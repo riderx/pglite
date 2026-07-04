@@ -1300,11 +1300,14 @@ full_page_writes = on        the §6.2 invariant depends on it
 data_checksums = off         kills XLOG_FPI_FOR_HINT read-noise; page
 wal_log_hints = off          integrity comes from object hashes; accept
                              byte-level (not logical) replica divergence.
-                             M0 FINDING: published PGlite initdb's with
-                             checksums ON — every reopen emitted 3–6
-                             hint-bit FPIs (~48 KB) until decoded. This
-                             pin is a REQUIRED initdb delta from stock
-                             PGlite, not an inherited default.
+                             M0 FINDING: PG 18 initdb defaults flipped
+                             checksums ON, so published PGlite inherits
+                             them — every reopen emitted 3–6 hint-bit
+                             FPIs (~48 KB) until decoded. The pin is pure
+                             config, VERIFIED: initDbStartParams
+                             ['--no-data-checksums'] ⇒ reopen boot WAL is
+                             exactly the 120-byte checkpoint record —
+                             zero writes, no PGlite changes.
 synchronous ack semantics    COMMIT ack strictly after CAS win; the
                              synchronous_commit GUC is accepted but inert
 stream TTL: none             explicit lifecycle deletion only
@@ -2060,30 +2063,52 @@ Each is independently demoable; the conflict path starts trivial and hardens.
 
 ## 17. Open questions
 
-1. Strict `Stream-Expected-Offset` upstreamed vs deployment-specific? (Small
-   either way; cooperative Stream-Seq suffices for trusted cells.)
-2. Fuzzy checkpoints: how soon do quiesced shutdown-style checkpoints become
-   the bottleneck for hot databases, forcing the backup-path implementation?
-3. Read-set false-conflict rates in practice: is page-LSN + prune-suppression
-   enough, or is the tuple-level slow path needed early?
+Triaged 2026-07-04 after the M0 experiments; each question carries the
+milestone whose work answers it. Two closed, one demoted to a cheap
+experiment, nine parked-with-owners — none blocks the M0 remainders or M1.
+
+1. ~~Strict `Stream-Expected-Offset` upstreamed vs deployment-specific?~~
+   **DECIDED: upstream it** — Durable Streams is ElectricSQL's own
+   protocol, so the extension (append-iff-tail, plus `Stream-Next-Offset`
+   on seq-conflict 409s, plus documenting per-stream `Stream-Seq` scope)
+   goes to the spec and both servers. Cooperative Stream-Seq remains the
+   interim for trusted cells. (M0 remainder / upstream PR.)
+2. ~~Fuzzy checkpoints forcing the backup-path implementation?~~ **LARGELY
+   RESOLVED by the M0 materializer discovery** (§6.1): checkpoints are
+   produced *offline* by a worker replaying the stream through a
+   crash-booted throwaway cell — no writer quiesce, no fuzzy-backup
+   machinery, at any cadence. Quiesced detach checkpoints remain the
+   cheap opportunistic path; the backup-recovery path may never be
+   needed. Residual: materializer throughput vs write rate. (M2.)
+3. Read-set false-conflict rates in practice: is page-LSN +
+   prune-suppression enough, or is the tuple-level slow path needed
+   early? (M5; abuse suite measures.)
 4. Sequence lease sizing and the `currval` repopulation seam — validate
-   against real ORM traffic.
-5. In-place reset vs recycle: at what contention level does recycle latency
-   (behind the proxy) actually hurt?
-6. NOTIFY sidecar delivery guarantees for offline listeners (replay window =
-   era? separate notify stream?).
-7. Physical graduation: how close is a materialized checkpoint + tail to a
-   `pg_upgrade`-able datadir for stock Postgres of the same major?
+   against real ORM traffic. (M4.)
+5. In-place reset vs recycle: at what contention level does recycle
+   latency (behind the proxy) actually hurt? (M0 remainder measures
+   recycle; M5 decides.)
+6. NOTIFY sidecar delivery guarantees for offline listeners (replay
+   window = era? separate notify stream?). (M3 ships live-only; M6
+   decides replay.)
+7. Physical graduation: how close is a materialized datadir to something
+   stock Postgres 18 starts? **Now a cheap experiment** — the M2
+   materializer emits a real datadir, wasm32 and native share
+   little-endian + MAXALIGN 8, and checksums-off now matches both sides'
+   configuration; try booting a native PG 18 on the materializer's
+   output. (M2+, one afternoon when the materializer exists.)
 8. Import-surface hardening: enumerate exactly which Emscripten syscalls
    survive into the pinned import object, and the fuzz plan for the VFS
-   boundary; when (if ever) the WASI tier graduates from POC.
-9. Multi-tenant packing: cells per host, shared-module memory ceilings, warm
-   pool sizing against the 80 MB active footprint.
-10. Where does the schema-epoch live — derived only, or also an `X` frame for
-    cheap joiner access?
-11. Control-plane schema versioning and the multi-region story (the catalog
-    is read-mostly — replicas suffice for reads, but era-rotation guards
-    want a single writer region per database).
+   boundary; when (if ever) the WASI tier graduates from POC. (M6 /
+   security review.)
+9. Multi-tenant packing: cells per host, shared-module memory ceilings,
+   warm pool sizing against the 80 MB active footprint. (M4 fleet
+   rigs.)
+10. Where does the schema-epoch live — derived only, or also an `X` frame
+    for cheap joiner access? (M5; the frame type is reserved either way.)
+11. Control-plane schema versioning and the multi-region story (the
+    catalog is read-mostly — replicas suffice for reads, but era-rotation
+    guards want a single writer region per database). (M4+.)
 12. Gateway manifest-cache TTLs: the wake path reads the manifest, so TTL
-    trades cold-wake latency against control-plane-outage tolerance —
-    measure before choosing defaults.
+    trades cold-wake latency against control-plane-outage tolerance.
+    (M1 measures naturally.)

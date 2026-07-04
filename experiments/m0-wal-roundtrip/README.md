@@ -40,9 +40,12 @@ empirically, not hardcoded) so ordinary crash recovery replays the tail.
    transactions, zero xids consumed at boot. This is precisely the
    read-noise the design's §9 pin (`data_checksums = off`) exists to kill —
    encountered empirically on the very first experiment. Consequence: the
-   pin is a **required initdb delta from stock PGlite**, not an inherited
-   default; with it, boot writes nothing and the §6.5 attach story holds
-   exactly as written.
+   pin is a **required initdb delta from stock PGlite** (PG 18 flipped
+   initdb's default to checksums-on upstream), not an inherited default —
+   and it is pure configuration, **verified**: with
+   `initDbStartParams: ['--no-data-checksums']` the reopen boot WAL is
+   exactly the 120-byte shutdown-checkpoint record — zero writes, no
+   PGlite code changes. The §6.5 attach story holds exactly as written.
 2. **Session teardown writes WAL after the last user transaction**
    (~1.2 KB: temp-table cleanup runs a final transaction). Slice capture
    must extend to the true durable end of WAL, not the last statement
