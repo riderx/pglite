@@ -2,7 +2,8 @@
 
 Routerless, scale-to-zero, forkable, Postgres-compatible databases built from
 isolated PGlite/WASM compute cells, object-storage checkpoints, and a
-per-database Durable Stream that carries canonical physical WAL.
+per-database Durable Stream (an era chain of them, §2.4) that carries
+canonical physical WAL.
 
 This is a **serialized multi-writer** design. There is no primary, no
 promotion, no failover machinery: any cell can execute and propose commits,
@@ -176,8 +177,8 @@ and no code may ever derive one from the other.
                         baseLsn, checkpointRef }   (carried in the creating
                         PUT body — atomic with era creation)
 'S'  era seal         { eraId, finalOffset, finalLsn, nextEraUrl, nextEraId }
-'G'  grant            { kind: sequence (others reserved — §5.1), range,
-                        grantee, granteeEpoch }
+'G'  grant            { kind: sequence (§5.3; others reserved — §5.1),
+                        range, grantee, granteeEpoch }
 'L'  lease            { kind: head|gc-pin, holder, epoch, ttl,
                         pinned(offset, lsn)? }
 'K'  checkpoint       { lsn, checkpointRef, sha256 }
@@ -314,8 +315,9 @@ refcounting, soft-delete, and cascading GC:
 - the fork gets its own era chain from `H`; producer and `Stream-Seq` state are
   not inherited (verified: forks are writer-state-fresh — writers re-bootstrap
   with an epoch bump);
-- allocator high-water marks at `H` are recorded in the fork manifest; the
-  fork's allocator namespace is independent thereafter (sibling forks may
+- sequence-grant high-water marks at `H` are recorded in the fork manifest;
+  the fork's grant namespace is independent thereafter — xids/mxids need no
+  recording, they chain per timeline (§5.1) — (sibling forks may
   reuse future XIDs/sequence values — they are independent databases);
 - GC is fork-aware: parent checkpoints, eras, and WAL ranges are pinned while
   any descendant references them (reverse references in the manifest).
@@ -524,6 +526,10 @@ escalation ladder for oversized results:
    frames extend the lease TTL for long runs;
 5. terminal: lease unobtainable → `40001` with a "response exceeded proxy
    buffer; retry" hint. Never a partial result.
+
+Known jumbo producers (`COPY TO`, cursor-less bulk `SELECT`s) may be
+pre-classified and routed straight to rung 4 or the read-only path,
+skipping the doomed spool.
 
 Declared read-only is the true streaming fast path: on `BEGIN READ ONLY` /
 `default_transaction_read_only=on`, Postgres itself rejects non-temp
@@ -803,8 +809,12 @@ pattern; the taint bit converts it to the documented failure mode.
   tables want lease-holder affinity. Documented, not fixable inside WAL.
 - **Advisory locks have no cross-cell meaning** — no WAL artifact, nothing to
   validate; migration tools (Prisma, golang-migrate, Rails) use them as
-  mutexes. Options: route `pg_advisory_*` to a stream-level lock service
-  (control frames), or error in multi-cell mode. Never silently local.
+  mutexes. End state: route `pg_advisory_*` to a stream-level lock service
+  (control frames), or error in multi-cell mode — never *silently* local.
+  Interim policy (M1–M5), reconciling with §3.7: advisory locks work,
+  session-scoped ones mark the session tainted, and the first use in
+  multi-cell topology raises a `WARNING` naming the cell-local scope — loud
+  enough to be honest until M6 picks service-or-error.
 - **Delivered cross-cell isolation is snapshot-at-B, commit-at-K** —
   REPEATABLE-READ-shaped. Page validation cannot see phantoms on never-read
   pages; do not claim serializability. Per-cell, semantics are vanilla.
@@ -952,7 +962,7 @@ reduction.** Without them, duplicate draws surface as unique violations
 column silently receives duplicated "unique" values, `SELECT
 last_value`/`pg_sequences` visibility diverges from vanilla after
 abort-only draws, and the never-reissue guarantee breaks at the first
-recycle. Rollout matches topology: at M1 the host cell manager coordinates
+recycle. Rollout matches topology: at M1 the cell host coordinates
 a per-database sequence cursor across its sibling cells host-locally (no
 stream frames needed — this closes the abort-only duplicate two same-host
 connections could otherwise observe); M4's cross-host lease frames extend
@@ -1165,7 +1175,10 @@ What each lifecycle event actually transfers:
   tailer's identity state — the clean path installs counters from the
   *control copy*, not the record) pointing at a shutdown-checkpoint record
   that is **real stream bytes minted by the host** (§6.1) — cells never
-  synthesize WAL. Boot reads exactly two WAL pages (segment page 0 + the
+  synthesize WAL, and the control copy and minted record are generated
+  **from one struct** (verified footgun: the clean path reads the copy, a
+  crash-path boot of the same bytes reads the record, and nothing
+  cross-checks them). Boot reads exactly two WAL pages (segment page 0 + the
   record's page; the rest of the segment may be zeros), and requires the
   SLRU segments covering `nextXid`/`nextMulti`/`nextOffset` present
   (materialized by the tailer's semantic SLRU pipeline, §6.3). The cell's
@@ -1609,7 +1622,7 @@ from JS is fine.)
 | Durability boundary / fsync interception | libc / Emscripten FS | none |
 | WAL record iteration + classification for the applier | C, new file wrapping xlogreader; emits block refs + special-record callbacks to JS | new file |
 | Page materialization at LSN (base + records) | C, new single-page redo entry point over `rm_redo` (walredo pattern) | new file |
-| Synthesized clean-at-H control view (lazy boot, §6.5) | JS: VFS serves a constructed `pg_control` from tailer-tracked state | none |
+| Synthesized clean-at-head control view (lazy boot, §6.5) | JS: VFS serves a constructed `pg_control` from tailer-tracked state (VFS must allow `O_RDWR` on pg_control, `mkdir` under `pg_wal`, and new-segment creation) | none |
 | Sequence lease clamp + cursor re-assert | C new file + few-line hook in `nextval_internal` (`ResetSequenceCaches` already exists) | tiny hunk |
 | Read-set capture | one hook at `PinBufferForBlock` appending to a ring buffer; JS harvests at commit | tiny hunk + new file |
 | Prune/hint-FPI suppression for follower reads | GUC-gated guards at the few call sites | tiny hunks |
@@ -1839,8 +1852,8 @@ Each is independently demoable; the conflict path starts trivial and hardens.
   identical dumps. Strict CAS extension in the TS server. Cell recycle timing.
   FPI/WAL-volume accounting vs page-image manifests.
 - **M1 — single-host vertical slice.** Framed era streams; quiesced
-  checkpoint objects + manifest; cold start via the synthesized clean-at-H
-  control view (§6.5) — attach, never recover; head lease; one-shot CAS
+  checkpoint objects + manifest; cold start via the synthesized
+  clean-at-head control view (§6.5) — attach, never recover; head lease; one-shot CAS
   with re-execute-on-loss; **interactive transactions get `40001`-on-loss
   from day one** (sibling races exist the moment two connections do);
   session advance between transactions by cheap reattach — tainted
