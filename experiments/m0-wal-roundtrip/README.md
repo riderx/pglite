@@ -55,6 +55,41 @@ empirically, not hardcoded) so ordinary crash recovery replays the tail.
    offset discoverable by scanning for a self-consistent CRC32C — no
    hardcoded struct layout needed beyond the state field.
 
+## M0 experiment 2: attach, never recover — PASS (20/20)
+
+`node attach.mjs` — the §6.5 mechanism, proven end to end on the same
+published build, zero C changes:
+
+- **All historical WAL deleted**; the cell boots from materialized pages +
+  a **synthesized `pg_control`** (state `DB_SHUTDOWNED`, identity counters
+  in the checkpoint copy) + a **host-minted 114-byte shutdown-checkpoint
+  record** as the only WAL bytes in existence (one-struct rule: the same
+  88-byte CheckPoint buffer feeds both the control copy and the record
+  payload; record CRC = payload-then-header CRC32C; long page header on
+  segment page 0, short header on the record's page).
+- Two attach shapes both pass: **A1 continuity** (head = the datadir's
+  previous EndOfLog, mid-segment) and **A2 jump-ahead** (head at `1/28` in
+  a fresh, far segment — WAL-history continuity is not required, only
+  record validity; the "host mints at head" model).
+- Verified per shape: live `pg_control_checkpoint()` equals the minted
+  record; `next_xid` installs from the synthesized control copy; 500-row
+  table byte-identical (non-vacuous guard); first new WAL lands in the
+  synthesized timeline; write + read work; a **plain reopen** afterwards
+  persists everything — the attach leaves a fully sound cluster.
+
+Additional findings:
+
+6. **Boot SQL runs after attach too** (~21 KB of WAL past H+120 before the
+   first user statement) — same bootstrap as finding 1, now quantified on
+   the attach path. Until it is identified/eliminated, the first slice
+   after attach contains it.
+7. **Harness bug worth remembering**: a multi-statement `exec` batch runs
+   in ONE implicit transaction under the simple protocol — a trailing
+   `rollback` rolled back the setup's CREATEs and made every comparison
+   vacuously pass ({} == {}). Both experiments now carry non-vacuous
+   guards. (Cost: one debugging detour via catalog forensics; the attach
+   mechanism itself had been working the whole time.)
+
 ## What this de-risks
 
 M1's commit path is now known-good end-to-end at the storage level: capture

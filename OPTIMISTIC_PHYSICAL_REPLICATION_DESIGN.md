@@ -1856,9 +1856,13 @@ Each is independently demoable; the conflict path starts trivial and hardens.
   eliminate — per-attach write amplification the §6.5 attach story assumes
   away) and session teardown writes a final cleanup transaction (slice
   capture must run to the durable end of WAL, not the last statement).
-  Remaining: attach experiment (synthesized clean-at-head control view,
-  recipe in §6.5); strict CAS extension in the TS server; cell recycle
-  timing; FPI/WAL-volume accounting vs page-image manifests.
+  Attach-never-recover — **DONE, 20/20 (`attach.mjs`)**: synthesized
+  `pg_control` + host-minted checkpoint record boot with ALL historical
+  WAL deleted, in both continuity and jump-ahead shapes; identity installs
+  from the control copy; a plain reopen afterwards is sound. Remaining:
+  strict CAS extension in the TS server; cell recycle timing;
+  FPI/WAL-volume accounting vs page-image manifests; identify/eliminate
+  the ~48 KB bootstrap WAL both experiments measured.
 - **M1 — single-host vertical slice.** Framed era streams; quiesced
   checkpoint objects + manifest; cold start via the synthesized
   clean-at-head control view (§6.5) — attach, never recover; head lease; one-shot CAS
