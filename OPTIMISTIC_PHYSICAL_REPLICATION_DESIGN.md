@@ -59,7 +59,11 @@ Re-verify line references against these before implementation.
 4. **The stream is the coordinator.** Allocation grants, leases, checkpoints,
    era rotation, and notification fanout are ordered control frames in the
    same stream as the WAL, serialized by the same compare-and-append. There is
-   no allocator service, no lock manager, no router state.
+   no allocator service, no lock manager, no router state. The platform
+   services preserve this: the gateway is **stateless by hard invariant**
+   (§14.5) and the control plane is never in the commit path (§14.6). If a
+   feature needs shared mutable state, it goes in the stream — or it does
+   not exist.
 5. **Leases are the steady state; optimism is the safety net.** A cell holding
    the head lease never loses a commit race and delivers vanilla Postgres
    semantics. Optimistic CAS commits are what make the lease safe to lose —
@@ -1198,6 +1202,13 @@ upgrades are materialize + logical dump/restore (also the graduation path);
 production Durable Streams durability (repo servers are single-disk fsync;
 the deployment target's replication story must be verified).
 
+**Architectural drift risks:** statefulness creep in the gateway. The §14.5
+invariant exists to be cited in review: any proposed feature needing state
+two gateway instances must agree on goes in the stream, the control plane,
+or nowhere. The gateway touches everything (auth, storage, streams,
+manifest cache), which makes it the natural landing spot for exactly the
+coordination state this design exists to eliminate.
+
 ## 13. Relationship to existing code
 
 | Existing (`packages/pglite-durable-vfs`, fork) | Role here |
@@ -1406,19 +1417,49 @@ Responsibilities:
   pluggable (local fs / object storage);
 - **proxy durable-stream operations** (CAS appends, catch-up, long-poll).
   The DS server remains the append serializer; the gateway adds tenant
-  authorization, frame validation (well-formed frames, size caps, sanity of
-  `W.baseLsn` against the observed head), and is the natural deployment
-  point for the strict `Stream-Expected-Offset` check — closing §2.3's
-  "cooperative, not enforced" gap at the boundary instead of trusting cells;
+  authorization and frame validation (well-formed frames, size caps, sanity
+  of `W.baseLsn`), and **validates-and-forwards** the strict
+  `Stream-Expected-Offset` header — enforcement lands in the DS server's
+  append lock (§2.3), never in the gateway (see the statelessness
+  invariant below for why this is forced, not chosen);
 - **mint and validate tenant-scoped capability tokens** (backed by
   control-plane auth, §14.6) — the concrete enforcement point for §11.2's
   credential scoping: cells and hosts never see raw storage or stream
   credentials.
 
-Discipline clause: **the gateway is a referee, not a coordinator.**
-Stateless or cache-only; any instance serves any tenant; killing one is
-harmless; it holds no serialization authority (the stream server does) and
-no topology authority (the control plane does).
+**Statelessness is a hard invariant, not a preference — this is essential
+to the design.** The gateway holds zero authoritative state; everything in
+it is disposable cache, reconstructible from the stream, the object store,
+or the control plane:
+
+```text
+MAY hold (disposable, TTL'd; loss costs latency only):
+  object read-through cache · manifest/era-pointer cache ·
+  token-verification keys · approximate metering counters
+
+MUST NEVER hold (loss or divergence would cost correctness):
+  append/CAS serialization state · leases or locks · commit journals ·
+  connection/session state (that is the session proxy's job, §3.5, and it
+  lives on the cell host) · anything two gateway instances could disagree
+  about
+```
+
+Consequences — which are the point:
+
+- any request can hit any gateway instance: the routerless property (§1)
+  extends through the platform layer;
+- scaling is "add instances"; deploys are invisible; `kill -9` of any
+  gateway at any moment changes latency and nothing else (§16 tests
+  exactly this);
+- **CAS enforcement cannot live in the gateway** — two instances can each
+  believe they know the tail; only the stream server's per-stream critical
+  section can decide. The gateway validates and forwards; the ~30-line
+  strict check (§2.3) lands in the DS server where the append lock already
+  is. A gateway-local "fast-path" of this check is the canonical
+  statefulness creep to reject in review;
+- the general test for any proposed gateway feature: if it needs state two
+  instances must agree on, it belongs in the stream (control frames), the
+  control plane, or nowhere.
 
 Salvage note: the old branch's pageserver — Hono app, disk store, object
 store — is the serving skeleton for exactly this component; only its
@@ -1541,6 +1582,13 @@ Each is independently demoable; the conflict path starts trivial and hardens.
   schemas minting multixacts under savepoints; temp-table-heavy sessions
   exercising the taint path; incarnation-burn churn under aggressive
   hibernation.
+- **Gateway statelessness (chaos) suite:** ≥2 gateway instances with
+  per-request random routing; `kill -9` one instance at every step of the
+  commit, catch-up, rotation, and wake flows; assert client-visible
+  behavior is byte-identical and the only measurable effect is latency; no
+  test may be able to distinguish which instance served which request. Any
+  future gateway feature that breaks this suite is rejected by §14.5, not
+  negotiated.
 - **NOTIFY suite:** atomicity (notification in stream iff commit is);
   exactly-once under rebase (lost CAS attempts emit nothing); global commit
   order across three listening cells; vanilla parity for local semantics
