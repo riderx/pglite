@@ -153,12 +153,21 @@ frame := type(1 byte) | length(4 bytes, BE, payload length) | payload
 One CAS append = one or more whole frames. Readers buffer and split; partial
 frames at a read boundary are handled by ordinary buffering.
 
+**Two positions, never conflated.** A **stream offset** is an opaque,
+server-minted cursor: it advances on *every* append, control frames
+included, and its format is implementation-specific — treat it strictly as
+a token. A **WAL LSN** is a byte position in the physical timeline: it
+advances only when `W`/`w` frames land. CAS guards and resume cursors use
+offsets; page validation, checkpoints, forks, and GC horizons use LSNs.
+Every commit therefore tracks a pair — attached at `(offset O, LSN B)` —
+and no code may ever derive one from the other.
+
 ### 2.2 Frame types
 
 ```text
 'W'  WAL slice        { commitId, baseLsn, endLsn, flags, walBytes }
 'w'  WAL slice ref    { commitId, baseLsn, endLsn, objectRef, sha256, byteLength }
-'G'  grant            { kind: xid|oid|relfilenode|sequence, range, grantee }
+'G'  grant            { kind: sequence (others reserved — see §5.1), range, grantee }
 'L'  lease            { kind: head|gc-pin|ddl, holder, epoch, ttl, pinnedLsn? }
 'K'  checkpoint       { lsn, manifestRef, sha256 }
 'N'  notify sidecar   { channel, payload, commitLsn }
@@ -177,13 +186,20 @@ Rules:
   stream — a joiner reconstructs it from the tail it is already reading.
 - `N` frames are appended atomically with their commit's `W` frame (same POST),
   giving cross-cell NOTIFY fanout in commit order (§10.2).
-- `commitId` is a cell-generated UUID journaled locally **before** the append
-  attempt (pending-commit journal, salvaged from the old branch). Producer
-  headers alone cannot answer "did my commit land?" after a crash — the
-  restarted incarnation no longer holds the byte-identical body a dedup
-  retry would need. Recovery is therefore: read the tail from the last
-  journaled offset and scan for `commitId`; found ⇒ the commit landed, not
-  found ⇒ it died with the cell (§3.4).
+- `commitId` is a cell-generated UUID journaled locally **before** the
+  append attempt, together with `{era URL, expected offset O, baseLsn,
+  endLsn, slice hash}` (pending-commit journal, salvaged from the old
+  branch). Producer headers alone cannot answer "did my commit land?" after
+  a crash — the restarted incarnation no longer holds the byte-identical
+  body a dedup retry would need. Recovery is exact and bounded, not a scan:
+  (1) **bump the producer epoch** — this fences any in-flight zombie append
+  from the dead incarnation, making the next step conclusive; (2) read the
+  journaled era at offset O; (3) our `commitId` there ⇒ landed; anything
+  else or nothing ⇒ lost (base-exactness means offset O could only ever
+  hold our proposal or a rival's). If the journaled era has already been
+  GC'd (recovery delayed past retention), the outcome is surfaced as
+  **indeterminate** — the same honest state a vanilla client is in after
+  losing its connection mid-`COMMIT`.
 
 ### 2.3 Compare-and-append
 
@@ -292,23 +308,29 @@ atomic conditional update to make checkpoint publication and era rotation
 race-safe (§6.1), lives in the control plane (§14.6) where that guard is an
 ordinary transaction rather than an object-store conditional PUT.
 
+Tenant data at rest — stream bytes and checkpoint objects — rides the
+deployment's storage-layer encryption; per-tenant key scoping is a tier
+feature (§11.3), not assumed by the base design.
+
 ## 3. Commit protocol
 
 ### 3.1 Cell lifecycle and the happy path
 
 ```text
 1.  request → any server → start/reuse cell for (database, era)
-2.  cell reads manifest and attaches at head H through the host's
-    page-version index (the tail is applied virtually, §6.2/§6.5) — no page
-    bytes move at boot; pages materialize lazily on first touch; asserts
-    config pins (§9)
-3.  SQL executes locally under native MVCC against the physical image at H
-4.  dirty pages go to a private overlay; WAL accumulates in the local pg_wal
-    (visible to the VFS as ordinary file writes)
-5.  at commit: slice WAL (H .. H'] — ALL bytes, unfiltered (see §5.4 for why
+2.  cell reads manifest and attaches at (stream offset O, WAL head B)
+    through the host's page-version index (the tail is applied virtually,
+    §6.2/§6.5) — no page bytes move at boot; pages materialize lazily on
+    first touch; asserts config pins (§9)
+3.  SQL executes locally under native MVCC against the physical image at B
+4.  dirty pages go to a private overlay; WAL accumulates in the local
+    pg_wal (visible to the VFS as ordinary file writes)
+5.  at commit: slice WAL (B .. B'] — ALL bytes, unfiltered (§5.3 rule 4:
     aborted-transaction records must stay in)
-6.  CAS append: W frame (+ N frames), Stream-Seq/expected-offset = H
-7.  win → ack client; overlay pages become clean local cache
+6.  CAS append: W frame {commitId, baseLsn=B, endLsn=B'} (+ N frames),
+    expected stream offset = O — the CAS token is the OFFSET, never an LSN
+    (control frames advance offsets without advancing WAL, §2.1)
+7.  win → new head (O', B'); ack client; overlay becomes clean local cache
 8.  lose → §3.3 / §7
 ```
 
@@ -323,8 +345,9 @@ read traffic generates no slice.
 
 ### 3.2 The head lease: steady state
 
-A cell may claim the **head lease** via an `L` frame (TTL + holder + epoch,
-fenced by `Producer-Epoch`). While held and unexpired:
+The **head lease** is claimed via an `L` frame (TTL + holder + epoch,
+fenced by `Producer-Epoch`). The holder is the host's commit sequencer — a
+lone cell is just the degenerate case (§14.4). While held and unexpired:
 
 - the router-free load balancer still sends requests anywhere, but any cell
   can see from the tail who holds the lease and proxy writes to the holder
@@ -362,8 +385,15 @@ state. A session that has created temp tables (or other cell-local durable
 state) cannot be transparently re-executed after a recycle — the recycle
 destroys exactly the state re-execution would need, and worse, silently: the
 re-run would read an empty temp table and commit wrong results. Such
-sessions carry a **session-state taint**: on CAS loss they get `40001`
-instead of silent retry (§3.7). M6's in-place reset lifts the restriction.
+sessions carry a **session-state taint** — and because the loss forces a
+recycle that destroys exactly that state, a bare `40001` with the
+connection kept open would leave the client silently continuing against a
+session whose temp tables, held cursors, and advisory locks have vanished.
+So tainted loss is a **fatal session reset**: an `ERROR` naming the cause,
+then connection termination (vanilla precedent — crash recovery closes
+connections; every driver and pool handles reconnect). Tainted sessions are
+also excluded from advance-by-reattach (§15 M1): they pin at their base
+until they commit or end. The in-place reset (M5) lifts all of this.
 
 ### 3.4 Reset-to-head
 
@@ -403,10 +433,13 @@ transactions, every byte — `DataRow`s, `CommandComplete`,
 `NotificationResponse`, errors — is held until the transaction's CAS
 resolves; on loss, the buffer is discarded and the re-execution's output is
 sent instead. End-of-transaction with an empty WAL slice ⇒ read-only ⇒
-flush immediately, no CAS. Buffering is capped: past the cap the
-transaction degrades to stream-through with `40001`-on-loss (honest —
-vanilla also errors mid-result-stream). Interactive transactions stream
-mid-transaction results by design; only the `COMMIT` response is held (§4).
+flush immediately, no CAS. Oversized results never break the invariant:
+past the in-memory cap the buffer **spools to local disk**, and past the
+spool cap the host **acquires the head lease before flushing** — a leased
+commit cannot lose, so streaming becomes safe. Mutating output (`RETURNING`
+rows, `CommandComplete`) is never sent ahead of an unresolved CAS, at any
+size. Interactive transactions stream mid-transaction results by design;
+only the `COMMIT` response is held (§4).
 
 ### 3.6 Commit-sequence placement audit
 
@@ -417,8 +450,12 @@ record: deferred triggers fire → holdable portals materialize →
 fail (CAS), each step needs an explicit before/after-CAS placement decision.
 Worst instance (verified): the temp-table truncate is physical and pre-CAS —
 a lost race would destroy the client's staging data in an aborted
-transaction. It has no WAL footprint and moves after CAS success. NOTIFY
-delivery already sits correctly after commit.
+transaction. It has no WAL footprint and moves after CAS success — **when
+the commit gate ships (M5)**. Until then no reorder exists, and the hazard
+is neutralized by the session-state taint instead: a temp-table session
+that loses CAS gets the fatal session reset of §3.3, never a silent
+continuation against truncated staging data. NOTIFY delivery already sits
+correctly after commit.
 
 ### 3.7 The MVP SQL contract
 
@@ -429,8 +466,8 @@ is stated, enforced, and tested — never implied. At M1–M4 (one-shot optimism
 | Shape | On CAS loss |
 | --- | --- |
 | One-shot statements / whole-transaction batches, no session-local state | transparent re-execute (§3.3) |
-| Sessions holding temp tables, `WITH HOLD` cursors, session advisory locks | `40001` (session-state taint) |
-| Interactive transactions | `40001` at `COMMIT` (M5) until rebase lands (M6) |
+| Sessions holding temp tables, `WITH HOLD` cursors, session advisory locks | fatal session reset — error + connection close (taint, §3.3) |
+| Interactive transactions | `40001` at `COMMIT` (from M1) until rebase lands (M5) |
 | DDL | never races — serialized via the head lease (§8.2) |
 | Read-only (empty slice) | never conflicts; response flushes at txn end |
 
@@ -638,43 +675,53 @@ case at zero iterations.
 
 ## 5. Identity and allocators
 
-### 5.1 XIDs
+### 5.1 XIDs and multixacts: chained state, no allocator
 
-`GetNewTransactionId` draws from per-cell ranges granted by `G` frames.
-Precedent for the pattern is in-tree: OIDs already prefetch in batches of
-8192 via `XLOG_NEXTOID`, and gaps are legal crash behavior. Properties:
+Earlier drafts granted per-cell XID ranges (and, after external review,
+multixact id+offset ranges). **Neither allocator exists in this design** —
+both counters are ordinary replayed state, made consistent by two rules
+already enforced elsewhere:
 
-- burned ranges (cell death, CAS loss under recycle) behave as crashed
-  transactions: clog never marks them committed; visibility treats them as
-  aborted. No special handling;
-- commit order ≠ xid order is fine (clog + snapshots already handle async
-  ordering);
-- allocate on first write, size ranges adaptively (small for short-lived
-  cells) to bound burn rate;
-- wraparound: freezing is ordinary vacuum work (§6.4), and `datfrozenxid`
-  advancement flows through normal WAL. Range accounting lives in the
-  manifest's allocator high-water marks, rebuilt from `G` frames on join.
+1. **a slice lands only on its exact base** (offset CAS, §3.1), so every
+   committed slice's xids and mxids chain from precisely the
+   `nextXid`/`nextMulti` state its readers replay to;
+2. **losers never publish** — they discard and re-execute (verbatim replay
+   is banned, §4.4), so speculative identities never reach the stream; the
+   M5 rebase restamps with fresh identities allocated at K.
 
-### 5.2 OIDs, relfilenodes, multixacts
+Edge cases, checked against source:
 
-- **OIDs/relfilenumbers** are allocated by DDL and uniqueness-checked at
-  execution time. Because DDL transactions hold the head lease (§8.2), checked-
-  at-B equals checked-at-head and no ranges are needed initially. If
-  rebaseable DDL is ever wanted, `G` frames extend naturally (the
-  `XLOG_NEXTOID` prefetch pattern again). One-shot DDL that loses a race
-  re-executes and re-allocates — no collision possible.
-- **Multixacts cannot be dismissed as ephemera** (an earlier draft did; the
-  design review killed the claim). Even a single-user cell mints multixact
-  IDs when subtransactions interact with row locks — FK `KEY SHARE` under
-  savepoints, `SELECT FOR UPDATE` in a subxact followed by `UPDATE` — and
-  the mxid is written into tuple `xmax`, WAL-logged, and persists on
-  committed pages until vacuum/freeze clears it. Mxids (and multixact member
-  *offsets* — a second counter) are therefore global timeline state exactly
-  like xids. Policy: range-grant **both** counters via `G` frames at M4 —
-  the same prefetch pattern and incarnation-burn rules as xids; checkpoints
-  already carry `pg_multixact/` (§6.1) and replay extends it. Before M4,
-  cells run single-writer under the lease, so local allocation is trivially
-  safe.
+- aborted transactions ride inside the winner's *contiguous* slice, and
+  recovery advances `nextXid` past every xid it sees in records
+  (`AdvanceNextFullTransactionIdPastXid`) — burn is consistent;
+- a transaction that wrote only to temp tables still emits a commit/abort
+  record (an assigned xid forces one via `markXidCommitted`), so no xid is
+  ever consumed invisibly to the stream;
+- multixact creation is WAL-logged before use (`XLOG_MULTIXACT_CREATE_ID`),
+  so mxids and member offsets chain identically; `pg_multixact/` ships in
+  checkpoints (§6.1) and replay extends it;
+- wraparound: freezing is ordinary vacuum work (§6.4); `datfrozenxid`
+  advancement flows through normal WAL.
+
+The aliasing hazard the grants defended against exists only in the
+verbatim-replay world this design bans. The one identity that *does* need
+coordination is sequences — the only counter a client can observe
+**without a commit** (§5.3). The convergence oracle (§16) pins this claim
+mechanically: stream replay into vanilla Postgres must yield clean clog,
+multixact, and `pg_amcheck` state under randomized, abort-heavy,
+multi-cell workloads.
+
+### 5.2 OIDs and relfilenumbers
+
+Allocated by DDL and uniqueness-checked at execution time against local
+state. DDL holds the head lease (§8.2), so checked-at-base equals
+checked-at-head; one-shot DDL that loses a race re-executes and
+re-allocates. TOAST chunk OIDs and other `GetNewOidWithIndex` allocations
+self-heal by construction — the retry loop re-checks against whatever state
+the cell executes on — and `nextOid` regression after a discarded slice is
+harmless for the same reason it is after a vanilla crash: uniqueness is
+enforced by index lookup, not by the counter. If rebaseable DDL is ever
+wanted, `G` frames extend naturally; nothing needs them today.
 
 ### 5.3 Sequences
 
@@ -738,11 +785,19 @@ the CAS.** Adversarially verified to hold, conditional on all of:
    values consumed by aborted transactions in a *surviving* cell are
    published by rule 4 the next time that cell commits.
 
-Without leases the system is still correct — concurrent duplicate draws
-surface as unique violations at CAS/rebase time → `40001` — just noisier.
-Leases are what make interactive RETURNING stable (§4.4) and one-shot retries
-rare. Guidance for generated schemas remains `uuidv7` keys, which sidestep the
-whole topic.
+**Leases are mandatory for Postgres sequence semantics — not noise
+reduction.** Without them, duplicate draws surface as unique violations
+*only where a unique index happens to exist*: a plain bigserial-shaped
+column silently receives duplicated "unique" values, `SELECT
+last_value`/`pg_sequences` visibility diverges from vanilla after
+abort-only draws, and the never-reissue guarantee breaks at the first
+recycle. Rollout matches topology: at M1 the host cell manager coordinates
+a per-database sequence cursor across its sibling cells host-locally (no
+stream frames needed — this closes the abort-only duplicate two same-host
+connections could otherwise observe); M4's cross-host lease frames extend
+the same discipline to the fleet; M5's RETURNING stability under rebase
+(§4.4) depends on them outright. `uuidv7` guidance for generated schemas
+stands — as advice, not as the correctness story.
 
 ## 6. Storage: checkpoints, lazy followers, GC
 
@@ -766,8 +821,10 @@ pg_control         (coherent CheckPoint struct: nextXid, nextOid,
 The checkpoint record itself must be **real, CRC-valid bytes in the stream**
 with a correct back-pointer and a reachable REDO record — recovery validates
 all of it; it cannot be fabricated at an arbitrary LSN. MVP protocol: the
-producing cell quiesces and runs a genuine shutdown-style checkpoint, the
-worker snapshots the datadir into the object, appends the `K` frame. Fuzzy
+host sequencer quiesces the database (it holds appends — with multiple
+cells per host there is no single "producing cell"), one cell runs a
+genuine shutdown-style checkpoint, the worker snapshots the datadir into
+the object, appends the `K` frame. Fuzzy
 (non-quiesced) checkpoints come later and must drive the backup-recovery path
 (`backupStartPoint`/`minRecoveryPoint`) so consistency is not declared before
 the snapshot end.
@@ -1028,9 +1085,10 @@ Feature policy (enforced, each with its loud failure mode):
 ### 10.1 Coordination frames
 
 Everything that would traditionally need a coordinator is an ordered control
-frame through the same CAS (§2.2): XID/sequence/OID grants, head/GC/DDL
-leases, checkpoint markers, era steps, fork markers. State is reconstructed by
-replaying the tail — the joiner already reads it.
+frame through the same CAS (§2.2): sequence grants (the only granted
+identity — xids, mxids, and OIDs are chained state needing none, §5.1–§5.2),
+head/GC/DDL leases, checkpoint markers, era steps, fork markers. State is
+reconstructed by replaying the tail — the joiner already reads it.
 
 ### 10.2 Cluster-wide LISTEN/NOTIFY — headline capability
 
@@ -1137,9 +1195,9 @@ inspector off. Two gaps Node does not close, and their mitigations:
 
 - **no network egress permission** — enforce at the infra layer (cell hosts
   reach only stream/storage endpoints) and, more importantly, scope
-  credentials: a process holds short-lived tokens for exactly its currently
-  assigned tenants, so full process compromise leaks co-residents only,
-  never the fleet;
+  credentials: a process holds short-lived tokens (gateway-minted, §14.5)
+  for exactly its currently assigned tenants, so full process compromise
+  leaks co-residents only, never the fleet;
 - **no per-worker syscall filter** (seccomp is process-granular) — same
   answer: partition by process, keep M modest.
 
@@ -1326,23 +1384,23 @@ from JS is fine.)
 | Durability boundary / fsync interception | libc / Emscripten FS | none |
 | WAL record iteration + classification for the applier | C, new file wrapping xlogreader; emits block refs + special-record callbacks to JS | new file |
 | Page materialization at LSN (base + records) | C, new single-page redo entry point over `rm_redo` (walredo pattern) | new file |
-| XID range allocation | C new file + 1–2 line hook in `GetNewTransactionId` | tiny hunk |
+| Synthesized clean-at-H control view (lazy boot, §6.5) | JS: VFS serves a constructed `pg_control` from tailer-tracked state | none |
 | Sequence lease clamp + cursor re-assert | C new file + few-line hook in `nextval_internal` (`ResetSequenceCaches` already exists) | tiny hunk |
 | Read-set capture | one hook at `PinBufferForBlock` appending to a ring buffer; JS harvests at commit | tiny hunk + new file |
 | Prune/hint-FPI suppression for follower reads | GUC-gated guards at the few call sites | tiny hunks |
 | Invalidation apply / cache flush on reset | C new file extending the existing `Pglite*` exports | new file |
-| Logical harvest + re-apply (M6) | C new files over heapam/index-AM/TOAST APIs | new files |
-| Commit gate (block inside COMMIT awaiting CAS) | C hook → synchronous JS import parked on the SAB/Atomics bridge | the one deep hunk — deferred to M6 |
+| Logical harvest + re-apply (M5) | C new files over heapam/index-AM/TOAST APIs | new files |
+| Commit gate (block inside COMMIT awaiting CAS) | C hook → synchronous JS import parked on the SAB/Atomics bridge | the one deep hunk — deferred to M5 |
 
 Note the ordering luck: **the MVP needs no commit-path patch — under the
 M1 contract (§3.7).** For one-shot commits the CAS runs in JS after the
 query returns and before the client ack; the irreversible pre-commit steps
 of §3.6 are neutralized not by a gate but by the contract (session-state
-taint → `40001`) plus proxy output buffering (§3.5). Pulling the commit
-gate earlier would not help: without M6's in-place reset, a CAS failure
-inside `COMMIT` still ends in a recycle and loses the same session state —
-the gate only becomes useful together with the machinery it gates. It
-arrives at M6, parked on the SAB/Atomics bridge already built for page
+taint → fatal reset) plus proxy output buffering (§3.5). Pulling the
+commit gate earlier would not help: without M5's in-place reset, a CAS
+failure inside `COMMIT` still ends in a recycle and loses the same session
+state — the gate only becomes useful together with the machinery it gates.
+It arrives at M5, parked on the SAB/Atomics bridge already built for page
 faults.
 
 ### 14.3 The cell host: shared pages, one tailer
@@ -1507,7 +1565,7 @@ Failure-independence rules (strict, testable):
 - deliberate non-goal: hosting the control plane on this substrate itself —
   the recovery story must have no circular dependency.
 
-The M7 GUI is simply a control-plane client with a stream tailer attached.
+The M6 GUI is simply a control-plane client with a stream tailer attached.
 
 ## 15. Milestones
 
@@ -1517,34 +1575,46 @@ Each is independently demoable; the conflict path starts trivial and hardens.
   LSNs via the VFS, replay into a second cell from a checkpoint, assert
   identical dumps. Strict CAS extension in the TS server. Cell recycle timing.
   FPI/WAL-volume accounting vs page-image manifests.
-- **M1 — canonical stream + cell host.** Framed era streams; quiesced
-  checkpoint objects + manifest; cold start from checkpoint + tail; head
-  lease; one-shot CAS with re-execute-on-loss; session proxy v0 with
-  cell-per-connection topology (§14.4); host cell manager: shared
-  content-addressed page cache, one tailer per database, host-local commit
-  sequencer (§14.3); **proxy response buffering + session-state taint
-  enforcing the §3.7 contract — the "client observed nothing" property is
-  M1, not polish**; storage/stream gateway v0 (fs backend, embedded DS
-  server) and control-plane schema v0 (§14.5–§14.6; PGlite as the dev
-  control plane). Scale-to-zero works here.
-- **M2 — eras, forks, GC.** Rotation via guarded seal; fork manifests over
-  stream forks; GC horizon from lease pins + fork refcounts.
-- **M3 — followers.** Lazy tail apply (page-version index, base-required
-  flags), eager special-record set, live invalidation incl. inval carriers;
-  read replicas with freshness modes; DDL-on-followers; **NOTIFY sidecar
-  frames with cross-cell LISTEN delivery — the headline demo (§10.2)**.
-- **M4 — multi-writer one-shots.** XID range grants; multixact id+offset
-  range grants (§5.2); sequence leases (clamp patch + incarnation-burn
-  rules, §5.3); optimistic CAS from multiple cells; convergence oracle in
-  CI.
-- **M5 — interactive v1.** Race → `40001`; commit-sequence placement audit;
-  taint bits.
-- **M6 — interactive v2 (rebase).** Read-set hook + repaired validation rules;
-  schema-epoch fence; logical re-apply, inserts first, then update/delete with
-  version preconditions; deferred-trigger ctid remap.
-- **M7 — productization.** DDL-lease polish, advisory-lock service or errors,
+- **M1 — single-host vertical slice.** Framed era streams; quiesced
+  checkpoint objects + manifest; cold start via the synthesized clean-at-H
+  control view (§6.5) — attach, never recover; head lease; one-shot CAS
+  with re-execute-on-loss; **interactive transactions get `40001`-on-loss
+  from day one** (sibling races exist the moment two connections do);
+  session advance between transactions by cheap reattach — tainted
+  sessions pin instead, a documented degradation until M3's live advance;
+  session proxy v0 with cell-per-connection topology (§14.4), response
+  buffering/spool and session-state taints enforcing the §3.7 contract —
+  the "client observed nothing" property is M1, not polish; host cell
+  manager: shared content-addressed page cache, one tailer per database,
+  host-local commit sequencer, **host-local sequence cursor** (§5.3,
+  §14.3); storage/stream gateway v0 (fs backend, embedded DS server) and
+  control-plane schema v0 (§14.5–§14.6; PGlite as the dev control plane).
+  Scale-to-zero works here.
+- **M2 — storage lifecycle.** Era rotation via guarded seal, with the host
+  sequencer as the quiesce point (§6.1); fork manifests over stream forks;
+  GC horizon from lease pins + fork refcounts **and GC execution** — era
+  deletion, checkpoint pruning, page-version trimming; the checkpoint
+  cadence dial exposed per database (§2.4).
+- **M3 — followers & live apply.** Lazy tail apply (page-version index,
+  base-required flags), eager special-record set, live invalidation incl.
+  all three inval carriers; **sibling-cell advance upgraded from reattach
+  to incremental live apply**, lifting M1's tainted-session pinning; read
+  replicas with freshness modes; DDL-on-followers; **NOTIFY sidecar frames
+  with cross-cell LISTEN delivery — the headline demo (§10.2)**.
+- **M4 — multi-host fleet.** Real cross-host CAS contention; sequence
+  lease frames + incarnation-burn rules (§5.3); lease migration between
+  hosts; gateway fleet mode; `linearizable` freshness verified against
+  multi-host tailer lag (§7); convergence oracle in CI including the §5.1
+  identity-chaining assertions.
+- **M5 — interactive transparent rebase.** Read-set hook + repaired
+  validation rules; schema-epoch fence; logical re-apply, inserts first,
+  then update/delete with version preconditions; deferred-trigger ctid
+  remap; **commit gate + in-place reset**; commit-sequence placement
+  reorder (§3.6); session-state taint lift (§3.3).
+- **M6 — productization.** DDL-lease polish; advisory-lock service or
+  errors; **janitor automation** (vacuum/freeze cadence, GC scheduling);
   graduation tooling (logical export; physical materialize-and-start
-  experiment), demo GUI: list databases, fork button, connect via psql
+  experiment); demo GUI: list databases, fork button, connect via psql
   through the proxy, a live per-database activity feed driven by the NOTIFY
   stream (§10.2) — the GUI itself is just another stream listener — and
   per-cell lazy-load/cache-hit counters (§6.5) so the footprint story is
@@ -1555,6 +1625,10 @@ Each is independently demoable; the conflict path starts trivial and hardens.
 - **The convergence oracle (build in week one):** replay a database's stream
   through vanilla Postgres recovery (it is real WAL) and `pg_dump`-diff
   against every cell's dump. Runs in CI on randomized multi-cell workloads.
+  Extended with the §5.1 identity-chaining assertions: clean clog and
+  multixact state plus a passing `pg_amcheck` under abort-heavy,
+  savepoint-heavy, multi-cell runs — the no-allocator claim is tested, not
+  argued.
 - **Deterministic cluster simulator:** N in-process cells + in-memory Durable
   Streams server; scripted interleavings of CAS races, lease expiries, era
   rotations, crashes at every step of the commit pipeline (the pending/journal
@@ -1573,9 +1647,11 @@ Each is independently demoable; the conflict path starts trivial and hardens.
   row of the §3.7 MVP SQL contract table.
 - **Client-observation property:** kill the CAS at every step of the commit
   pipeline and assert a one-shot client received zero bytes before
-  resolution (§3.5 buffering), that read-only transactions flush without
-  CAS, and that tainted sessions get `40001` — the §3.7 contract enforced
-  mechanically, not by review.
+  resolution at every buffer regime (in-memory, disk-spooled,
+  lease-escalated — §3.5), that read-only transactions flush without CAS,
+  and that tainted sessions get the fatal session reset (§3.3), never a
+  bare `40001` on a session whose state is gone — the §3.7 contract
+  enforced mechanically, not by review.
 - **Abuse/load suite (early, not late):** hot single sequence hammered from
   N cells; `RETURNING`-heavy ORM traffic; migration tools under the
   advisory-lock policy; `SKIP LOCKED` queue workers on two cells; FK-heavy
