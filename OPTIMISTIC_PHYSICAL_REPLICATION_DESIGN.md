@@ -1573,9 +1573,10 @@ eventual review diff):**
   protocol is superseded;
 - the native fork branch's exports — WAL-LSN getters,
   `PgliteDropRelationBuffersRange` / `FindAndDrop…Range`, the `__PGLITE__`
-  hunks in clog/subtrans/transam/multixact — are re-landed on a fresh fork
-  branch as new-files-plus-tiny-hunks under the §14.1 patch budget (the old
-  fork branch predates that discipline);
+  hunks in clog/subtrans/transam/multixact — are re-landed on the fork's
+  paired branch (`optimistic-physical-replication`, per §14.8) as
+  new-files-plus-tiny-hunks under the §14.1 patch budget (the old fork
+  branch predates both disciplines);
 - **port the tests' invariants even where implementations are rewritten** —
   the crash-window, idempotent-replay, and dirty-generation tests encode
   hard-won thinking that transfers directly to §16's suites.
@@ -1618,6 +1619,24 @@ first:
 4. **Hunks in existing Postgres files** — last resort: 1–5 line call-site
    hooks, `__PGLITE__`-guarded, vanilla behavior when unconfigured.
 
+The ladder is also a **repository boundary**: rungs 1 (JS) live in the
+§14.7 monorepo packages; rungs 2–4 (libc, new C files, hunks) live in the
+`postgres-pglite` submodule. The contract across that boundary is
+deliberately thin and one-directional:
+
+- the submodule exposes **mechanism only** — `pgl_*` WASM exports and
+  GUC-gated hooks, enumerated in a single header that *is* the interface
+  documentation; every hook is default-off and vanilla-behaving when
+  unconfigured, so the fork remains a faithful Postgres until a package
+  turns a feature on;
+- **policy lives in the packages** — the read-set hook records into a ring
+  buffer, but harvesting and validation are JS; the sequence clamp reads a
+  limit the host set, but leases are JS; the redo entry point applies one
+  page, but the page-version index is JS;
+- packages depend on the exported API, never on Postgres internals — the
+  API surface is the thing the patch-budget metric protects, and it is
+  what must be re-reasoned on a major-version rebase, nothing else.
+
 The fork already follows this shape (`PgliteDropRelationBuffersRange` and
 friends as added functions; small `__PGLITE__` hunks in
 clog/subtrans/transam/multixact). Second principle: **reuse Postgres
@@ -1629,7 +1648,9 @@ re-apply. Battle-tested code, and it tracks version changes for free.
 
 Rule of thumb: **per-record / per-page / per-tuple loops in C; per-commit /
 per-frame orchestration in JS.** (Node-native crypto counts as C — hashing
-from JS is fine.)
+from JS is fine.) The Layer column doubles as repository location: JS rows
+land in the §14.7 packages; C and libc rows land in the `postgres-pglite`
+submodule under the §14.8 discipline.
 
 | Mechanism | Layer | Patch shape |
 | --- | --- | --- |
@@ -1858,6 +1879,35 @@ host exists. Supabase-lite embeds cell + gateway in one process; the fleet
 runs cell-server + gateway pools; both speak the identical gateway API,
 which is what makes sandbox → fleet promotion an upload (§14.5). Package
 names provisional; the boundaries are not.
+
+### 14.8 Submodule discipline: paired branches, atomic refs
+
+Native changes (rungs 2–4 of §14.1) live in the `postgres-pglite`
+submodule, and the two repositories move in lockstep by convention:
+
+- **Paired branch names.** The submodule branch carries *the same name* as
+  the superproject branch — this project's native work lands on
+  `optimistic-physical-replication` in `electric-sql/postgres-pglite`,
+  created from the fork's main when the first hook lands. One name, two
+  repos, no mapping table.
+- **The two-commit ritual, always in this order:**
+  1. commit the native change in the submodule on the paired branch and
+     **push it**;
+  2. commit the superproject gitlink bump *in the same commit as* the
+     package/doc changes that depend on the new hook.
+  A superproject commit must never reference native state its own change
+  does not need, and any checkout of the superproject branch must build —
+  the gitlink and its consumers travel together.
+- **A gitlink may only ever point at a remote-reachable commit.** Pushing
+  the submodule is step one, not a follow-up. (This rule exists because we
+  broke it: this branch's ancestor pinned a submodule commit that existed
+  on one laptop, atop extension pins that existed nowhere — recoverable
+  only because the machine survived. See §13.1's generated-artifact
+  caution for the sibling rule.)
+- **CI asserts the discipline** alongside the §14.1 hunk-count budget:
+  the pinned submodule commit is fetchable from the fork remote; the
+  submodule branch containing it matches the superproject branch name;
+  the exported hook header's surface hasn't grown without a doc change.
 
 ## 15. Milestones
 
