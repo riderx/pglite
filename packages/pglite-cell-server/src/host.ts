@@ -9,6 +9,7 @@ import type { GatewayHandle, GatewayTarget } from './gateway'
 import { DatabaseRuntime, resolveRuntimeOpts } from './database-runtime'
 import type { ResolvedRuntimeOpts, RuntimeOpts } from './database-runtime'
 import type { HostSession } from './session'
+import type { CheckpointReport } from './checkpoint'
 
 export interface CellHostOpts {
   /** The gateway: an in-process GatewayCore or `{ url }` for HTTP. */
@@ -62,6 +63,38 @@ export class CellHost {
   async hibernateDatabase(dbNameOrId: string): Promise<void> {
     const databaseId = await this.gateway.resolveDatabaseId(dbNameOrId)
     await this.runtimes.get(databaseId)?.hibernate()
+  }
+
+  /**
+   * Build a checkpoint for a database (M1e worker): materialize the shared
+   * base to a genuine stream position, pack + upload it, CAS a K frame, and
+   * register the control-plane row so future wakes hydrate it. The runtime
+   * is created + activated lazily if not already resident. Idempotent.
+   */
+  async checkpointDatabase(dbNameOrId: string): Promise<CheckpointReport> {
+    const databaseId = await this.gateway.resolveDatabaseId(dbNameOrId)
+    let runtime = this.runtimes.get(databaseId)
+    if (!runtime) {
+      runtime = new DatabaseRuntime({
+        databaseId,
+        hostId: this.hostId,
+        gateway: this.gateway,
+        dataRoot: this.dataRoot,
+        opts: this.opts,
+      })
+      this.runtimes.set(databaseId, runtime)
+    }
+    await runtime.ensureActive()
+    return runtime.checkpoint()
+  }
+
+  /**
+   * The resident runtime for a database id, if any (test hook + operational
+   * introspection). Does NOT create or activate — returns undefined when no
+   * runtime is resident.
+   */
+  runtimeFor(databaseId: string): DatabaseRuntime | undefined {
+    return this.runtimes.get(databaseId)
   }
 
   /** Databases with an ACTIVE runtime on this host. */

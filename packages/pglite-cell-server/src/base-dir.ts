@@ -121,6 +121,18 @@ export class BaseDirManager {
     return { lsn: this.canonicalState.lsn, offset: this.canonicalState.offset }
   }
 
+  /**
+   * The canonical base DIRECTORY (M1e checkpoint worker input): a datadir
+   * clean at a genuine stream position, its pg_control checkpoint anchor at
+   * `canonical.lsn - 120`. The checkpoint worker packs a copy of this dir.
+   * The paired `canonical.offset` is the sync-slice append's `nextOffset`
+   * (or the hydrated checkpoint's streamOffset) — the `streamOffset` a
+   * joiner must tail from. Only valid while the manager is active.
+   */
+  get canonicalDir(): string {
+    return this.canonicalState.dir
+  }
+
   /** Serialize every dir-mutating operation behind one promise chain. */
   private run<T>(fn: () => Promise<T>): Promise<T> {
     const p = this.chain.then(fn)

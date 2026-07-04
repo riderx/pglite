@@ -255,6 +255,21 @@ export class GatewayCore {
     })
   }
 
+  /**
+   * The latest (highest-LSN) checkpoint row for a database, or null. Used by
+   * the M1e checkpoint worker to decide idempotency (skip when a checkpoint
+   * already exists at the current canonical position). Additive accessor
+   * over the control plane's `latestCheckpoint`.
+   */
+  async latestCheckpoint(databaseId: string): Promise<{
+    lsn: string
+    snapEnd: string
+    streamOffset: string
+    objectRef: string
+  } | null> {
+    return this.controlPlane.latestCheckpoint(databaseId)
+  }
+
   /** Read a database's current manifest from the control plane. */
   async getManifest(databaseId: string): Promise<Manifest> {
     const db = await this.controlPlane.getDatabaseById(databaseId)

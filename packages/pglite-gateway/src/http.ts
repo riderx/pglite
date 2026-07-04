@@ -165,6 +165,24 @@ export class GatewayServer {
       }
     })
 
+    // --- Checkpoints (M1e worker) ----------------------------------------
+    app.get('/v1/db/:id/checkpoint/latest', async (c) => {
+      const row = await core.latestCheckpoint(c.req.param('id'))
+      if (row === null) return c.text('no checkpoint', 404)
+      return c.json(row)
+    })
+
+    app.post('/v1/db/:id/checkpoint', async (c) => {
+      const body = (await c.req.json()) as {
+        lsn: string
+        snapEnd: string
+        streamOffset: string
+        objectRef: string
+      }
+      await core.registerCheckpoint(c.req.param('id'), body)
+      return c.body(null, 204)
+    })
+
     // --- Objects (content-addressed, immutable) --------------------------
     app.get('/v1/objects/:ref', async (c) => {
       const ref = c.req.param('ref')

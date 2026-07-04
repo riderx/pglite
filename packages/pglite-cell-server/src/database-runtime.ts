@@ -25,6 +25,8 @@ import type { Manifest } from '@electric-sql/pglite-gateway'
 import { BaseDirManager } from './base-dir'
 import type { GatewayHandle } from './gateway'
 import { HostSession } from './session'
+import { checkpointDatabase } from './checkpoint'
+import type { CheckpointReport } from './checkpoint'
 
 /** Runtime tuning knobs (host-wide defaults, applied per database). */
 export interface RuntimeOpts {
@@ -41,6 +43,19 @@ export interface RuntimeOpts {
    * Undefined (default) disables the timer — hibernation stays explicit.
    */
   hibernateAfterMs?: number
+  /**
+   * On hibernate, run a checkpoint FIRST when the tail since the last
+   * checkpoint exceeds this many bytes. Default 0 = ALWAYS checkpoint on
+   * hibernate — this makes wake cheap (zero W-slice replay) and bounds the
+   * M1c ever-longer-tail cost. A negative value disables it.
+   */
+  checkpointOnHibernateBytes?: number
+  /**
+   * Auto-cadence (§2.4 dial): after each landed commit, if bytes since the
+   * last checkpoint exceed this, fire-and-forget a checkpoint. Default 0 =
+   * disabled (any nonzero value arms it).
+   */
+  checkpointEveryBytes?: number
 }
 
 export interface ResolvedRuntimeOpts {
@@ -49,6 +64,8 @@ export interface ResolvedRuntimeOpts {
   maxRetries: number
   attachAttempts: number
   hibernateAfterMs: number | undefined
+  checkpointOnHibernateBytes: number
+  checkpointEveryBytes: number
 }
 
 export function resolveRuntimeOpts(
@@ -60,6 +77,8 @@ export function resolveRuntimeOpts(
     maxRetries: opts.maxRetries ?? 3,
     attachAttempts: opts.attachAttempts ?? 10,
     hibernateAfterMs: opts.hibernateAfterMs,
+    checkpointOnHibernateBytes: opts.checkpointOnHibernateBytes ?? 0,
+    checkpointEveryBytes: opts.checkpointEveryBytes ?? 0,
   }
 }
 
@@ -89,7 +108,7 @@ export class DatabaseRuntime {
   readonly hostId: string
   readonly opts: ResolvedRuntimeOpts
 
-  private readonly gateway: GatewayHandle
+  private readonly _gateway: GatewayHandle
   private readonly root: string
 
   private _state: RuntimeState = 'cold'
@@ -120,10 +139,20 @@ export class DatabaseRuntime {
   private hibernateTimer: ReturnType<typeof setTimeout> | null = null
   private activating: Promise<void> | null = null
 
+  /**
+   * The snapEnd LSN of the last checkpoint this runtime knows of (from the
+   * manifest at activation, refreshed after every checkpoint it runs). The
+   * "tail since the last checkpoint" is `tailer.head.lsn - lastCheckpointLsn`
+   * — the byte proxy the checkpoint dials (hibernate / auto-cadence) test.
+   */
+  private lastCheckpointLsn = 0n
+  /** Guards against concurrent / re-entrant checkpoint runs (in-flight). */
+  private checkpointing: Promise<CheckpointReport> | null = null
+
   constructor(init: DatabaseRuntimeInit) {
     this.databaseId = init.databaseId
     this.hostId = init.hostId
-    this.gateway = init.gateway
+    this._gateway = init.gateway
     this.opts = init.opts
     this.root = join(init.dataRoot, init.databaseId)
   }
@@ -152,6 +181,11 @@ export class DatabaseRuntime {
     return this._baseDirs
   }
 
+  /** The gateway handle (M1e checkpoint worker consumes object/checkpoint). */
+  get gateway(): GatewayHandle {
+    return this._gateway
+  }
+
   get sessionCount(): number {
     return this.sessions.size
   }
@@ -174,17 +208,17 @@ export class DatabaseRuntime {
    */
   private async activate(): Promise<void> {
     const t0 = Date.now()
-    const manifest = await this.gateway.getManifest(this.databaseId)
+    const manifest = await this._gateway.getManifest(this.databaseId)
     this._manifest = manifest
 
     const dirsRoot = join(this.root, 'dirs')
     rmSync(dirsRoot, { recursive: true, force: true })
     mkdirSync(dirsRoot, { recursive: true })
     const canonicalDir = join(dirsRoot, 'canonical-0')
-    const ckptBytes = await this.gateway.getObject(manifest.checkpoint.ref)
+    const ckptBytes = await this._gateway.getObject(manifest.checkpoint.ref)
     await extractDatadir(ckptBytes, canonicalDir)
 
-    const client = this.gateway.streamClientFor(this.databaseId)
+    const client = this._gateway.streamClientFor(this.databaseId)
     const tailer = new EraTailer(client, {
       path: manifest.era.path,
       eraId: manifest.era.id,
@@ -219,6 +253,7 @@ export class DatabaseRuntime {
     // tailer head (everything on the stream is "applied" by definition).
     this.raiseWatermark({ offset: tailer.head.offset, lsn: tailer.head.lsn })
 
+    this.lastCheckpointLsn = parseLsn(manifest.checkpoint.snapEnd)
     this._state = 'active'
     await this.appendHeadLease()
 
@@ -288,8 +323,57 @@ export class DatabaseRuntime {
     }
     if (res.landed) {
       this.raiseWatermark({ offset: res.nextOffset, lsn: input.endLsn })
+      this.maybeAutoCheckpoint()
     }
     return res
+  }
+
+  /** Bytes of tail past the last known checkpoint (LSN delta as a proxy). */
+  private tailBytesSinceCheckpoint(): bigint {
+    const head = this._tailer?.head.lsn ?? this.lastCheckpointLsn
+    const delta = head - this.lastCheckpointLsn
+    return delta > 0n ? delta : 0n
+  }
+
+  /**
+   * Auto-cadence (§2.4 dial): once the tail past the last checkpoint exceeds
+   * `checkpointEveryBytes`, fire-and-forget a checkpoint. Guarded by the
+   * in-flight flag so a slow checkpoint never overlaps another. Disabled
+   * when the option is 0.
+   */
+  private maybeAutoCheckpoint(): void {
+    const threshold = this.opts.checkpointEveryBytes
+    if (threshold <= 0 || this.checkpointing !== null) return
+    if (this.tailBytesSinceCheckpoint() < BigInt(threshold)) return
+    void this.checkpoint().catch((err) => {
+      console.log(
+        `[pglite-cell-server] db ${this.databaseId}: auto-checkpoint ` +
+          `failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    })
+  }
+
+  /**
+   * Build a checkpoint for this database (M1e). Serialized by the in-flight
+   * guard — concurrent callers share the same run. On success the local
+   * last-checkpoint LSN advances so subsequent cadence / hibernate decisions
+   * measure the tail past the NEW checkpoint. Idempotent runs (`skipped`)
+   * still refresh the LSN.
+   */
+  async checkpoint(): Promise<CheckpointReport> {
+    if (this.checkpointing !== null) return this.checkpointing
+    const run = (async (): Promise<CheckpointReport> => {
+      await this.ensureActive()
+      const report = await checkpointDatabase(this)
+      this.lastCheckpointLsn = parseLsn(report.snapEnd)
+      return report
+    })()
+    this.checkpointing = run
+    try {
+      return await run
+    } finally {
+      this.checkpointing = null
+    }
   }
 
   /**
@@ -433,6 +517,25 @@ export class DatabaseRuntime {
   async hibernate(): Promise<void> {
     if (this._state !== 'active') return
     this.clearHibernateTimer()
+
+    // Checkpoint FIRST when the tail past the last checkpoint exceeds the
+    // threshold (default 0 = always). This is what makes wake cheap (zero
+    // W-slice replay past the checkpoint) and bounds the M1c ever-longer-tail
+    // cost. A negative threshold disables it. Best-effort: a failed
+    // checkpoint still hibernates (wake replays the tail as before).
+    const hibBytes = this.opts.checkpointOnHibernateBytes
+    if (hibBytes >= 0 && this.tailBytesSinceCheckpoint() >= BigInt(hibBytes)) {
+      try {
+        await this.checkpoint()
+      } catch (err) {
+        console.log(
+          `[pglite-cell-server] db ${this.databaseId}: hibernate ` +
+            `checkpoint failed (continuing): ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
+    }
+
     for (const session of [...this.sessions]) {
       await session._hibernateCell()
     }

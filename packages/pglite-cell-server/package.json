@@ -38,10 +38,11 @@
   },
   "scripts": {
     "build": "tsup",
-    "lint": "eslint ./src ./tests --report-unused-disable-directives --max-warnings 0",
-    "format": "prettier --write ./src ./tests",
+    "demo": "tsx ./scripts/demo-scale-to-zero.ts",
+    "lint": "eslint ./src ./tests ./scripts --report-unused-disable-directives --max-warnings 0",
+    "format": "prettier --write ./src ./tests ./scripts",
     "typecheck": "tsc",
-    "stylecheck": "pnpm lint && prettier --check ./src ./tests",
+    "stylecheck": "pnpm lint && prettier --check ./src ./tests ./scripts",
     "test": "vitest"
   },
   "dependencies": {
