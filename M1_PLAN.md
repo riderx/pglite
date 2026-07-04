@@ -198,7 +198,9 @@ token and is group zero.
 ## Scope cuts (documented, deliberate — each lands at its owning milestone)
 
 - **One era per database.** Era-shaped everything (URLs
-  `…/era/<6-digit-ordinal>-<ulid>`, O frames, era-qualified tokens), but no
+  `…/era/<6-digit-ordinal>-<ulid>`, O frames, era-qualified tokens; NOTE:
+  manifest `era.path` carries a LEADING slash — `DsStreamClient` joins by
+  string concatenation, M1b finding), but no
   rotation: K frames land mid-era; joiners hydrate the latest checkpoint and
   tail from its recorded offset. Rotation state machine = M2 (§6.1).
 - **Advance = recycle-with-materialize**, host base-dir shared per database;
