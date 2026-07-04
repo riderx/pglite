@@ -64,10 +64,13 @@ Re-verify line references against these before implementation.
    (§14.5) and the control plane is never in the commit path (§14.6). If a
    feature needs shared mutable state, it goes in the stream — or it does
    not exist.
-5. **Leases are the steady state; optimism is the safety net.** A cell holding
-   the head lease never loses a commit race and delivers vanilla Postgres
-   semantics. Optimistic CAS commits are what make the lease safe to lose —
-   failover, bursts, cross-sandbox writes — not the common case.
+5. **Leases are the steady state; optimism is the safety net.** The lease
+   holder (a host's commit sequencer, §14.4; a lone cell is the degenerate
+   case) never loses a commit race with *other hosts* and delivers vanilla
+   Postgres semantics; same-host sibling cells still race each other and
+   resolve locally (§3.7). Optimistic CAS commits are what make the lease
+   safe to lose — failover, bursts, cross-sandbox writes — not the common
+   case.
 6. **Fail loud, never silent.** Every known gap in transparent conflict
    handling degrades to a retryable serialization failure — SQLSTATE `40001`,
    defined in §4.0 — never to silently wrong data. The four known
@@ -83,7 +86,7 @@ committed history is one linear WAL.**
 ```text
                        ┌────────────────────────────────────┐
                        │ Object storage                     │
-                       │  - manifest (per database)         │
+                       │  - manifest → control plane §14.6  │
                        │  - checkpoint objects (pages+aux)  │
                        │  - spilled large WAL slices        │
                        └───────────────▲────────────────────┘
@@ -113,8 +116,8 @@ Each database (branch/timeline) consists of:
 
 - one **era chain** of Durable Streams carrying framed WAL and control records;
 - a **manifest**: latest checkpoint ref, current era stream URL + start
-  offset, era history, fork lineage, allocator high-water marks — held as
-  rows in the control-plane Postgres (§14.6), cached by gateways;
+  offset, era history, fork lineage, sequence-grant high-water marks — held
+  as rows in the control-plane Postgres (§14.6), cached by gateways;
 - **checkpoint objects**: immutable snapshots of the full recovery state (§6.1);
 - zero or more active **compute cells**, each an isolated WASM instance with a
   capability-scoped host API (§11).
@@ -165,15 +168,23 @@ and no code may ever derive one from the other.
 ### 2.2 Frame types
 
 ```text
-'W'  WAL slice        { commitId, baseLsn, endLsn, flags, walBytes }
-'w'  WAL slice ref    { commitId, baseLsn, endLsn, objectRef, sha256, byteLength }
-'G'  grant            { kind: sequence (others reserved — see §5.1), range, grantee }
-'L'  lease            { kind: head|gc-pin|ddl, holder, epoch, ttl, pinnedLsn? }
-'K'  checkpoint       { lsn, manifestRef, sha256 }
+'W'  WAL slice        { commitId, eraId, expectedOffset, baseLsn, endLsn,
+                        sliceHash, walBytes }
+'w'  WAL slice ref    { commitId, eraId, expectedOffset, baseLsn, endLsn,
+                        sliceHash, objectRef, byteLength }
+'O'  era open         { eraId, ordinal, prevEraId, prevEraUrl, baseOffset,
+                        baseLsn, checkpointRef }   (carried in the creating
+                        PUT body — atomic with era creation)
+'S'  era seal         { eraId, finalOffset, finalLsn, nextEraUrl, nextEraId }
+'G'  grant            { kind: sequence (others reserved — §5.1), range,
+                        grantee, granteeEpoch }
+'L'  lease            { kind: head|gc-pin, holder, epoch, ttl,
+                        pinned(offset, lsn)? }
+'K'  checkpoint       { lsn, checkpointRef, sha256 }
 'N'  notify sidecar   { channel, payload, commitLsn }
-'S'  seal / era-step  { nextEraUrl, finalLsn }
-'F'  fork marker      { childDatabaseId, forkLsn }
+'F'  fork marker      { childDatabaseId, forkOffset, forkLsn }
 'X'  schema epoch     { epoch, reason }   (optional; derivable from invals)
+'0'  fence / no-op    { eraId, expectedOffset }    (recovery fencing, §3.8)
 ```
 
 Rules:
@@ -187,19 +198,13 @@ Rules:
 - `N` frames are appended atomically with their commit's `W` frame (same POST),
   giving cross-cell NOTIFY fanout in commit order (§10.2).
 - `commitId` is a cell-generated UUID journaled locally **before** the
-  append attempt, together with `{era URL, expected offset O, baseLsn,
-  endLsn, slice hash}` (pending-commit journal, salvaged from the old
-  branch). Producer headers alone cannot answer "did my commit land?" after
-  a crash — the restarted incarnation no longer holds the byte-identical
-  body a dedup retry would need. Recovery is exact and bounded, not a scan:
-  (1) **bump the producer epoch** — this fences any in-flight zombie append
-  from the dead incarnation, making the next step conclusive; (2) read the
-  journaled era at offset O; (3) our `commitId` there ⇒ landed; anything
-  else or nothing ⇒ lost (base-exactness means offset O could only ever
-  hold our proposal or a rival's). If the journaled era has already been
-  GC'd (recovery delayed past retention), the outcome is surfaced as
-  **indeterminate** — the same honest state a vanilla client is in after
-  losing its connection mid-`COMMIT`.
+  append attempt, together with `{era URL + id, expected offset O, CAS
+  token, baseLsn, endLsn, sliceHash, producer id/epoch/seq}` (pending-commit
+  journal, salvaged from the old branch). Producer headers alone cannot
+  answer "did my commit land?" after a crash — the restarted incarnation no
+  longer holds the byte-identical body a dedup retry would need. The full
+  fence-then-read recovery algorithm is §3.8; the decision is always made
+  from stream bytes at immutable positions, never from producer state.
 
 ### 2.3 Compare-and-append
 
@@ -232,30 +237,59 @@ Caveats to engineer around:
 - Tail with long-poll or catch-up reads, never SSE (SSE base64-encodes binary,
   +33%).
 
+**Four CAS invariants** (from adversarial verification against both server
+implementations; each closes a concrete broken interleaving):
+
+- **W1 — every era-stream append is CAS'd.** Fences, `K`/`S`/`L`/`G`
+  frames, tail-copies — no exceptions. The per-stream seq floor is what
+  protects *everyone* against stale bases, and it only advances when
+  appends carry the token; one uncarried append tears the floor and lets a
+  stale-based rival land.
+- **W2 — retries are byte-identical against the journaled URL.** Nothing
+  ever re-targets an in-flight payload at a newer era.
+- **W3 — CAS tokens are era-qualified**: `pad(eraOrdinal) + "," + offset`
+  (fixed-width ordinal dominates the lexicographic compare). Fresh era
+  streams restart offsets and reset the seq floor, so an un-qualified stale
+  token from era N could pass on era N+1; the era's first append arms the
+  new floor.
+- **W4 — frames are self-describing and position-checked**: every frame
+  carries `{eraId, expectedOffset, …}` and readers/appliers **void any
+  frame whose expectedOffset differs from the position it occupies**. This
+  is the only defense that survives the production server's
+  metadata-rollback window (§2.6) — commit decisions derive from stream
+  bytes at immutable positions, never from producer/seq state.
+
 ### 2.4 Eras: bounded streams, stepped by checkpoints
 
 Era rotation is load-bearing, not hygiene: both shipped servers return the
 **entire remainder of a stream in one response, buffered in server memory**.
 Unbounded streams mean unbounded joins.
 
-Rotation protocol:
+Rotation, narratively (§6.1 holds the normative state machine):
 
-1. A checkpoint completes at LSN `C` (§6.1) and its `K` frame is appended.
-2. The rotating worker seals era `N`: `POST` with body = `S` frame
-   (`nextEraUrl`, `finalLsn`), `Stream-Closed: true`, `Stream-Seq` guard, and
-   producer headers. Verified semantics: append+close is atomic under the
-   per-stream lock and closure is terminal — nothing can land after the seal.
-   Two sharp edges: the close-*only* path (empty body) skips `Stream-Seq`
-   validation entirely, so always seal **with** a body; and append+close is
-   not itself tail-conditional, so the `Stream-Seq`/expected-offset guard on
-   the sealing POST is what makes rotation race-safe.
-3. Era `N+1` is a **fresh stream** (offsets restart; manifest carries the
-   mapping), not a stream-fork: fork-chain reads recurse the whole chain per
-   GET, so a long-lived database would pay per-era recursion forever. Fresh
-   streams also release old eras for deletion once no fork or pin references
-   them.
-4. The manifest is CAS-updated to point at era `N+1` — a guarded
-   transactional update in the control plane (§14.6).
+1. A checkpoint completes at LSN `C` and its `K` frame is CAS-appended.
+2. Era `N+1` is created **first** as a **fresh stream** (not a fork —
+   fork-chain reads recurse per era, and forks reset producer/seq state
+   anyway) at a **unique per-attempt URL** (`…/era/<ordinal>-<ulid>`): PUT
+   idempotency compares config only and *silently discards the body* on
+   match, so a deterministic URL would let two racing rotators mix up
+   checkpoint identities. The `O` (era-open) frame rides in the PUT body,
+   atomic with creation; the `S` frame is the sole naming authority — a
+   losing rotator's era is an orphan by construction, swept by GC after a
+   grace period.
+3. The rotator seals era `N`: `POST` body = `S` frame, `Stream-Closed:
+   true`, CAS token, producer headers. Verified: append+close is atomic and
+   closure terminal. **Never seal with close-only** — the close-only path
+   skips `Stream-Seq` validation entirely, so it can race a landing commit
+   with no error; a closed era *without* a terminal `S` frame is wedged
+   (stop writes, run rotation-repair). A commit that beats the seal is an
+   ordinary era-N commit; the rotator re-cuts or tail-copies and retries.
+4. The manifest is CAS-updated to era `N+1` — a guarded transactional
+   update in the control plane (§14.6). Rotation is **re-entrant**: before
+   rotating, walk forward (while the manifest era is sealed with a valid
+   `S`, advance the manifest); writers hitting 409-closed on a commit read
+   the tail `S`, hop, **re-base, and re-CAS** — never blind-forward a slice
+   whose base is now suspect.
 
 **The central operational dial:** checkpoint cadence = era length = worst-case
 join tail = worst-case rebase distance. One knob governs recovery time,
@@ -268,9 +302,11 @@ error, so a lost tail is otherwise undetectable).
 
 ### 2.5 Database forks
 
-Forking a database at LSN `H` uses the native stream fork primitive
-(`PUT` + `Stream-Forked-From` + `Stream-Fork-Offset`), which is implemented in
-all stores with refcounting, soft-delete, and cascading GC:
+Forking a database at a recorded `(offset, LSN)` pair uses the native
+stream fork primitive (`PUT` + `Stream-Forked-From` + `Stream-Fork-Offset`
+— the PUT consumes the *offset*; the manifest and `F` frame record the
+*LSN*, per §2.1's two-positions rule), implemented in all stores with
+refcounting, soft-delete, and cascading GC:
 
 - fork manifest references the parent checkpoint lineage and parent eras up to
   `H`; reads resolve through the layered lookup (fork-local first, then parent
@@ -284,8 +320,10 @@ all stores with refcounting, soft-delete, and cascading GC:
 - GC is fork-aware: parent checkpoints, eras, and WAL ranges are pinned while
   any descendant references them (reverse references in the manifest).
 
-Fork = one manifest write + one stream-fork PUT. No page copies. Long-lived
-forks should compact onto their own checkpoint + fresh era to unpin parents.
+Fork = one manifest write + one stream-fork PUT + one CAS-appended `F`
+frame in the parent era (so tailers and GC learn of the child in-band). No
+page copies. Long-lived forks should compact onto their own checkpoint +
+fresh era to unpin parents.
 
 ### 2.6 Transport durability is a first-class dependency
 
@@ -312,6 +350,17 @@ Tenant data at rest — stream bytes and checkpoint objects — rides the
 deployment's storage-layer encryption; per-tenant key scoping is a tier
 feature (§11.3), not assumed by the base design.
 
+One verified production-server fact the spec does not advertise: in the
+caddy store, **producer state, the CAS floor, and the closed bit can roll
+back across a server crash while the appended frames survive** (bbolt
+metadata errors are swallowed — "the file is the source of truth" — and
+crash recovery reconciles only the offset). The design absorbs this via W4
+(§2.3): frames self-describe their expected position and readers void
+mis-positioned stragglers, and all landed/lost decisions come from stream
+bytes, never producer state. Worth filing upstream: recovery should rebuild
+producer/seq/closed state from the segment scan, and appends should commit
+metadata before ack.
+
 ## 3. Commit protocol
 
 ### 3.1 Cell lifecycle and the happy path
@@ -331,8 +380,17 @@ feature (§11.3), not assumed by the base design.
     expected stream offset = O — the CAS token is the OFFSET, never an LSN
     (control frames advance offsets without advancing WAL, §2.1)
 7.  win → new head (O', B'); ack client; overlay becomes clean local cache
-8.  lose → §3.3 / §7
+8.  lose → §3.3 / §4
 ```
+
+Slice capture is **LSN-bounded, not write-bounded** (verified): Postgres
+flushes whole 8 KB pages from page start, so the first flush after attach
+rewrites bytes below B (byte-identical — the insertion buffer was seeded
+from the VFS's own served page) and page/segment headers inside `(B, B']`
+are ordinary in-band stream bytes. The slice is whatever lies between the
+two LSNs, unfiltered — load-bearing for aborted transactions' sequence
+records (§5.3 rule 4) *and* for multixact `CREATE_ID` records from aborted
+subxacts, whose replay is outcome-independent (§5.1).
 
 The client ack strictly follows CAS success. `synchronous_commit=off` is
 accepted but inert: acking before the CAS resolves would convert a lost race
@@ -340,7 +398,7 @@ into acknowledged data loss (verified: the vanilla fast path acks before WAL
 flush; the analogous shortcut here is unsound).
 
 Read-only requests skip the CAS entirely — but note reads are not WAL-silent
-in vanilla Postgres (§7.6): follower-mode cells suppress pruning/hint-FPI so
+in vanilla Postgres (§7): follower-mode cells suppress pruning/hint-FPI so
 read traffic generates no slice.
 
 ### 3.2 The head lease: steady state
@@ -352,9 +410,10 @@ lone cell is just the degenerate case (§14.4). While held and unexpired:
 - the router-free load balancer still sends requests anywhere, but any cell
   can see from the tail who holds the lease and proxy writes to the holder
   (or the holder simply wins every CAS because nobody else is appending);
-- the holder pipelines commits without contention — vanilla semantics,
-  vanilla latency minus one stream round-trip per commit;
-- interactive transactions on the holder never rebase;
+- the holder pipelines commits without cross-host contention — vanilla
+  semantics, vanilla latency plus one stream round-trip per commit;
+- interactive transactions never lose to *other hosts* while the lease
+  holds (same-host siblings still race and resolve locally, §3.7);
 - DDL transactions implicitly require the lease (§8.2).
 
 Lease loss (crash, TTL expiry, network partition) needs no recovery protocol:
@@ -393,7 +452,17 @@ So tainted loss is a **fatal session reset**: an `ERROR` naming the cause,
 then connection termination (vanilla precedent — crash recovery closes
 connections; every driver and pool handles reconnect). Tainted sessions are
 also excluded from advance-by-reattach (§15 M1): they pin at their base
-until they commit or end. The in-place reset (M5) lifts all of this.
+until they commit or end. A pinned session is governed by three rules
+(adversarially forced): it holds a **`gc-pin` lease** — `{base (era,
+offset, lsn), TTL, heartbeat}` — so the GC horizon (§6.4) cannot sweep the
+state a rehydration would need, with a hard max TTL and a per-database pin
+cap (expiry ⇒ the same fatal session reset — legitimate, since backend
+death loses identical state in vanilla); its growing staleness is
+surfaced (NOTICE + metric), and idle pinned sessions are reaped; its
+writes are attempted normally — the first CAS loss is the fatal reset, not
+a retry loop. M3's live tail-apply lifts the *pinning* (temp state survives
+in-place slice application — only recycling kills it); M5's in-place reset
+lifts the *taint* itself.
 
 ### 3.4 Reset-to-head
 
@@ -412,7 +481,10 @@ Discarding speculative state and re-aligning to head `K`:
   syscache/plancache flush — the simple safe default), honor
   `relcacheInitFileInval`, and call `ResetSequenceCaches()` (§5.3, mandatory —
   relfilenumber-keyed invalidation does not catch replayed foreign sequence
-  records).
+  records). The verified scope bar (§5.1): in-place reset must be
+  **crash-recovery-grade** — `TransamVariables`, `MultiXactState`, all SLRU
+  buffers, sequence caches, and the losing attempt's temp storage — or it
+  is not a reset.
 
 ### 3.5 The session proxy
 
@@ -433,13 +505,34 @@ transactions, every byte — `DataRow`s, `CommandComplete`,
 `NotificationResponse`, errors — is held until the transaction's CAS
 resolves; on loss, the buffer is discarded and the re-execution's output is
 sent instead. End-of-transaction with an empty WAL slice ⇒ read-only ⇒
-flush immediately, no CAS. Oversized results never break the invariant:
-past the in-memory cap the buffer **spools to local disk**, and past the
-spool cap the host **acquires the head lease before flushing** — a leased
-commit cannot lose, so streaming becomes safe. Mutating output (`RETURNING`
-rows, `CommandComplete`) is never sent ahead of an unresolved CAS, at any
-size. Interactive transactions stream mid-transaction results by design;
-only the `COMMIT` response is held (§4).
+flush immediately, no CAS.
+
+The governing invariant (adversarially corrected — an earlier draft's "a
+leased commit cannot lose" was false, because a lease acquired *after*
+execution fences the future, not the already-executed past): **no byte
+reaches the client except from (a) a landed commit, (b) an execution begun
+under a held lease, or (c) a declared read-only statement.** The
+escalation ladder for oversized results:
+
+1. buffer in memory up to M; 2. spool to local disk up to D;
+3. past D: stop producing output and probe the lease **at the executed
+   base** — CAS an `L` frame with the token of base O_B. Landing proves
+   nothing intervened since execution, so the spool + slice flush safely;
+4. else discard and **re-execute under the lease** (CAS `L` at the current
+   head, bounded attempts): an execution begun under a held lease cannot
+   lose, so output streams to the client with zero buffering; heartbeat
+   frames extend the lease TTL for long runs;
+5. terminal: lease unobtainable → `40001` with a "response exceeded proxy
+   buffer; retry" hint. Never a partial result.
+
+Declared read-only is the true streaming fast path: on `BEGIN READ ONLY` /
+`default_transaction_read_only=on`, Postgres itself rejects non-temp
+writes, the commit slice is empty **by construction**, and the proxy
+streams incrementally at any size — the proxy sets the GUC itself and
+treats a nonempty slice at end as a protocol bug. Undeclared `SELECT`s get
+no such path (they can invoke volatile writing functions). Interactive
+transactions stream mid-transaction results by design; only the `COMMIT`
+response is held (§4).
 
 ### 3.6 Commit-sequence placement audit
 
@@ -468,16 +561,58 @@ is stated, enforced, and tested — never implied. At M1–M4 (one-shot optimism
 | One-shot statements / whole-transaction batches, no session-local state | transparent re-execute (§3.3) |
 | Sessions holding temp tables, `WITH HOLD` cursors, session advisory locks | fatal session reset — error + connection close (taint, §3.3) |
 | Interactive transactions | `40001` at `COMMIT` (from M1) until rebase lands (M5) |
-| DDL | never races — serialized via the head lease (§8.2) |
+| DDL | serializes via the head lease (§8.2); a stale-lease loser re-executes like any one-shot |
 | Read-only (empty slice) | never conflicts; response flushes at txn end |
 
-On leased cells — the steady state — none of these degradations trigger,
-because losses require an actual cross-host race. The contract is enforced
+The head lease eliminates *cross-host* losses, but same-host sibling cells
+still race each other and resolve through the host sequencer — so these
+rows are live behavior from M1, not a fleet-only concern (a lone
+connection on a leased host is the only configuration that never races).
+The contract is enforced
 mechanically (taint bits route the failure) and each row is pinned by a §16
 contract test. One structural grace note: cells have no filesystem or
 network access, so the vanilla hazard of "trigger with external side
 effects ran before the commit failed" is impossible here by construction —
 in-database side effects are the only kind, and those retry cleanly.
+
+### 3.8 Commit recovery: "did it land?"
+
+After a crash between POST and ack, the restarted incarnation decides the
+outcome exactly, from stream bytes (adversarially corrected — there is no
+epoch-bump API; fencing is itself a CAS'd append, and every step obeys
+W1–W4, §2.3):
+
+```text
+journal (fsync'd before the original POST):
+  { commitId, eraId+URL, expectedOffset O, casToken, baseLsn, endLsn,
+    sliceHash, producerId, epoch e, seq, fenceEpoch := e }
+
+RECOVER:
+ 1. fenceEpoch := max(fenceEpoch, e) + 1; fsync journal   (monotonic per attempt)
+ 2. HEAD the journaled era → (tail T, closed?);  closed → step 4
+ 3. FENCE: CAS-append a '0' no-op frame {eraId, expectedOffset T} with
+    (producerId, fenceEpoch, seq 0) and token(era, T)
+      409-seq    → re-HEAD, retry (nothing mutated on 409)
+      409-closed → step 4 (closure fences everything)
+      403 (higher epoch echoed) → a newer incarnation already fenced;
+                    mark self-fenced; step 4
+      200        → fenced; step 4
+ 4. DECIDE: GET era at offset O; first frame F:
+      F.commitId == journal.commitId ∧ F.sliceHash matches → LANDED
+      any other frame, or empty + closed                   → LOST: discard
+        speculative state, rebase, run a NEW transaction with a NEW
+        commitId — never re-POST old slice bytes
+      era GC'd past retention                              → INDETERMINATE
+        (the vanilla lost-connection-during-COMMIT state, surfaced honestly)
+ 5. write again only with epoch ≥ fenceEpoch (or > the echoed one), seq 0
+```
+
+Why the fence must carry the CAS token: the epoch fences only *our*
+producerId; the per-stream seq floor is what protects everyone against
+stale bases, and it advances only when appends carry tokens (W1). An
+unguarded fence would leave a gap a stale-based rival could land through.
+The original in-process retry path (same incarnation, same producer tuple)
+still uses plain 204-dedup and never needs this.
 
 ## 4. Interactive transactions: transparent rebase
 
@@ -499,8 +634,11 @@ precise and well known to drivers, ORMs, and retry middleware:
 
 This design adopts `40001` as the **single client-visible failure mode for
 every cross-cell conflict**: a lost commit race that cannot be transparently
-rebased, a read-set validation failure, a schema-epoch fence trip, a tainted
-transaction losing a race, a retry/rebase budget being exhausted. Surfaced as:
+rebased, a read-set validation failure, a schema-epoch fence trip, a
+rebase-tainted transaction (§4.5) losing a race, a retry/rebase budget being
+exhausted. The one exception is *session-state* taint (§3.3), which
+escalates to a fatal session reset — the connection's local state cannot
+survive the loss, so keeping the wire open would lie. Surfaced as:
 
 ```text
 ERROR:  could not serialize access due to concurrent update
@@ -520,8 +658,8 @@ Goal: clients never implement retry loops. Interactive transactions
 **transparently re-applied** or fail with `40001` — the same contract as
 vanilla `SERIALIZABLE`, and rare in practice because leased cells never race.
 
-This ships as a ladder: (v1) any race → `40001` (loud, trivial, correct);
-(v2) rebase with validation, below. All mechanisms are source-verified; the
+This ships as a ladder: v1 (= M1) any race → `40001` — loud, trivial,
+correct; v2 (= M5) rebase with validation, below. All mechanisms are source-verified; the
 original naive formulations were adversarially refuted and the repaired rules
 are what follows.
 
@@ -643,7 +781,13 @@ preserve them. Track cheap per-transaction taint; if tainted, a lost CAS
 downgrades to `40001` instead of rebase:
 
 - result sets projecting `ctid`, `xmin`, `cmin`, `cmax`;
-- calls to `txid_current()` / `pg_current_xact_id()`.
+- calls to `txid_current()` / `pg_current_xact_id()`;
+- writes to temp tables during the losing attempt (verified hazard: temp
+  pages keep the discarded xid *numbers*, which the winner's stream later
+  rebinds — rolled-back temp rows would zombie back to visibility;
+  restamping temp rows at rebase is possible but not v1. Temp content from
+  *previously committed* transactions is safe — those xids are in the
+  stream and stable).
 
 Concrete casualty otherwise (verified): EF Core/Npgsql's default optimistic
 concurrency token is `xmin` — post-rebase it silently mismatches and the app
@@ -710,6 +854,23 @@ coordination is sequences — the only counter a client can observe
 mechanically: stream replay into vanilla Postgres must yield clean clog,
 multixact, and `pg_amcheck` state under randomized, abort-heavy,
 multi-cell workloads.
+
+Two conditions the adversarial pass attached (both absorbed elsewhere but
+stated here because they are what the claim *rests on*):
+
+- **"losers discard all local state" means crash-recovery-grade
+  re-derivation** — shared-memory counters (`TransamVariables`,
+  `MultiXactState`), *all* SLRU buffers, sequence caches, and temp
+  storage, not just heap pages and WAL. The concrete hazard otherwise: a
+  loser that speculatively crossed a clog page boundary discarded that
+  page's ZEROPAGE record with its slice; retained local clog state would
+  let a later commit reference an xid on a page never zero-logged in the
+  stream. Cell recycle satisfies this by definition; it defines the M5
+  in-place reset's mandatory scope (§3.4);
+- **a custom slice applier must replicate the recovery loop's per-record
+  `xl_xid` advance** (plus the commit/abort/multixact payload-xid
+  advances) — the chaining argument assumes standard-redo semantics
+  (§6.3).
 
 ### 5.2 OIDs and relfilenumbers
 
@@ -812,15 +973,24 @@ pg_xact/           (clog — REQUIRED; tail replay only extends it)
 pg_multixact/
 pg_commit_ts/      (if enabled)
 pg_filenode.map    (global + per-database relmapper files)
-pg_twophase/
+pg_twophase/       (empty while 2PC is out of scope, §9)
 unlogged-relation init forks
 pg_control         (coherent CheckPoint struct: nextXid, nextOid,
                     nextMulti/Offset, oldest* horizons, TLI, fullPageWrites)
 ```
 
-The checkpoint record itself must be **real, CRC-valid bytes in the stream**
-with a correct back-pointer and a reachable REDO record — recovery validates
-all of it; it cannot be fabricated at an arbitrary LSN. MVP protocol: the
+The checkpoint record itself must be **real, CRC-valid bytes in the
+stream** — verified twice over: recovery validates record CRC, prev-link,
+exact length, and REDO placement, and even the clean-shutdown boot *reads
+the record from pg_wal* (there is no code path that trusts `pg_control`
+alone, §6.5). The rule that follows (adversarially recommended): **cells
+never synthesize WAL — the host mints checkpoint records as stream
+bytes.** On clean detach, the exiting cell's genuine shutdown checkpoint
+is the record (note: the fork's exit path can bypass `ShutdownXLOG`, so
+the host must drive a real shutdown, not just kill the worker); on crash
+attach, the host CAS-appends a canonical shutdown-checkpoint record at the
+head (advancing B by its 120 bytes), deterministic by construction so two
+hosts can never mint divergent bytes at the same LSN. MVP protocol: the
 host sequencer quiesces the database (it holds appends — with multiple
 cells per host there is no single "producing cell"), one cell runs a
 genuine shutdown-style checkpoint, the worker snapshots the datadir into
@@ -839,27 +1009,39 @@ The fork already compiles out automatic XLOG-consumption checkpoints under
 
 Checkpoint publication and era rotation follow a fixed state machine — this
 is the normative order (§2.4 is the narrative view); every step is
-idempotent and any worker can resume after a crash at any point:
+idempotent, every append obeys W1–W4 (§2.3), and any worker can resume or
+adopt after a crash at any point:
 
 ```text
-1. quiesce + local checkpoint       redo: rerun — nothing published yet
-2. upload checkpoint objects        redo: content-addressed, re-put is safe
-3. create era N+1 stream (PUT)      redo: idempotent PUT (200 on match);
-                                    created before the seal so the pointer
-                                    target always exists
-4. append K frame to era N          redo: producer dedup, or tail scan
-5. seal era N (S frame + close,     redo: guarded seal — losing the seal
-   Stream-Seq guard, with body)     race means another worker rotated;
-                                    abandon this attempt
-6. CAS manifest → {checkpoint,      redo: conditional update; loser
-   era N+1}                         re-reads and reconciles
+0. REPAIR-WALK: while the manifest era is sealed with a valid terminal S,
+   CAS-advance the manifest to S.next (0 rows updated ⇒ someone else
+   repaired ⇒ re-read, continue)
+1. quiesce (host-local) + checkpoint  redo: rerun — nothing published yet
+2. upload checkpoint objects          redo: content-addressed, re-put safe
+3. PUT era N+1 at a UNIQUE per-attempt URL (…/era/<ordinal>-<ulid>), body
+   = O frame                          redo: idempotent PUT matches only our
+                                      own retry (PUT discards bodies on
+                                      config match — deterministic URLs
+                                      would mix up rival checkpoints)
+4. CAS-append K frame to era N        redo: producer dedup or read-back
+5. SEAL era N: CAS append+close, body = S {…, nextEraUrl = step 3}
+     409-seq    → a commit raced in: it is a legitimate era-N commit;
+                  tail-copy it into N+1 (still unreferenced) or re-cut
+     409-closed → another rotator won; adopt theirs; our era orphans
+6. control-plane manifest: UPDATE … WHERE era = N (re-entrant via step 0)
+GC: sweep era streams that are unreferenced by manifest or any terminal S
+    and older than a grace window (orphans from lost races and crashes)
 ```
 
 Joiner tolerance rules make partial progress harmless: a `K` frame with no
-seal ⇒ keep tailing era N; an era N+1 that exists but is unreferenced ⇒
-ignore it until the manifest or an `S` frame says otherwise; a sealed era ⇒
-follow the `S` pointer even if the manifest lags behind. The manifest in
-step 6 is control-plane rows (§14.6); the guard is `UPDATE … WHERE era = N`.
+seal ⇒ keep tailing era N; an era that exists but is unreferenced ⇒ ignore
+it; a terminal `S` ⇒ verify the `O`/`S` mirror linkage (`S.finalLsn ==
+O.baseLsn`, ids match) and hop, even if the manifest lags. **Presence of a
+valid terminal `S` frame means sealed regardless of the stream's closed
+bit** (the closed bit can roll back across a server crash, §2.6); a closed
+era *without* a terminal `S` is wedged — stop writes, run repair. Writers
+whose commit gets 409-closed re-base on the new era and re-CAS; they never
+blind-forward a slice whose base is now suspect.
 
 ### 6.2 The follower invariant (corrected)
 
@@ -907,6 +1089,20 @@ Enumerated (verified) record set a tail applier handles specially, eagerly:
   DBASE create/drop, TBLSPC, SLRU zero/truncate pages.
 - **XLOG-rmgr control**: NEXTOID, checkpoints, `PARAMETER_CHANGE`,
   `FPW_CHANGE`, standalone FPIs.
+- **Identity advancement, exactly as standard redo does it** (verified
+  load-bearing for §5.1): advance `nextXid` past *every* replayed record's
+  `xl_xid`, plus the payload xids of commit/abort records (latest of
+  subxid arrays — always complete, even under suboverflow) and multixact
+  member xids; advance `nextMulti`/`nextOffset` from `CREATE_ID` records
+  regardless of the emitting transaction's outcome.
+- **SLRU materialization is a semantic pipeline, not page versioning**
+  (verified): SLRU pages carry no LSN and no page header, so the
+  page-version index cannot cover `pg_xact`/`pg_multixact`/commit-ts — the
+  tailer materializes them by applying commit/abort/multixact records
+  (plus ZEROPAGE/TRUNCATE), and attach requires specific segments present:
+  the clog page covering `nextXid`, the multixact offsets page covering
+  `nextMulti` (always read on a fresh lineage), and the members page for
+  `nextOffset` (§6.5).
 - Buffer invalidation for pages the running follower has in shared_buffers —
   the fork's `PgliteDropRelationBuffersRange` hook, driven by the block refs
   in applied records.
@@ -961,10 +1157,21 @@ directly — the machinery already built in `pglite-durable-vfs`.
 What each lifecycle event actually transfers:
 
 - **cold start / wake**: manifest + `pg_control`-scale metadata — kilobytes.
-  The cell attaches at head via the page-version index (a synthesized
-  clean-at-`H` control view, with `nextXid`/`nextOid` and clog state coming
-  from the tailer's eager commit-record processing, §6.3); it does not run
-  eager redo. First-query latency pays only for that query's working set;
+  The cell attaches at head via the page-version index; it does not run
+  eager redo. Verified feasible with **zero C changes** — the fork's
+  clean-shutdown boot path is byte-for-byte vanilla and every gate is
+  satisfiable by served bytes. The recipe: the VFS serves a **synthesized
+  `pg_control`** (state `DB_SHUTDOWNED`, `checkPointCopy` carrying the
+  tailer's identity state — the clean path installs counters from the
+  *control copy*, not the record) pointing at a shutdown-checkpoint record
+  that is **real stream bytes minted by the host** (§6.1) — cells never
+  synthesize WAL. Boot reads exactly two WAL pages (segment page 0 + the
+  record's page; the rest of the segment may be zeros), and requires the
+  SLRU segments covering `nextXid`/`nextMulti`/`nextOffset` present
+  (materialized by the tailer's semantic SLRU pipeline, §6.3). The cell's
+  GUCs must mirror the control view's eight tracked parameters exactly or
+  boot itself writes `PARAMETER_CHANGE`/`FPW_CHANGE` records at B (§9).
+  First-query latency pays only for that query's working set;
 - **tail apply (followers and idle siblings)**: index updates, clog bits,
   invalidation messages — metadata and SLRU bits, kilobytes, never pages;
 - **fork**: one manifest write + one stream-fork PUT — zero page bytes;
@@ -991,6 +1198,14 @@ optimization** — the byte-count regression suite (§16) asserts it stays true.
     over-claimed this as "fresh" — it is not linearizable);
   - `bounded-stale(Δ)` and `pinned(LSN)` — explicit staleness; forks,
     tests, time travel.
+- **The host watermark gate** (adversarially forced) makes `session` mode
+  honest across connections: W := the highest offset this host has acked
+  or applied; **no statement begins executing on a cell whose base < W** —
+  the cell fast-forwards (or reattaches) first. Without it, conn A's
+  acked commit can be invisible to conn B's next statement — write-then-
+  read time travel through one connection pool. Companion rule: a
+  session's base never decreases (reattach target = max(head, W, session
+  base)). Cross-host read-your-writes remains the commit-LSN token.
 - The tailer never advances the visible LSN under an open snapshot; the
   query/apply gate from `pglite-durable-vfs` carries over unchanged.
 - `waitForLsn` gives read-your-writes across cells; the commit response
@@ -1065,16 +1280,20 @@ synchronous ack semantics    COMMIT ack strictly after CAS win; the
                              synchronous_commit GUC is accepted but inert
 stream TTL: none             explicit lifecycle deletion only
 CREATE DATABASE: WAL_LOG     FILE_COPY replays via local copydir
+GUCs mirror the control view  the 8 pg_control-tracked parameters must
+                             match the synthesized control copy exactly,
+                             or boot writes PARAMETER_CHANGE / FPW_CHANGE
+                             records at B before any user data (§6.5)
 ```
 
 Feature policy (enforced, each with its loud failure mode):
 
 | Feature | Policy |
 | --- | --- |
-| Unlogged tables | forbid in multi-cell mode (or document as per-cell ephemera) |
+| Unlogged tables | forbid (the tested policy, §16); per-cell-ephemera mode only if ever demanded |
 | Advisory locks | stream lock service, or error in multi-cell mode |
 | `SKIP LOCKED`/`FOR UPDATE` cross-cell | works, but contention → `40001`; route queues to lease holder |
-| ctid/xmin/txid observation | rebase-taint → `40001` on race |
+| ctid/xmin/cmin/cmax/txid observation | rebase-taint → `40001` on race |
 | `setval` on leased sequences | lease-epoch bump or error |
 | Prepared transactions (2PC) | out of scope initially |
 | SERIALIZABLE | per-cell yes; cross-cell not claimed |
@@ -1086,9 +1305,10 @@ Feature policy (enforced, each with its loud failure mode):
 
 Everything that would traditionally need a coordinator is an ordered control
 frame through the same CAS (§2.2): sequence grants (the only granted
-identity — xids, mxids, and OIDs are chained state needing none, §5.1–§5.2),
-head/GC/DDL leases, checkpoint markers, era steps, fork markers. State is
-reconstructed by replaying the tail — the joiner already reads it.
+identity — xids/mxids are chained state, OIDs are checked-at-execution;
+§5.1–§5.2), head and gc-pin leases, checkpoint markers, era open/seal,
+fork markers, recovery fences. State is reconstructed by replaying the
+tail — the joiner already reads it.
 
 ### 10.2 Cluster-wide LISTEN/NOTIFY — headline capability
 
@@ -1281,7 +1501,7 @@ coordination state this design exists to eliminate.
 | SAB fetch bridge, shared-memory build | remote page faults for cells |
 | `pglite-socket` | session proxy seed (§3.5); its `QueryQueueManager` is the multiplexer mode (§14.4) |
 | `__PGLITE__` hunks in clog/subtrans/transam/multixact | in-place reset counter-rewind audit anchors |
-| Durable Streams client/server | transport; plus the ~30-line `Stream-Expected-Offset` extension |
+| Durable Streams client/server | transport; plus the ~30–40-line `Stream-Expected-Offset` extension |
 
 ### 13.1 Salvage plan from `codex/durable-vfs-plan`
 
@@ -1417,9 +1637,10 @@ Cells on a host must never fetch or materialize the same bytes twice:
   payoff of choosing physical over logical replication;
 - **one stream tailer per (database, host)**: fans frames out to resident
   cells, maintains the shared page-version index, makes `local`-mode reads
-  free, and shortens `linearizable` catch-up — but the tailer's head can
-  lag commits acked via other hosts, which is exactly why `linearizable`
-  still performs a stream `HEAD` confirmation (§7);
+  free, shortens `linearizable` catch-up, and drives the host watermark
+  gate (§7) — but the tailer's head can lag commits acked via other hosts,
+  which is exactly why `linearizable` still performs a stream `HEAD`
+  confirmation (§7);
 - per-cell memory holds only the dirty overlay and Postgres shared_buffers;
   cells run with small shared_buffers because the host cache is warm.
 
@@ -1451,7 +1672,7 @@ transaction-idle connections pin their cell), and the multiplexer below.
 **`multiplexer`.** Many connections onto one cell via the existing
 pglite-socket queue (per-handler transaction affinity, one statement at a
 time). Right for read-heavy and many-idle-connection workloads. When
-multi-session PGlite lands, this flips back to being the natural default —
+multi-session PGlite lands, this becomes the natural default —
 one cell hosting real concurrent sessions, topology shifting from
 cells-per-connection to cells-per-database.
 
@@ -1463,7 +1684,8 @@ three deployments — and the same API surface in all of them is what makes
 sandbox → fleet promotion an upload, not a migration:
 
 ```text
-embedded    in-process inside a Supalite sandbox (fs backend, no network)
+embedded    in-process inside an app sandbox, e.g. Supabase-lite
+            (fs backend, no network)
 dev         single node, fs backend, embedded DS test server
 fleet       horizontal pool in front of object storage + DS service
 ```
@@ -1584,17 +1806,21 @@ Each is independently demoable; the conflict path starts trivial and hardens.
   sessions pin instead, a documented degradation until M3's live advance;
   session proxy v0 with cell-per-connection topology (§14.4), response
   buffering/spool and session-state taints enforcing the §3.7 contract —
-  the "client observed nothing" property is M1, not polish; host cell
-  manager: shared content-addressed page cache, one tailer per database,
-  host-local commit sequencer, **host-local sequence cursor** (§5.3,
-  §14.3); storage/stream gateway v0 (fs backend, embedded DS server) and
-  control-plane schema v0 (§14.5–§14.6; PGlite as the dev control plane).
-  Scale-to-zero works here.
-- **M2 — storage lifecycle.** Era rotation via guarded seal, with the host
-  sequencer as the quiesce point (§6.1); fork manifests over stream forks;
-  GC horizon from lease pins + fork refcounts **and GC execution** — era
-  deletion, checkpoint pruning, page-version trimming; the checkpoint
-  cadence dial exposed per database (§2.4).
+  the "client observed nothing" property is M1, not polish; the W1–W4 CAS
+  invariants, pending journal + §3.8 recovery, and host-minted checkpoint
+  records (§6.1) from the first commit; cell host: shared
+  content-addressed page cache, one tailer per database, host-local commit
+  sequencer + **sequence cursor** (§5.3, §14.4), the watermark gate (§7),
+  and `gc-pin` leases for pinned sessions (§3.3); storage/stream gateway
+  v0 (fs backend, embedded DS server) and control-plane schema v0
+  (§14.5–§14.6; PGlite as the dev control plane). Scale-to-zero works
+  here.
+- **M2 — storage lifecycle.** Hardened era rotation (unique per-attempt
+  URLs, `O`/`S` mirror frames, repair-walk, orphan sweep — §2.4, §6.1)
+  with the host sequencer as the quiesce point; fork manifests over stream
+  forks + `F` frames; GC horizon from lease pins + fork refcounts **and GC
+  execution** — era deletion, checkpoint pruning, page-version trimming;
+  the checkpoint cadence dial exposed per database (§2.4).
 - **M3 — followers & live apply.** Lazy tail apply (page-version index,
   base-required flags), eager special-record set, live invalidation incl.
   all three inval carriers; **sibling-cell advance upgraded from reattach
@@ -1609,9 +1835,10 @@ Each is independently demoable; the conflict path starts trivial and hardens.
 - **M5 — interactive transparent rebase.** Read-set hook + repaired
   validation rules; schema-epoch fence; logical re-apply, inserts first,
   then update/delete with version preconditions; deferred-trigger ctid
-  remap; **commit gate + in-place reset**; commit-sequence placement
-  reorder (§3.6); session-state taint lift (§3.3).
-- **M6 — productization.** DDL-lease polish; advisory-lock service or
+  remap; **commit gate + in-place reset** at crash-recovery-grade scope
+  (§3.4, §5.1) incl. the temp-write rebase taint (§4.5); commit-sequence
+  placement reorder (§3.6); session-state taint lift (§3.3).
+- **M6 — productization.** Lease polish; advisory-lock service or
   errors; **janitor automation** (vacuum/freeze cadence, GC scheduling);
   graduation tooling (logical export; physical materialize-and-start
   experiment); demo GUI: list databases, fork button, connect via psql
@@ -1670,6 +1897,17 @@ Each is independently demoable; the conflict path starts trivial and hardens.
   order across three listening cells; vanilla parity for local semantics
   (post-commit delivery, discard on abort, `pg_notify` from triggers);
   proxy-attached client delivery; GUI/stream-listener path.
+- **Freshness & read-your-writes suite:** the watermark gate (commit on
+  conn A, immediate read on conn B through one pool — never stale);
+  `linearizable` against an artificially lagged host tailer; `session`
+  tokens cross-host; `local` staleness bounded by tail lag; session base
+  monotonicity across reattach.
+- **Recovery & rotation chaos:** kill cells between POST and ack at every
+  point and run §3.8 — landed / lost / indeterminate all reachable, never
+  wrong; two concurrent rotators (unique-URL orphaning, adopt-on-409);
+  a commit racing the seal (tail-copy path); crash between seal and
+  manifest UPDATE (repair-walk); W4 straggler-voiding under simulated
+  server metadata rollback (§2.6).
 - **Postgres regression subset** on a single leased cell (should be near-clean
   — the point of physical fidelity).
 - **Laziness regression suite (byte-count assertions, §6.5):** cold start
