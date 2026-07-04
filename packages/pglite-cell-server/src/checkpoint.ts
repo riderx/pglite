@@ -26,7 +26,7 @@
 
 import { formatLsn, parseLsn } from '@electric-sql/pglite-cell'
 import type { KFrame } from '@electric-sql/pglite-cell'
-import { SHUTDOWN_CKPT_REC_ALIGNED } from '@electric-sql/pglite-cell'
+import { shutdownCheckpointStart } from '@electric-sql/pglite-cell'
 import { packDatadir } from '@electric-sql/pglite-gateway'
 import type { DatabaseRuntime } from './database-runtime'
 import { AdvanceRaceError } from './errors'
@@ -69,7 +69,7 @@ export async function checkpointDatabase(
     )
     const snapEnd = canonical.lsn
     const streamOffset = canonical.offset
-    const checkpointC = snapEnd - BigInt(SHUTDOWN_CKPT_REC_ALIGNED)
+    const checkpointC = shutdownCheckpointStart(snapEnd)
     const lsnText = formatLsn(checkpointC)
     const snapEndText = formatLsn(snapEnd)
 

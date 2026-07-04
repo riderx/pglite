@@ -17,7 +17,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { DsStreamClient } from './stream-client'
 import { StreamHttpError } from './stream-client'
 import { casToken, encodeAppend } from './frames'
-import type { Frame, WFrame } from './frames'
+import type { Frame, NFrame, WFrame } from './frames'
 import { formatLsn } from './lsn'
 import { CommitJournal } from './journal'
 import type { RecoveryReport } from './journal'
@@ -55,6 +55,13 @@ export interface CommitSliceInput {
   baseLsn: bigint
   endLsn: bigint
   bytes: Uint8Array
+  /**
+   * Notifications harvested at commit time (M3, §10.2). Encoded as N
+   * frames IN THE SAME append body as the W frame (same expectedOffset)
+   * — atomic by construction. They are rebuilt on the closed→hop re-CAS
+   * path too (frames are re-derived from this input per attempt).
+   */
+  notifications?: { channel: string; payload: string }[]
 }
 
 /** Outcome of a commit attempt: landed at `offset`, or definitively lost. */
@@ -218,7 +225,23 @@ export class Committer {
       },
       wal: input.bytes,
     }
-    const body = encodeAppend([frame])
+    // N frames ride the winning POST (M3, §10.2): same append body, same
+    // expectedOffset as the W frame. Rebuilt fresh on every attempt (era
+    // hops included), so lost attempts leak nothing.
+    const nFrames: NFrame[] = (input.notifications ?? []).map((n) => ({
+      type: 'N',
+      header: {
+        v: 1,
+        eraId: era.id,
+        expectedOffset,
+        commitId: input.commitId,
+        channel: n.channel,
+        payload: n.payload,
+        commitLsn: formatLsn(input.endLsn),
+      },
+    }))
+    const frames: Frame[] = [frame, ...nFrames]
+    const body = encodeAppend(frames)
     const seqToken = casToken(era.ordinal, expectedOffset)
     const producer = {
       id: this.producerId,
@@ -257,7 +280,7 @@ export class Committer {
           // frames. Re-download from the pre-append boundary instead.
           await this.tailer.catchUp()
         } else if (this.tailer.head.offset === expectedOffset) {
-          this.tailer.advanceLocal([frame], res.nextOffset)
+          this.tailer.advanceLocal(frames, res.nextOffset)
         }
         // else: a concurrent catch-up (checkpoint/rotation workers read the
         // tailer outside the append mutex) already ingested our own bytes

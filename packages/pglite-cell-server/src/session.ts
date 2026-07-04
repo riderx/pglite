@@ -25,15 +25,20 @@ import { Cell } from '@electric-sql/pglite-cell'
 import type { Results } from '@electric-sql/pglite'
 import { serialize } from '@electric-sql/pg-protocol'
 import type { CellDirLease } from './base-dir'
-import type { DatabaseRuntime } from './database-runtime'
+import type { DatabaseRuntime, DeliveredNotification } from './database-runtime'
 import {
   AdvanceRaceError,
   FatalSessionResetError,
+  PinnedWriteError,
   SerializationConflictError,
   SessionClosedError,
   SessionPinnedExpiredError,
 } from './errors'
-import { concatBytes, scanBackendOutput } from './proxy/wire'
+import {
+  concatBytes,
+  extractNotificationResponses,
+  scanBackendOutput,
+} from './proxy/wire'
 import type { BackendScan } from './proxy/wire'
 
 export type ExecOutcome =
@@ -69,8 +74,21 @@ export type UnitDisposition =
   | 'flushed-readonly' // empty slice: never CAS'd, response final (§3.5)
   | 'landed' // commit CAS'd and landed: buffered response is now true
   | 'held-conflict' // unrecoverable loss: output DISCARDED, proxy sends 40001
+  | 'held-pinned' // pinned-mode write: output DISCARDED, proxy sends 0A000
   | 'mid-txn' // interactive transaction in progress: streams by design
   | 'aborted' // transaction aborted (error / ROLLBACK): nothing to publish
+
+/**
+ * Session freshness mode (§7 / M3): changes ONLY the gate step before an
+ * idle-state unit. Set via the proxy-intercepted `SET pglite.freshness`
+ * (never forwarded to the cell) or programmatically.
+ */
+export type Freshness =
+  | { mode: 'session' }
+  | { mode: 'linearizable' }
+  | { mode: 'local' }
+  | { mode: 'pinned'; lsn: bigint }
+  | { mode: 'bounded-stale'; ms: number }
 
 export interface UnitResult {
   /** The (possibly re-executed) buffered backend response to flush. */
@@ -111,6 +129,25 @@ type DriveResult<T> =
   | { kind: 'read-only'; payload: T }
   | { kind: 'landed'; payload: T; landedOffset: string }
   | { kind: 'conflict'; detail: string }
+  | { kind: 'pinned-write' }
+
+/** `LISTEN ch` / `UNLISTEN ch` / `UNLISTEN *` as a lone simple statement. */
+function classifyListen(
+  sql: string,
+):
+  | { op: 'listen' | 'unlisten'; channel: string }
+  | { op: 'unlisten-all' }
+  | null {
+  const m =
+    /^\s*(listen|unlisten)\s+(?:"([^"]+)"|(\*)|([a-zA-Z_][\w$]*))\s*;?\s*$/i.exec(
+      sql,
+    )
+  if (!m) return null
+  const op = m[1].toLowerCase() as 'listen' | 'unlisten'
+  if (m[3] === '*') return op === 'unlisten' ? { op: 'unlisten-all' } : null
+  const channel = m[2] ?? m[4].toLowerCase()
+  return { op, channel }
+}
 
 /** Last non-empty statement is `ROLLBACK` / `ABORT` (not `ROLLBACK TO`). */
 function endsWithRollback(sql: string): boolean {
@@ -160,6 +197,18 @@ export class HostSession {
   private startupBytes: Uint8Array | null = null
   private setStatements: string[] = []
 
+  /** Channels this session LISTENs (host registry + delivery filter, M3). */
+  private readonly _listenSet = new Set<string>()
+  /** Freshness mode (§7): changes only the idle-unit gate step. */
+  private freshness: Freshness = { mode: 'session' }
+  /** Wall-clock of the last cell attach/advance (bounded-stale gate). */
+  private lastAdvanceAt = 0
+  /** Notifications harvested during the CURRENT execution attempt (M3):
+   *  cleared per attempt, so a lost CAS discards them with the attempt. */
+  private notifBuffer: { channel: string; payload: string }[] = []
+  /** The runtime listen-union version applied to the current cell. */
+  private cellListenVersion = -1
+
   /** TEST HOOK (§16 client-observation property): unit execution events. */
   _unitObserver: ((ev: UnitObservation) => void) | null = null
 
@@ -175,6 +224,37 @@ export class HostSession {
 
   get closed(): boolean {
     return this.dead !== null
+  }
+
+  /** Channels this session currently LISTENs. */
+  get listenChannels(): ReadonlySet<string> {
+    return this._listenSet
+  }
+
+  /** The session's freshness mode (§7). */
+  get freshnessMode(): Freshness {
+    return this.freshness
+  }
+
+  /**
+   * Set the freshness mode (§7). Applied at the next idle-unit gate; set
+   * by the proxy's `SET pglite.freshness` interception (never forwarded
+   * to the cell) or programmatically.
+   */
+  setFreshness(freshness: Freshness): void {
+    this.freshness = freshness
+  }
+
+  /**
+   * Tailer-driven notification delivery for THIS session (M3, §10.2):
+   * `cb` fires, in stream order == global commit order, for every N frame
+   * on a channel this session LISTENs at delivery time — the committing
+   * session's own connection included. Returns the unsubscribe fn.
+   */
+  subscribeNotifications(cb: (n: DeliveredNotification) => void): () => void {
+    return this.runtime.subscribeNotifications((n) => {
+      if (this._listenSet.has(n.channel)) cb(n)
+    })
   }
 
   /** Idle = no open cell mid-transaction (hibernation eligibility). */
@@ -248,6 +328,8 @@ export class HostSession {
         }
       case 'conflict':
         throw new SerializationConflictError(r.detail)
+      case 'pinned-write':
+        throw new PinnedWriteError()
     }
   }
 
@@ -290,7 +372,16 @@ export class HostSession {
         } catch (err) {
           threw = err
         }
-        const output = concatBytes(chunks)
+        // Uniform delivery (M3, §10.2 step 4): raw 'A' NotificationResponse
+        // bytes are STRIPPED from unit output — all client-facing delivery
+        // is tailer-driven, so nothing ever arrives twice and every
+        // listener (committer included) hears the same global order. The
+        // same walk IS the harvest: PGlite's raw-stream exec bypasses its
+        // parser, so the 'A' bytes here are the only place the local
+        // commit's notifications exist.
+        const { stripped: output, notifications } =
+          extractNotificationResponses(concatBytes(chunks))
+        this.notifBuffer.push(...notifications)
         const scan = scanBackendOutput(output)
         this._unitObserver?.({
           phase: 'attempt',
@@ -354,6 +445,15 @@ export class HostSession {
           disposition: 'held-conflict',
         }
         break
+      case 'pinned-write':
+        // Pinned freshness (§7): the write can never publish; the buffered
+        // output dies unsent and the proxy synthesizes the 0A000 error.
+        result = {
+          output: new Uint8Array(0),
+          rfqStatus: 'I',
+          disposition: 'held-pinned',
+        }
+        break
     }
     this._unitObserver?.({
       phase: 'result',
@@ -371,12 +471,31 @@ export class HostSession {
       this.startupBytes = unit.bytes.slice()
       return
     }
-    if (
-      unit.kind === 'simple' &&
-      unit.sqlForReplay !== undefined &&
-      isReplayableSet(unit.sqlForReplay)
-    ) {
+    if (unit.kind !== 'simple' || unit.sqlForReplay === undefined) return
+    if (isReplayableSet(unit.sqlForReplay)) {
       this.setStatements.push(unit.sqlForReplay)
+    }
+    // LISTEN registry (M3, §10.2 step 1): classification happens only on a
+    // SUCCESSFULLY finished unit (forwarded to the cell as normal; also
+    // recorded here). Simple protocol only — extended-protocol
+    // LISTEN/UNLISTEN is a documented M3 gap.
+    const listen = classifyListen(unit.sqlForReplay)
+    if (listen === null) return
+    if (listen.op === 'unlisten-all') {
+      for (const channel of [...this._listenSet]) {
+        this._listenSet.delete(channel)
+        this.runtime.releaseListen(channel)
+      }
+      return
+    }
+    if (listen.op === 'listen') {
+      if (!this._listenSet.has(listen.channel)) {
+        this._listenSet.add(listen.channel)
+        this.runtime.acquireListen(listen.channel)
+      }
+    } else if (this._listenSet.has(listen.channel)) {
+      this._listenSet.delete(listen.channel)
+      this.runtime.releaseListen(listen.channel)
     }
   }
 
@@ -408,7 +527,23 @@ export class HostSession {
       if (cell === null) throw new SessionClosedError('cell attach failed')
       const wasInTxn = cell.db.isInTransaction()
 
+      // Cell auto-LISTEN delta (M3, §10.2 step 2): when the host LISTEN
+      // union changed since this cell last synced, re-apply it between
+      // units (never mid-transaction). Rides the session's own unit queue
+      // (drive() is serialized per session) under runExclusive. LISTEN
+      // writes no WAL (backend-local pg_listening_channels state; probed
+      // in tests), so read cells stay publish-clean.
+      if (!wasInTxn && this.cellListenVersion !== this.runtime.listenVersion) {
+        await this.applyListenUnion(cell)
+      }
+
+      // Harvest window (M3): notifications fired during THIS attempt only.
+      // Local commit precedes capture, so they are in hand before
+      // commitSlice; a lost attempt's harvest dies with the attempt.
+      this.notifBuffer = []
+
       const { payload, threw, aborted } = await runner(cell)
+      const notifications = this.notifBuffer
 
       if (cell.db.isInTransaction()) {
         // Mid interactive transaction (possibly in aborted state after an
@@ -446,6 +581,19 @@ export class HostSession {
         // Read-only: never CAS'd; response is immediately final.
         await this.probeTaints(cell)
         return { kind: 'read-only', payload }
+      }
+
+      if (this.freshness.mode === 'pinned') {
+        // Pinned sessions never advance and can never publish (§7): a
+        // nonempty capture is a clean, typed rejection — not a conflict.
+        // The cell committed locally, so its state diverged from the pin;
+        // destroy it (the floors probe covers observed sequence draws).
+        // The next attach serves the then-current head — the fixed-base
+        // guarantee holds only until a rejected write (documented M3
+        // recycle-based limitation).
+        await this.runtime.probeFloors(cell)
+        await this.destroyCell()
+        return { kind: 'pinned-write' }
       }
 
       if (this.mode === 'read') {
@@ -488,6 +636,9 @@ export class HostSession {
         baseLsn: slice.baseLsn,
         endLsn: slice.endLsn,
         bytes: slice.bytes,
+        // Harvested notifications ride the winning POST as N frames (M3,
+        // §10.2 step 3) — atomic with the W frame by construction.
+        notifications,
       })
 
       if (res.landed) {
@@ -543,14 +694,17 @@ export class HostSession {
   private async ensureCell(): Promise<void> {
     if (this.cell !== null) {
       const inTxn = this.cell.db.isInTransaction()
-      if (
-        inTxn ||
-        this._tainted ||
-        this.streamPos.lsn >= this.runtime.watermark.lsn
-      ) {
-        return
+      if (inTxn || this._tainted) return
+      if (this.freshness.mode === 'linearizable') {
+        // §7 linearizable: confirm the TRUE head (catch-up past the
+        // observed tail) before the watermark gate — the only mode that
+        // sees another host's just-acked commit.
+        await this.runtime.linearizableSync()
       }
+      if (!this.shouldAdvance()) return
       await this.destroyCell()
+    } else if (this.freshness.mode === 'linearizable' && !this._tainted) {
+      await this.runtime.linearizableSync()
     }
 
     if (this.mode === 'read') {
@@ -565,7 +719,7 @@ export class HostSession {
       this.cell = cell
       this.lease = lease
       this.streamPos = { offset: lease.base.offset, lsn: lease.base.lsn }
-      await this.replaySessionState(cell)
+      await this.finishAttach(cell)
       return
     }
 
@@ -592,10 +746,67 @@ export class HostSession {
         offset: lease.base.offset,
         lsn: lease.base.lsn,
       }
-      await this.replaySessionState(cell)
+      await this.finishAttach(cell)
       return
     }
     throw new AdvanceRaceError(this.runtime.opts.attachAttempts)
+  }
+
+  /**
+   * The freshness-gated advance decision (§7) for an idle, untainted,
+   * already-attached cell. `session` (default) is the plain watermark
+   * gate; `linearizable` runs the same gate AFTER `linearizableSync`;
+   * `local` and `pinned` never advance; `bounded-stale` gates only when
+   * the base's wall-clock age exceeds Δ.
+   */
+  private shouldAdvance(): boolean {
+    switch (this.freshness.mode) {
+      case 'local':
+      case 'pinned':
+        return false
+      case 'bounded-stale':
+        if (Date.now() - this.lastAdvanceAt < this.freshness.ms) return false
+        return this.streamPos.lsn < this.runtime.watermark.lsn
+      case 'session':
+      case 'linearizable':
+        return this.streamPos.lsn < this.runtime.watermark.lsn
+    }
+  }
+
+  /**
+   * Post-attach hookup for a fresh cell: the notification harvest tap
+   * (M3 — `onNotification` fires during unit execution, after local
+   * commit, before capture), the bounded-stale clock, session-state
+   * replay, and the cell auto-LISTEN of the host union.
+   */
+  private async finishAttach(cell: Cell): Promise<void> {
+    this.lastAdvanceAt = Date.now()
+    cell.db.onNotification((channel, payload) => {
+      this.notifBuffer.push({ channel, payload })
+    })
+    await this.replaySessionState(cell)
+    await this.applyListenUnion(cell)
+  }
+
+  /**
+   * Apply the host LISTEN union to this cell (M3, §10.2 step 2): fresh
+   * cells get plain `LISTEN`s (like the SET replay); open cells re-sync
+   * with `UNLISTEN *` first when the union changed. LISTEN/UNLISTEN are
+   * backend-local (no WAL — probed in tests), so read cells stay
+   * publish-clean. Output discarded.
+   */
+  private async applyListenUnion(cell: Cell): Promise<void> {
+    const version = this.runtime.listenVersion
+    const channels = this.runtime.listenUnion
+    const fresh = this.cellListenVersion === -1
+    this.cellListenVersion = version
+    const stmts = channels.map((c) => `listen "${c.replace(/"/g, '""')}"`)
+    if (!fresh) stmts.unshift('unlisten *')
+    if (stmts.length === 0) return
+    const discard = { onRawData: () => {} }
+    await cell.db.runExclusive(() =>
+      cell.db.execProtocolRawStream(serialize.query(stmts.join('; ')), discard),
+    )
   }
 
   /**
@@ -656,6 +867,7 @@ export class HostSession {
     const lease = this.lease
     this.cell = null
     this.lease = null
+    this.cellListenVersion = -1
     if (cell) await cell.db.close().catch(() => undefined)
     if (lease) this.runtime.baseDirs.releaseCellDir(lease.dir)
   }
@@ -712,6 +924,7 @@ export class HostSession {
     }
     this.cell = null
     this.lease = null
+    this.cellListenVersion = -1
     const { detachSlice } = await cell.closeClean()
     if (detachSlice !== null) {
       // Best-effort: a CAS loss here just means the teardown WAL stays

@@ -1,5 +1,16 @@
 # M3 implementation plan — followers, freshness, NOTIFY headline
 
+> **STATUS: M3 (JS subset) CLOSED (2026-07-04).** Shipped per the
+> re-sequencing note below; live apply remains with the M5 native wave.
+> Findings: PGlite's execProtocolRawStream bypasses onNotification — the
+> proxy's 'A'-strip walk IS the harvest; LISTEN verified WAL-silent; a
+> latent head-computation bug (shutdown record straddling an 8 KiB WAL
+> page ⇒ `checkPoint+120` under-counts) found and fixed in every
+> materialize path; **pure-NOTIFY (no-write) transactions produce an
+> empty slice and therefore don't distribute — fixed in M4a via an
+> N-only CAS control append when notifications are pending on an empty
+> capture.**
+
 Companion to design doc §7, §8.1, §10.2 and §15 M3. One structural
 decision up front, made when the goal became "complete M2–M6":
 

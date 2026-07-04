@@ -219,6 +219,101 @@ export function errorResponse(fields: ErrorFields): Uint8Array {
   return new Uint8Array(out)
 }
 
+/** Hand-rolled CommandComplete: 'C' + i32 length + tag cstring. */
+export function commandComplete(tag: string): Uint8Array {
+  const tagLen = Buffer.byteLength(tag)
+  const out = Buffer.alloc(1 + 4 + tagLen + 1)
+  out.write('C', 0)
+  out.writeInt32BE(4 + tagLen + 1, 1)
+  out.write(tag, 5)
+  out[5 + tagLen] = 0
+  return new Uint8Array(out)
+}
+
+/**
+ * Hand-rolled NotificationResponse ('A'): i32 pid + channel cstring +
+ * payload cstring. The proxy synthesizes these for tailer-driven delivery
+ * (M3, §10.2) — `pid` is a fixed synthetic backend pid.
+ */
+export function notificationResponse(
+  pid: number,
+  channel: string,
+  payload: string,
+): Uint8Array {
+  const chLen = Buffer.byteLength(channel)
+  const plLen = Buffer.byteLength(payload)
+  const len = 4 + 4 + chLen + 1 + plLen + 1
+  const out = Buffer.alloc(1 + len)
+  out.write('A', 0)
+  out.writeInt32BE(len, 1)
+  out.writeInt32BE(pid, 5)
+  out.write(channel, 9)
+  out[9 + chLen] = 0
+  out.write(payload, 9 + chLen + 1)
+  out[9 + chLen + 1 + plLen] = 0
+  return new Uint8Array(out)
+}
+
+/**
+ * Strip NotificationResponse ('A') messages from a buffered backend
+ * response (M3, §10.2 uniform delivery): ALL client-facing notification
+ * delivery is tailer-driven, so raw 'A' bytes a unit execution produced
+ * locally must never reach the client — a light type+length walk, no
+ * parsing. Returns the input array unchanged when no 'A' is present.
+ */
+export function stripNotificationResponses(output: Uint8Array): Uint8Array {
+  return extractNotificationResponses(output).stripped
+}
+
+/**
+ * The harvest + strip walk in one pass (M3): PGlite's raw-stream exec path
+ * bypasses its protocol parser, so the notifications a unit's local commit
+ * fired exist ONLY as 'A' messages in the raw output — decode them (i32
+ * pid + channel cstring + payload cstring) into the harvest list and strip
+ * them from the client-bound bytes. Returns the input array unchanged
+ * (zero-copy) when no 'A' is present.
+ */
+export function extractNotificationResponses(output: Uint8Array): {
+  stripped: Uint8Array
+  notifications: { channel: string; payload: string }[]
+} {
+  const view = new DataView(output.buffer, output.byteOffset, output.byteLength)
+  let hasA = false
+  for (let pos = 0; pos + 5 <= output.length; ) {
+    const len = view.getInt32(pos + 1)
+    if (output[pos] === 0x41 /* 'A' */) {
+      hasA = true
+      break
+    }
+    pos += 1 + len
+  }
+  if (!hasA) return { stripped: output, notifications: [] }
+  const kept: Uint8Array[] = []
+  const notifications: { channel: string; payload: string }[] = []
+  const buf = Buffer.from(output.buffer, output.byteOffset, output.byteLength)
+  for (let pos = 0; pos + 5 <= output.length; ) {
+    const len = view.getInt32(pos + 1)
+    const end = Math.min(pos + 1 + len, output.length)
+    if (output[pos] === 0x41) {
+      // 'A' + i32 len + i32 pid + channel cstring + payload cstring
+      const chStart = pos + 9
+      const chEnd = buf.indexOf(0, chStart)
+      const plStart = chEnd + 1
+      const plEnd = buf.indexOf(0, plStart)
+      if (chEnd >= 0 && plEnd >= 0 && plEnd < end) {
+        notifications.push({
+          channel: buf.toString('utf8', chStart, chEnd),
+          payload: buf.toString('utf8', plStart, plEnd),
+        })
+      }
+    } else {
+      kept.push(output.subarray(pos, end))
+    }
+    pos = end
+  }
+  return { stripped: concatBytes(kept), notifications }
+}
+
 /** Hand-rolled ReadyForQuery: 'Z' + i32(5) + status byte. */
 export function readyForQuery(status: 'I' | 'T' | 'E'): Uint8Array {
   const out = Buffer.alloc(6)

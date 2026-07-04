@@ -7,7 +7,7 @@
 import { PGlite } from '@electric-sql/pglite'
 import { parseLsn } from './lsn'
 import { readControl, readWalRange } from './datadir'
-import { SHUTDOWN_CKPT_REC_ALIGNED } from './lsn'
+import { shutdownCheckpointEnd } from './lsn'
 import { ConfigPinError, ZeroBootWalError } from './errors'
 
 /** A captured WAL byte range `(baseLsn, endLsn]`, ready to commit. */
@@ -135,7 +135,7 @@ export class Cell {
   async closeClean(): Promise<{ detachSlice: CapturedSlice | null }> {
     await this.pg.close()
     const control = readControl(this.dir)
-    const end = control.checkPoint + BigInt(SHUTDOWN_CKPT_REC_ALIGNED)
+    const end = shutdownCheckpointEnd(control.checkPoint)
     if (end === this.cursor) return { detachSlice: null }
     return {
       detachSlice: {

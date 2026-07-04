@@ -108,6 +108,18 @@ export interface SequenceFloor {
 
 export type RuntimeState = 'cold' | 'active' | 'hibernated'
 
+/** One notification delivered off the tailer (M3, §10.2): stream order ==
+ *  commit order, globally — the committing session's own connection hears
+ *  it via this same path. */
+export interface DeliveredNotification {
+  channel: string
+  payload: string
+  commitId: string
+  commitLsn: string
+  /** Stream offset of the append group the N frame rode in. */
+  offset: string
+}
+
 export interface DatabaseRuntimeInit {
   databaseId: string
   hostId: string
@@ -149,6 +161,18 @@ export class DatabaseRuntime {
   readonly floors = new Map<string, SequenceFloor>()
 
   private readonly sessions = new Set<HostSession>()
+
+  /**
+   * The LISTEN registry (M3, §10.2 step 1): the union of channels listened
+   * across this runtime's sessions, refcounted. Cells auto-LISTEN this
+   * union so `onNotification` harvests fire for any channel with ≥1 local
+   * listener; `listenVersion` bumps on every union change so open cells
+   * delta-apply between units.
+   */
+  private readonly listenRefs = new Map<string, number>()
+  listenVersion = 0
+  /** N-frame delivery subscribers (proxy connections, programmatic hooks). */
+  private readonly notifSubs = new Set<(n: DeliveredNotification) => void>()
   private lastLeaseAt = 0
   private hibernateTimer: ReturnType<typeof setTimeout> | null = null
   private activating: Promise<void> | null = null
@@ -260,6 +284,27 @@ export class DatabaseRuntime {
       tailer,
       journalDir: join(this.root, 'journal'), // persists across hibernation
     })
+
+    // Uniform notification delivery (M3, §10.2 step 4): EVERY N frame this
+    // runtime observes — own commits via the committer's local advance,
+    // foreign ones via catch-up — fans out in stream order.
+    tailer.onNotificationFrame = (header, offset) => {
+      const n: DeliveredNotification = {
+        channel: header.channel,
+        payload: header.payload,
+        commitId: header.commitId,
+        commitLsn: header.commitLsn,
+        offset,
+      }
+      for (const sub of [...this.notifSubs]) {
+        try {
+          sub(n)
+        } catch {
+          // Delivery is fire-and-forget (vanilla semantics): a subscriber
+          // failure never poisons the tailer dispatch path.
+        }
+      }
+    }
 
     this._tailer = tailer
     this._committer = committer
@@ -626,7 +671,62 @@ export class DatabaseRuntime {
   }
 
   removeSession(session: HostSession): void {
-    this.sessions.delete(session)
+    if (this.sessions.delete(session)) {
+      for (const channel of session.listenChannels) {
+        this.releaseListen(channel)
+      }
+    }
+  }
+
+  // ----- M3: LISTEN registry + notification fanout (§10.2) -----
+
+  /** Channels with ≥1 listening session on this host (the cell union). */
+  get listenUnion(): string[] {
+    return [...this.listenRefs.keys()].sort()
+  }
+
+  /** Refcount a channel into the union (bumps `listenVersion` when new). */
+  acquireListen(channel: string): void {
+    const n = this.listenRefs.get(channel) ?? 0
+    this.listenRefs.set(channel, n + 1)
+    if (n === 0) this.listenVersion++
+  }
+
+  /** Drop one reference (bumps `listenVersion` when the channel empties). */
+  releaseListen(channel: string): void {
+    const n = this.listenRefs.get(channel)
+    if (n === undefined) return
+    if (n <= 1) {
+      this.listenRefs.delete(channel)
+      this.listenVersion++
+    } else {
+      this.listenRefs.set(channel, n - 1)
+    }
+  }
+
+  /**
+   * Subscribe to tailer-driven notification delivery (M3, §10.2): `cb`
+   * fires for EVERY N frame in stream order; callers filter by their own
+   * listen set. Returns the unsubscribe function. Survives hibernation
+   * (the wake re-wires a fresh tailer to the same subscriber set).
+   */
+  subscribeNotifications(cb: (n: DeliveredNotification) => void): () => void {
+    this.notifSubs.add(cb)
+    return () => this.notifSubs.delete(cb)
+  }
+
+  /**
+   * `linearizable` freshness (§7): confirm the true stream head with a
+   * catch-up round-trip past the observed tail, then raise the watermark
+   * so the ordinary gate advances the session's cell. The only mode
+   * guaranteed to see a commit acked via ANOTHER host an instant ago.
+   */
+  async linearizableSync(): Promise<void> {
+    await this.tailer.catchUp()
+    this.raiseWatermark({
+      offset: this.tailer.head.offset,
+      lsn: this.tailer.head.lsn,
+    })
   }
 
   /**

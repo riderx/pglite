@@ -19,6 +19,7 @@ import {
   type LFrame,
   type FenceFrame,
   type GenericFrame,
+  type NFrame,
 } from '../src/frames'
 
 const ERA = '000001-01H0000000000000000000000000'
@@ -132,8 +133,24 @@ describe('frame codec round-trips', () => {
     expect(decodeFrame(encodeFrame(f), 0)!.frame).toEqual(f)
   })
 
-  it('reserved generic frames (G,N,F,X)', () => {
-    for (const type of ['G', 'N', 'F', 'X'] as const) {
+  it('typed N (notification) frame round-trips', () => {
+    const f: NFrame = {
+      type: 'N',
+      header: {
+        v: 1,
+        eraId: ERA,
+        expectedOffset: INITIAL_OFFSET_TOKEN,
+        commitId: 'c-notify',
+        channel: 'orders',
+        payload: '{"id":1}',
+        commitLsn: '0/1A2B3C4',
+      },
+    }
+    expect(decodeFrame(encodeFrame(f), 0)!.frame).toEqual(f)
+  })
+
+  it('reserved generic frames (G,F,X)', () => {
+    for (const type of ['G', 'F', 'X'] as const) {
       const f: GenericFrame = {
         type,
         header: {

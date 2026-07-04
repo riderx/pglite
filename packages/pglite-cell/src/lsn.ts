@@ -23,6 +23,56 @@ export const SHUTDOWN_CKPT_REC_LEN = 114
  */
 export const SHUTDOWN_CKPT_REC_ALIGNED = 120
 
+/** Short (continuation) WAL page header size — XLogPageHeaderData. */
+export const WAL_SHORT_PHD = 24
+
+/** Long WAL page header (first page of a segment) — XLogLongPageHeaderData. */
+export const WAL_LONG_PHD = 40
+
+/**
+ * End LSN of a shutdown-checkpoint record starting at `checkPoint` — the
+ * datadir's clean insert position. Normally `checkPoint + 120`, BUT when
+ * the 120-byte record straddles an 8 KiB WAL page boundary the
+ * continuation page header (24 bytes; 40 at a segment boundary) sits
+ * inside the record's LSN footprint. Found the hard way at M3: a
+ * materialize whose shutdown record crossed a page boundary under-counted
+ * its head by 24 bytes and every later open of that state failed the
+ * zero-boot-WAL assert.
+ */
+export function shutdownCheckpointEnd(checkPoint: bigint): bigint {
+  const page = BigInt(WAL_BLOCK_SIZE)
+  const nextPage = checkPoint - (checkPoint % page) + page
+  let end = checkPoint + BigInt(SHUTDOWN_CKPT_REC_ALIGNED)
+  if (end > nextPage) {
+    end += BigInt(
+      nextPage % BigInt(WAL_SEG_SIZE) === 0n ? WAL_LONG_PHD : WAL_SHORT_PHD,
+    )
+  }
+  return end
+}
+
+/**
+ * Inverse of `shutdownCheckpointEnd`: the record's start LSN given its
+ * end. A non-straddling record ends at page offset 0 or ≥ 144 (24-byte
+ * page header + 120); a straddling one ends at offset (24..112] (the
+ * continuation header + record tail). The ranges are disjoint, so the
+ * footprint is decidable from the end alone.
+ */
+export function shutdownCheckpointStart(end: bigint): bigint {
+  const page = BigInt(WAL_BLOCK_SIZE)
+  const endMod = end % page
+  if (
+    endMod === 0n ||
+    endMod >= BigInt(WAL_SHORT_PHD + SHUTDOWN_CKPT_REC_ALIGNED)
+  ) {
+    return end - BigInt(SHUTDOWN_CKPT_REC_ALIGNED)
+  }
+  const boundary = end - endMod
+  const phd =
+    boundary % BigInt(WAL_SEG_SIZE) === 0n ? WAL_LONG_PHD : WAL_SHORT_PHD
+  return end - BigInt(SHUTDOWN_CKPT_REC_ALIGNED) - BigInt(phd)
+}
+
 /** Number of 16MB segments per 4-byte "log id" (0x1_0000_0000 / 16MB = 256). */
 const SEG_PER_ID = Number(0x100000000n / BigInt(WAL_SEG_SIZE))
 

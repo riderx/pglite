@@ -122,12 +122,30 @@ export interface SFrame {
 }
 
 /**
+ * Notification frame (M3, §10.2): one NOTIFY harvested at commit time,
+ * riding the SAME CAS append as its commit's W frame — notifications exist
+ * in the stream iff the commit does, atomically. One frame per
+ * notification, ordered. `commitLsn` is the commit's endLsn (formatted).
+ */
+export interface NFrameHeader extends BaseHeader {
+  commitId: string
+  channel: string
+  payload: string
+  commitLsn: string
+}
+
+export interface NFrame {
+  type: 'N'
+  header: NFrameHeader
+}
+
+/**
  * Reserved control frames — codec support + tests only, not produced yet
- * (G: M4, N: M3, F: M2b, X: M5). Their payload is an opaque JSON header
- * extending the common base.
+ * (G: M4, F: M2b, X: M5). Their payload is an opaque JSON header
+ * extending the common base. (N graduated to a typed frame at M3.)
  */
 export interface GenericFrame {
-  type: 'G' | 'N' | 'F' | 'X'
+  type: 'G' | 'F' | 'X'
   header: BaseHeader & Record<string, unknown>
 }
 
@@ -138,6 +156,7 @@ export type Frame =
   | KFrame
   | LFrame
   | FenceFrame
+  | NFrame
   | GenericFrame
 
 // ---------------------------------------------------------------------------

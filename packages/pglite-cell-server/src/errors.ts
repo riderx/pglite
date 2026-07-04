@@ -56,6 +56,26 @@ export class SessionPinnedExpiredError extends Error {
   }
 }
 
+/**
+ * A write attempted on a session in `pinned` freshness mode (§7). Pinned
+ * sessions serve a fixed base and never advance; their transactions can
+ * never publish. SQLSTATE 0A000 (`feature_not_supported`) — chosen over
+ * 55000 because the write is categorically unsupported in this mode, not
+ * a transient object-state problem; the message names the fix.
+ */
+export class PinnedWriteError extends Error {
+  readonly code = '0A000'
+
+  constructor() {
+    super(
+      `cannot execute a write in pinned freshness mode: this session ` +
+        `serves a fixed historical base and never advances — ` +
+        `SET pglite.freshness = 'session' to write`,
+    )
+    this.name = 'PinnedWriteError'
+  }
+}
+
 /** Any use of a session that is closed, reset, or destroyed by hibernation. */
 export class SessionClosedError extends Error {
   constructor(reason: string) {

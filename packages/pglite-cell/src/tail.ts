@@ -24,6 +24,7 @@ import type {
   GenericFrame,
   KFrameHeader,
   LFrameHeader,
+  NFrameHeader,
   OFrameHeader,
   SFrameHeader,
 } from './frames'
@@ -87,8 +88,17 @@ export class EraTailer {
   readonly leases: Partial<Record<'head' | 'gc-pin', LFrameHeader>> = {}
   /** The era-open frame of the CURRENT era, if its origin was read. */
   eraOpen: OFrameHeader | null = null
-  /** Raw reserved control frames (G/N/F/X) — recorded, not interpreted. */
+  /** Raw reserved control frames (G/F/X) — recorded, not interpreted. */
   readonly controlFrames: GenericFrame[] = []
+  /** Ordered N (notification) frame headers seen, with their group offset. */
+  readonly notifications: { header: NFrameHeader; offset: string }[] = []
+  /**
+   * Subscriber hook for N frames (M3, §10.2): invoked for every N frame
+   * as it is dispatched — via catch-up, live poll, or a local advance —
+   * in stream order, which is commit order, globally.
+   */
+  onNotificationFrame: ((header: NFrameHeader, offset: string) => void) | null =
+    null
   /**
    * Frames whose header eraId differs from the current era's — the fork
    * copied-prefix case (§2.5). Tolerated (position + LSN chain stay strict)
@@ -341,10 +351,17 @@ export class EraTailer {
           }
           this.eraOpen = frame.header
           break
+        case 'N':
+          this.notifications.push({
+            header: frame.header,
+            offset: group.offset,
+          })
+          this.onNotificationFrame?.(frame.header, group.offset)
+          break
         case '0':
           break // recovery fence: deliberate no-op
         default:
-          // G/N/F/X: reserved — record raw, do not interpret.
+          // G/F/X: reserved — record raw, do not interpret.
           this.controlFrames.push(frame)
       }
     }

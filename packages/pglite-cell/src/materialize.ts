@@ -13,7 +13,7 @@ import {
   readWalRange,
   writeWalRange,
 } from './datadir'
-import { SHUTDOWN_CKPT_REC_ALIGNED } from './lsn'
+import { shutdownCheckpointEnd } from './lsn'
 import { SliceChainError } from './errors'
 
 /** The minimal slice shape materialize consumes (TailSlice-compatible). */
@@ -65,7 +65,7 @@ export async function materializeAtHead(
     const control = readControl(baseDir)
     return {
       syncSlice: null,
-      headLsn: control.checkPoint + BigInt(SHUTDOWN_CKPT_REC_ALIGNED),
+      headLsn: shutdownCheckpointEnd(control.checkPoint),
     }
   }
 
@@ -91,7 +91,7 @@ export async function materializeAtHead(
   await db.close()
 
   const control = readControl(baseDir)
-  const headLsn = control.checkPoint + BigInt(SHUTDOWN_CKPT_REC_ALIGNED)
+  const headLsn = shutdownCheckpointEnd(control.checkPoint)
   const lastSliceEnd = slices[slices.length - 1].endLsn
   if (headLsn < lastSliceEnd) {
     throw new SliceChainError(

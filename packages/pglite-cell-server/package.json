@@ -39,6 +39,7 @@
   "scripts": {
     "build": "tsup",
     "demo": "tsx ./scripts/demo-scale-to-zero.ts",
+    "demo:notify": "tsx ./scripts/demo-notify.ts",
     "lint": "eslint ./src ./tests ./scripts --report-unused-disable-directives --max-warnings 0",
     "format": "prettier --write ./src ./tests ./scripts",
     "typecheck": "tsc",
