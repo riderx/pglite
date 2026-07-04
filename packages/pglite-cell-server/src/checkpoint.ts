@@ -57,7 +57,12 @@ export async function checkpointDatabase(
 ): Promise<CheckpointReport> {
   await runtime.ensureActive()
 
-  const maxAttempts = runtime.opts.attachAttempts
+  // Cross-host K-frame ping-pong (M4): two hosts checkpointing the same
+  // database alternate losses — each K loss re-runs the canonical ensure,
+  // whose fresh SYNC slice moves the head and defeats the OTHER host's
+  // in-flight K. Double the solo bound and jitter the retries (below) so
+  // one side wins quickly instead of strict alternation to exhaustion.
+  const maxAttempts = runtime.opts.attachAttempts * 2
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     // (1) Bring the shared base to a genuine stream position (write-attach):
     // materialize + publish the landed sync slice ⇒ canonical dir clean at
@@ -122,6 +127,8 @@ export async function checkpointDatabase(
     })
     if (!res.landed) {
       await runtime.tailer.catchUp()
+      // Jittered stagger before re-advancing (see maxAttempts note).
+      await new Promise((r) => setTimeout(r, 10 + Math.random() * 90))
       continue // lost the K-frame CAS: re-advance + retry
     }
 

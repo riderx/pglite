@@ -18,7 +18,9 @@ import type {
   Cell,
   CommitResult,
   CommitSliceInput,
+  GFrame,
   LFrame,
+  NFrame,
 } from '@electric-sql/pglite-cell'
 import { extractDatadir } from '@electric-sql/pglite-gateway'
 import type { Manifest } from '@electric-sql/pglite-gateway'
@@ -96,6 +98,37 @@ export function resolveRuntimeOpts(
   }
 }
 
+/** Sequence-grant range size (M4, §5.3 JS subset). 4096 with renewal at
+ *  50% keeps the unenforced prelog window (HONESTY CLAUSE: no native
+ *  `nextval_internal` clamp yet) unreachable under the abuse suite. */
+const GRANT_SIZE = 4096n
+/** Bound on grant-take CAS retries (each loss re-reads the high-water). */
+const GRANT_CAS_ATTEMPTS = 10
+
+/** One live sequence grant this host incarnation holds (M4, §5.3): the
+ *  host may draw values in `(start, end]`. Burned (never resumed) on any
+ *  incarnation end — hibernate, recycle, crash. */
+export interface SequenceGrant {
+  schema: string
+  name: string
+  /** `schema.name` — the G-frame `seqName`. */
+  seqName: string
+  start: bigint
+  end: bigint
+}
+
+/** The head-lease view for tests/operators (M4, §3.2). */
+export interface LeaseState {
+  /** Holder of the last L{head} frame seen, null before any. */
+  holder: string | null
+  epoch: number
+  ttlMs: number
+  /** True while the lease is within TTL of its local observation time. */
+  fresh: boolean
+  /** True iff this host holds a fresh head lease. */
+  held: boolean
+}
+
 /** A host-local sequence floor (§5.3 M1: closes the abort-only hazard). */
 export interface SequenceFloor {
   schema: string
@@ -159,6 +192,14 @@ export class DatabaseRuntime {
    * limitation — native nextval clamps + G-frame leases land at M4).
    */
   readonly floors = new Map<string, SequenceFloor>()
+
+  /**
+   * Live sequence grants held by THIS runtime incarnation (M4, §5.3),
+   * keyed `schema.name`. Cleared (burned) on hibernate — a fresh
+   * incarnation must take a fresh grant at/above the replayed high-water,
+   * never resuming a predecessor's residual range (§5.3 rule 7).
+   */
+  readonly grants = new Map<string, SequenceGrant>()
 
   private readonly sessions = new Set<HostSession>()
 
@@ -274,6 +315,22 @@ export class DatabaseRuntime {
     })
     await tailer.catchUp()
 
+    // Incarnation burn (M4, §5.3 rule 7): every grant on the era chain is
+    // either LIVE (a foreign incarnation's — we must not draw in it) or
+    // BURNED (a dead incarnation's residual — never resumed, ours
+    // included). Either way this fresh incarnation may only draw ABOVE
+    // every replayed grant's end, so floor each granted sequence to its
+    // high-water before any session draws. Gaps allowed; duplicates not.
+    for (const [seqName, hw] of tailer.grantHighWaters()) {
+      const dot = seqName.indexOf('.')
+      const schema = seqName.slice(0, dot)
+      const name = seqName.slice(dot + 1)
+      const existing = this.floors.get(seqName)
+      if (!existing || hw > existing.value) {
+        this.floors.set(seqName, { schema, name, value: hw, isCalled: true })
+      }
+    }
+
     const committer = await Committer.create({
       client,
       era: {
@@ -336,13 +393,71 @@ export class DatabaseRuntime {
     if (pos.lsn > this.watermark.lsn) this.watermark = { ...pos }
   }
 
+  /** The live L{head} view: last frame seen + local-observation freshness
+   *  (L headers carry no timestamp — freshness is judged from when THIS
+   *  tailer dispatched the frame). */
+  private headLeaseView(): {
+    holder: string | null
+    epoch: number
+    ttlMs: number
+    fresh: boolean
+    foreign: boolean
+  } {
+    const lease = this._tailer?.leases.head
+    const at = this._tailer?.leaseSeenAt.head ?? 0
+    if (!lease) {
+      return {
+        holder: null,
+        epoch: 0,
+        ttlMs: this.opts.leaseTtlMs,
+        fresh: false,
+        foreign: false,
+      }
+    }
+    return {
+      holder: lease.holder,
+      epoch: lease.epoch,
+      ttlMs: lease.ttlMs,
+      fresh: Date.now() - at < lease.ttlMs,
+      foreign: lease.holder !== this.hostId,
+    }
+  }
+
+  /** The head-lease state (M4 test/introspection surface). */
+  leaseState(): LeaseState {
+    const v = this.headLeaseView()
+    return {
+      holder: v.holder,
+      epoch: v.epoch,
+      ttlMs: v.ttlMs,
+      fresh: v.fresh,
+      held: v.fresh && !v.foreign && v.holder !== null,
+    }
+  }
+
   /**
-   * Append (or refresh) the head-lease L frame. Frames flow; nothing
-   * enforces them at M1 — a persistent CAS loss is logged and ignored.
+   * Append (claim/refresh) the head-lease L frame (M4 §3.2 semantics; the
+   * lease still has ZERO correctness weight):
+   *
+   * - a FRESH foreign lease means another host holds — do not claim; a
+   *   demoted holder lands here too and thereby stops refreshing;
+   * - an expired/absent lease is claimable by anyone (migration): the
+   *   claim epoch is `max(committer epoch, last lease epoch + 1)` so the
+   *   L{head} epoch chain stays strictly monotone across claims;
+   * - a refresh of our own lease keeps `max(committer epoch, lease epoch)`.
+   *
+   * A CAS loss re-reads the tail; if the loss revealed a fresh foreign
+   * lease, adopt it (stop). Persistent losses are logged and ignored.
    */
   private async appendHeadLease(): Promise<void> {
     const committer = this.committer
     for (let i = 0; i < 3; i++) {
+      const v = this.headLeaseView()
+      if (v.fresh && v.foreign) return // another host holds: adopt, no claim
+      const epoch =
+        v.holder !== null && !v.foreign
+          ? Math.max(committer.epoch, v.epoch) // refresh our own lease
+          : Math.max(committer.epoch, v.epoch + 1) // claim / migrate
       const res = await committer.appendControl((expectedOffset) => {
         const frame: LFrame = {
           type: 'L',
@@ -354,7 +469,7 @@ export class DatabaseRuntime {
             expectedOffset,
             kind: 'head',
             holder: this.hostId,
-            epoch: committer.epoch,
+            epoch,
             ttlMs: this.opts.leaseTtlMs,
           },
         }
@@ -369,8 +484,22 @@ export class DatabaseRuntime {
 
     console.log(
       `[pglite-cell-server] db ${this.databaseId}: head-lease append kept ` +
-        `losing its CAS — continuing without (advisory at M1)`,
+        `losing its CAS — continuing without (advisory)`,
     )
+  }
+
+  /**
+   * Lease-aware backoff after a CAS loss (M4, §3.2): when a FRESH foreign
+   * head lease exists, the holder is pipelining — delay this host's retry
+   * (25–100ms jittered) instead of hammering the CAS. No lease / stale
+   * lease / own lease ⇒ no delay (the optimistic path proceeds).
+   */
+  private async leaseAwareBackoff(): Promise<void> {
+    const v = this.headLeaseView()
+    if (v.fresh && v.foreign) {
+      const delay = 25 + Math.floor(Math.random() * 75)
+      await new Promise((r) => setTimeout(r, delay))
+    }
   }
 
   /**
@@ -388,12 +517,17 @@ export class DatabaseRuntime {
     try {
       res = await this.committer.commitSlice(input)
     } catch (err) {
-      if (err instanceof CaptureCursorError) return { landed: false }
+      if (err instanceof CaptureCursorError) {
+        await this.leaseAwareBackoff()
+        return { landed: false }
+      }
       throw err
     }
     if (res.landed) {
       this.raiseWatermark({ offset: res.nextOffset, lsn: input.endLsn })
       this.maybeAutoCheckpoint()
+    } else {
+      await this.leaseAwareBackoff()
     }
     return res
   }
@@ -535,12 +669,7 @@ export class DatabaseRuntime {
    * `isCalled` is always true here.
    */
   async probeFloors(cell: Cell): Promise<void> {
-    const rows = (
-      await cell.db.query<{ s: string; n: string; v: string }>(
-        `select schemaname as s, sequencename as n, last_value::text as v
-           from pg_sequences where last_value is not null`,
-      )
-    ).rows
+    const rows = await this.querySequences(cell)
     for (const row of rows) {
       const key = `${row.s}.${row.n}`
       const value = BigInt(row.v)
@@ -554,6 +683,150 @@ export class DatabaseRuntime {
         })
       }
     }
+    // Grant maintenance rides the same probe (M4, §5.3): an abort-observed
+    // draw is exactly the evidence a grant must cover.
+    await this.ensureGrants(rows)
+  }
+
+  /**
+   * Grant maintenance probe for a cell whose transaction COMMITTED and
+   * landed (M4, §5.3): first `nextval` evidence takes a grant; ≥50%
+   * consumption renews it. Unlike `probeFloors` this does not raise the
+   * floor map from observed values (committed draws are published — the
+   * stream itself covers them).
+   */
+  async probeGrants(cell: Cell): Promise<void> {
+    await this.ensureGrants(await this.querySequences(cell))
+  }
+
+  private async querySequences(
+    cell: Cell,
+  ): Promise<{ s: string; n: string; v: string }[]> {
+    return (
+      await cell.db.query<{ s: string; n: string; v: string }>(
+        `select schemaname as s, sequencename as n, last_value::text as v
+           from pg_sequences where last_value is not null`,
+      )
+    ).rows
+  }
+
+  /**
+   * The M4 §5.3 grant state machine, probe-driven. For each sequence with
+   * an observed draw:
+   *
+   * - no grant yet (first evidence) ⇒ take one at
+   *   `start = max(observed, floor, replayed high-water)`;
+   * - ≥50% of the current grant consumed ⇒ renew (next disjoint range at
+   *   the high-water; a contiguous own-extension keeps cells drawing
+   *   naturally, a jump re-floors future attaches to the new start);
+   * - observed PAST the grant end ⇒ the unenforced prelog window fired
+   *   (HONESTY CLAUSE — no native nextval clamp yet): logged LOUDLY and
+   *   an emergency grant is taken from the observed value.
+   */
+  private async ensureGrants(
+    rows: { s: string; n: string; v: string }[],
+  ): Promise<void> {
+    for (const row of rows) {
+      const key = `${row.s}.${row.n}`
+      const observed = BigInt(row.v)
+      const g = this.grants.get(key)
+      if (g) {
+        if (observed > g.end) {
+          // Draw placement is UNENFORCED in the JS subset (HONESTY
+          // CLAUSE, §14.2: the native nextval clamp is not here yet):
+          // under multi-host traffic the on-disk value routinely reflects
+          // FOREIGN published draws replayed into fresh cells, and a
+          // cell's own 32-ahead prelog can also cross the boundary. Both
+          // land here: take a fresh grant from the observed value so the
+          // grant chain stays ahead of every published draw.
+          console.log(
+            `[pglite-cell-server] db ${this.databaseId}: sequence ${key} ` +
+              `observed at ${observed}, past this host's grant end ` +
+              `${g.end} (foreign replay advance and/or the unenforced ` +
+              `prelog window — §14.2 clamp not yet native); taking a ` +
+              `fresh grant from the observed value`,
+          )
+        } else if (observed < g.start + (g.end - g.start) / 2n) {
+          continue // under 50% consumed: nothing to do
+        }
+      }
+      const floor = this.floors.get(key)?.value ?? 0n
+      const minStart = g
+        ? observed > g.end
+          ? observed
+          : g.end
+        : observed > floor
+          ? observed
+          : floor
+      const fresh = await this.takeGrant(row.s, row.n, minStart)
+      if (fresh === null) continue // logged; retried on the next probe
+      if (g && fresh.start === g.end && observed <= g.end) {
+        // Contiguous own extension: the live cells keep drawing naturally
+        // across the old end — no re-floor, no gap.
+        this.grants.set(key, { ...fresh, start: g.start })
+      } else {
+        // Fresh grant or a jump over foreign ranges: future attaches must
+        // draw inside the new range.
+        this.grants.set(key, fresh)
+        const existing = this.floors.get(key)
+        if (!existing || fresh.start > existing.value) {
+          this.floors.set(key, {
+            schema: row.s,
+            name: row.n,
+            value: fresh.start,
+            isCalled: true,
+          })
+        }
+      }
+    }
+  }
+
+  /**
+   * CAS-append one G frame for `(schema, name)` (M4, §5.3). The range is
+   * computed INSIDE the append callback — `start = max(minStart, replayed
+   * high-water)` at the moment of the attempt — so a CAS loss to a foreign
+   * grant re-reads and takes the next disjoint range. Bounded; a
+   * persistent loss is logged and reported null (retried next probe).
+   */
+  private async takeGrant(
+    schema: string,
+    name: string,
+    minStart: bigint,
+  ): Promise<SequenceGrant | null> {
+    const seqName = `${schema}.${name}`
+    const committer = this.committer
+    for (let i = 0; i < GRANT_CAS_ATTEMPTS; i++) {
+      let start = 0n
+      let end = 0n
+      const res = await committer.appendControl((expectedOffset) => {
+        const hw = this.tailer.grantHighWater(seqName)
+        start = minStart > hw ? minStart : hw
+        end = start + GRANT_SIZE
+        const frame: GFrame = {
+          type: 'G',
+          header: {
+            v: 1,
+            eraId: this.tailer.currentEra.id,
+            expectedOffset,
+            kind: 'sequence',
+            seqName,
+            start: start.toString(),
+            end: end.toString(),
+            grantee: this.hostId,
+            granteeEpoch: committer.epoch,
+          },
+        }
+        return [frame]
+      })
+      if (res.landed) return { schema, name, seqName, start, end }
+      await this.tailer.catchUp() // another host granted first: re-read
+    }
+    console.log(
+      `[pglite-cell-server] db ${this.databaseId}: sequence-grant append ` +
+        `for ${seqName} kept losing its CAS after ${GRANT_CAS_ATTEMPTS} ` +
+        `attempts — will retry on the next probe`,
+    )
+    return null
   }
 
   /**
@@ -730,6 +1003,73 @@ export class DatabaseRuntime {
   }
 
   /**
+   * Block until this host's tailer has ingested the stream up to `lsn`
+   * (M4 cross-host session tokens, §7): a client that committed on host A
+   * carries the commit LSN as a session token; host B waits for it, the
+   * watermark rises, and the ordinary `session` gate serves read-your-
+   * writes. Polls catch-up (bounded by `timeoutMs`).
+   */
+  async waitForLsn(lsn: bigint, timeoutMs = 30_000): Promise<void> {
+    await this.ensureActive()
+    const t0 = Date.now()
+    for (;;) {
+      await this.tailer.catchUp()
+      if (this.tailer.head.lsn >= lsn) break
+      if (Date.now() - t0 > timeoutMs) {
+        throw new Error(
+          `waitForLsn: head ${formatLsn(this.tailer.head.lsn)} still below ` +
+            `${formatLsn(lsn)} after ${timeoutMs}ms`,
+        )
+      }
+      await new Promise((r) => setTimeout(r, 25))
+    }
+    this.raiseWatermark({
+      offset: this.tailer.head.offset,
+      lsn: this.tailer.head.lsn,
+    })
+  }
+
+  /**
+   * Publish harvested notifications from a transaction that committed
+   * with an EMPTY capture (a pure `NOTIFY` writes no WAL — M3 leftover,
+   * fixed at M4): CAS-append the N frames ALONE, `commitLsn` = the head
+   * LSN at append time. The tailer fanout then delivers them everywhere,
+   * this host included. Bounded retries; a persistent loss is logged
+   * (delivery is fire-and-forget, matching vanilla's weak guarantees).
+   */
+  async publishNotificationOnlyCommit(
+    notifications: { channel: string; payload: string }[],
+  ): Promise<void> {
+    if (notifications.length === 0) return
+    const committer = this.committer
+    const commitId = randomUUID()
+    for (let i = 0; i < 3; i++) {
+      const res = await committer.appendControl((expectedOffset) =>
+        notifications.map(
+          (n): NFrame => ({
+            type: 'N',
+            header: {
+              v: 1,
+              eraId: this.tailer.currentEra.id,
+              expectedOffset,
+              commitId,
+              channel: n.channel,
+              payload: n.payload,
+              commitLsn: formatLsn(this.tailer.head.lsn),
+            },
+          }),
+        ),
+      )
+      if (res.landed) return
+      await this.tailer.catchUp()
+    }
+    console.log(
+      `[pglite-cell-server] db ${this.databaseId}: NOTIFY-only append kept ` +
+        `losing its CAS — ${notifications.length} notification(s) dropped`,
+    )
+  }
+
+  /**
    * Hibernate: for each idle (not-in-txn, untainted) session cell, publish
    * the detach slice if it is canonical write-attached (clean close writes
    * session-teardown WAL + a real shutdown checkpoint — the stream tail
@@ -784,6 +1124,10 @@ export class DatabaseRuntime {
     this._tailer = null
     this._committer = null
     this._manifest = null
+    // Incarnation burn (M4, §5.3 rule 7): the residual grant ranges die
+    // with this incarnation — the wake takes fresh grants at/above the
+    // replayed high-water (activate() floors every granted sequence).
+    this.grants.clear()
     this._state = 'hibernated'
     this.hibernating = false
 

@@ -105,6 +105,16 @@ control-plane writes are lifecycle-rate (create, checkpoint), never commit-rate.
 | GET    | `/v1/db/:id/manifest`          | current manifest (era pointer + checkpoint)     |
 | GET    | `/v1/db/:id/checkpoint/latest` | latest checkpoint row                           |
 | POST   | `/v1/db/:id/checkpoint`        | register a checkpoint                           |
+| POST   | `/v1/db/:id/era/attempt`       | register an era attempt (pre-PUT orphan record) |
+| POST   | `/v1/db/:id/era/promote`       | mark an era attempt promoted                    |
+| POST   | `/v1/db/:id/era/seal`          | seal era `ordinal` (terminal-S coords)          |
+| POST   | `/v1/db/:id/era/advance`       | guarded `current_era_ordinal` advance           |
+| POST   | `/v1/db/:id/era`               | insert the era-N row (rotation step 6)          |
+| GET    | `/v1/db/:id/era/:ordinal`      | read an era row by ordinal (404 if absent)      |
+| PUT    | `/v1/db/:id/pin`               | upsert a GC pin (control-plane mirror, §6.4)    |
+| DELETE | `/v1/db/:id/pin/:pinId`        | delete a pin by id                              |
+| GET    | `/v1/db/:id/pins`              | list live (unexpired) pins for a database       |
+| POST   | `/v1/db/:id/pins/expire`       | sweep expired pins (global TTL sweep)           |
 | ALL    | `/v1/db/:id/stream/*`          | verbatim CAS/read proxy to the DS server        |
 | GET    | `/v1/objects/:ref`             | fetch a content-addressed object (read-through) |
 | PUT    | `/v1/objects`                  | store a content-addressed object                |

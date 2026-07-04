@@ -140,12 +140,49 @@ export interface NFrame {
 }
 
 /**
+ * Sequence-grant frame (M4, §5.3): a CAS-appended lease of the value range
+ * `(start, end]` of one sequence to one host incarnation. Grant state is a
+ * pure replay of the era chain — the tailer records every G frame and the
+ * per-sequence high-water is `max(end)`. `start`/`end` are decimal strings
+ * (sequence values are int8 — JSON numbers cannot carry them losslessly).
+ *
+ * Incarnation burn (§5.3 rule 7): a grant is bound to `(grantee,
+ * granteeEpoch)`; when that incarnation ends (hibernate / recycle / crash)
+ * the residual range is burned — a fresh incarnation takes a NEW grant at
+ * or above the replayed high-water, never resuming a predecessor's range.
+ *
+ * A zero-width grant (`start === end`) records nothing but the high-water:
+ * the rotator appends these into a freshly cut era so joiners who tail only
+ * the new era still see every live grant's ceiling (grants must survive
+ * era hops — the era base offset sits PAST the O frame, so the O cannot
+ * carry them for joiners).
+ */
+export interface GFrameHeader extends BaseHeader {
+  kind: 'sequence'
+  /** `schema.name` of the sequence (schema split at the first dot). */
+  seqName: string
+  /** Decimal string; the grant covers values `(start, end]`. */
+  start: string
+  /** Decimal string; the per-sequence high-water is `max(end)`. */
+  end: string
+  /** Host id of the grantee incarnation. */
+  grantee: string
+  /** The grantee's committer (producer) epoch — the incarnation bound. */
+  granteeEpoch: number
+}
+
+export interface GFrame {
+  type: 'G'
+  header: GFrameHeader
+}
+
+/**
  * Reserved control frames — codec support + tests only, not produced yet
- * (G: M4, F: M2b, X: M5). Their payload is an opaque JSON header
- * extending the common base. (N graduated to a typed frame at M3.)
+ * (F: M2b, X: M5). Their payload is an opaque JSON header extending the
+ * common base. (N graduated to a typed frame at M3, G at M4.)
  */
 export interface GenericFrame {
-  type: 'G' | 'F' | 'X'
+  type: 'F' | 'X'
   header: BaseHeader & Record<string, unknown>
 }
 
@@ -157,6 +194,7 @@ export type Frame =
   | LFrame
   | FenceFrame
   | NFrame
+  | GFrame
   | GenericFrame
 
 // ---------------------------------------------------------------------------

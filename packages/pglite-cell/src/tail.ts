@@ -22,6 +22,7 @@ import type {
   AppendGroup,
   Frame,
   GenericFrame,
+  GFrameHeader,
   KFrameHeader,
   LFrameHeader,
   NFrameHeader,
@@ -77,6 +78,11 @@ export class EraTailer {
   private headOffset: string
   private headLsn: bigint
   private _closed = false
+  /** Catch-up serialization chain (M4 hardening): runs never overlap, and
+   *  every caller gets a run that STARTS at or after its call (freshness —
+   *  sharing an in-flight run would let a CAS loser catch up to a tail
+   *  older than the append it just lost to). */
+  private catchUpChain: Promise<unknown> = Promise.resolve()
   /** Terminal S seen in the current era, pending an era hop. */
   private pendingSeal: SFrameHeader | null = null
 
@@ -86,10 +92,25 @@ export class EraTailer {
   latestCheckpoint: KFrameHeader | null = null
   /** The last L (lease) frame header seen, per lease kind. */
   readonly leases: Partial<Record<'head' | 'gc-pin', LFrameHeader>> = {}
+  /**
+   * Wall-clock (Date.now) at which the corresponding `leases[kind]` frame
+   * was DISPATCHED by this tailer (M4 lease-aware backoff: L headers carry
+   * no timestamp — freshness is judged from local observation time).
+   */
+  readonly leaseSeenAt: Partial<Record<'head' | 'gc-pin', number>> = {}
   /** The era-open frame of the CURRENT era, if its origin was read. */
   eraOpen: OFrameHeader | null = null
-  /** Raw reserved control frames (G/F/X) — recorded, not interpreted. */
+  /** Raw reserved control frames (F/X) — recorded, not interpreted. */
   readonly controlFrames: GenericFrame[] = []
+  /**
+   * Every G (sequence grant) frame replayed off the era chain, in stream
+   * order (M4, §5.3). Survives era hops — the map is never cleared; a
+   * fresh era's zero-width re-assert grants seed joiners who tail only
+   * the new era.
+   */
+  readonly grants: GFrameHeader[] = []
+  /** Per-sequence grant high-water: max(end) over every replayed G. */
+  private readonly grantHw = new Map<string, bigint>()
   /** Ordered N (notification) frame headers seen, with their group offset. */
   readonly notifications: { header: NFrameHeader; offset: string }[] = []
   /**
@@ -153,13 +174,31 @@ export class EraTailer {
    * chains into the next era via its O frame (O/S mirror verified — throws
    * `EraChainError` on violation); a closed era without a terminal S throws
    * `WedgedEraError`. Returns the number of new W slices.
+   *
+   * Concurrency (M4 hardening): catch-ups are SERIALIZED — concurrent
+   * calls queue behind the in-flight run (each caller's run starts at or
+   * after its call) — and a response fetched against a boundary that
+   * `advanceLocal` moved mid-read is DISCARDED and re-read (the committer
+   * advances the tailer locally after its own appends; feeding a
+   * stale-boundary response would poison the reader).
    */
-  async catchUp(): Promise<number> {
+  catchUp(): Promise<number> {
+    const p = this.catchUpChain.then(() => this.catchUpInner())
+    this.catchUpChain = p.then(
+      () => undefined,
+      () => undefined,
+    )
+    return p
+  }
+
+  private async catchUpInner(): Promise<number> {
     const before = this.slices.length
     for (;;) {
+      const reader = this.reader
       const res = await this.client.read(this.era.path, {
-        offset: this.reader.boundary,
+        offset: reader.boundary,
       })
+      if (this.reader !== reader) continue // advanceLocal moved us: re-read
       this.ingest(res.bytes, res.nextOffset)
       const atTail = res.upToDate || res.bytes.length === 0
       if (this.pendingSeal) {
@@ -185,11 +224,13 @@ export class EraTailer {
    */
   async pollOnce(opts: { live: 'long-poll' }): Promise<number> {
     const before = this.slices.length
+    const reader = this.reader
     const res = await this.client.read(this.era.path, {
-      offset: this.reader.boundary,
+      offset: reader.boundary,
       live: opts.live,
     })
     if (res.status === 204) return 0 // long-poll timeout, nothing new
+    if (this.reader !== reader) return 0 // advanceLocal moved us: stale
     this.ingest(res.bytes, res.nextOffset)
     let hopped = false
     while (this.pendingSeal) {
@@ -207,6 +248,21 @@ export class EraTailer {
   /** Verified slices whose baseLsn is at or past `lsn` (oldest first). */
   slicesSince(lsn: bigint): TailSlice[] {
     return this.slices.filter((s) => s.baseLsn >= lsn)
+  }
+
+  /** Every replayed grant for one sequence, in stream order (M4, §5.3). */
+  grantsFor(seqName: string): GFrameHeader[] {
+    return this.grants.filter((g) => g.seqName === seqName)
+  }
+
+  /** The grant high-water for one sequence: max(end), 0n before any G. */
+  grantHighWater(seqName: string): bigint {
+    return this.grantHw.get(seqName) ?? 0n
+  }
+
+  /** Snapshot of every sequence's grant high-water (rotation re-assert). */
+  grantHighWaters(): Map<string, bigint> {
+    return new Map(this.grantHw)
   }
 
   /**
@@ -341,7 +397,15 @@ export class EraTailer {
           break
         case 'L':
           this.leases[frame.header.kind] = frame.header
+          this.leaseSeenAt[frame.header.kind] = Date.now()
           break
+        case 'G': {
+          this.grants.push(frame.header)
+          const end = BigInt(frame.header.end)
+          const hw = this.grantHw.get(frame.header.seqName) ?? 0n
+          if (end > hw) this.grantHw.set(frame.header.seqName, end)
+          break
+        }
         case 'O':
           if (group.offset !== INITIAL_OFFSET_TOKEN) {
             throw new ProtocolError(
@@ -361,7 +425,7 @@ export class EraTailer {
         case '0':
           break // recovery fence: deliberate no-op
         default:
-          // G/F/X: reserved — record raw, do not interpret.
+          // F/X: reserved — record raw, do not interpret.
           this.controlFrames.push(frame)
       }
     }

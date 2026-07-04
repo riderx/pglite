@@ -29,6 +29,7 @@ import {
 } from '@electric-sql/pglite-cell'
 import type {
   DsStreamClient,
+  GFrame,
   OFrame,
   OFrameHeader,
   SFrame,
@@ -156,6 +157,57 @@ function verifyMirror(seal: SFrameHeader, open: OFrameHeader): void {
         `finalLsn:${seal.finalLsn}}`,
     )
   }
+}
+
+/**
+ * Re-assert every sequence's grant high-water into the freshly cut era as
+ * ZERO-WIDTH G frames (M4, §5.3 grants-across-rotation rule). Joiners at
+ * era N+1 tail from the era's baseOffset — PAST the O frame and with no
+ * view of era N — so without this, a fresh host would compute its first
+ * grant from checkpoint state alone (which lags live grant ends: setval
+ * floors record grant STARTS, and drawn values trail the leased range) and
+ * could overlap a live foreign grant. A zero-width grant (start == end)
+ * carries no drawable range; it only re-publishes `max(end)`. Appended
+ * BEFORE the manifest transition completes, so nothing can attach to the
+ * new era through the manifest without seeing them. Best-effort beyond
+ * that: a crash between the seal and this append loses the re-assert for
+ * fresh joiners (documented crash window; live tailers keep their grant
+ * state across the hop regardless).
+ */
+async function reassertGrantHighWaters(
+  runtime: DatabaseRuntime,
+): Promise<void> {
+  const highWaters = [...runtime.tailer.grantHighWaters().entries()].filter(
+    ([, hw]) => hw > 0n,
+  )
+  if (highWaters.length === 0) return
+  for (let i = 0; i < 3; i++) {
+    const res = await runtime.committer.appendControl((expectedOffset) =>
+      highWaters.map(
+        ([seqName, hw]): GFrame => ({
+          type: 'G',
+          header: {
+            v: 1,
+            eraId: runtime.tailer.currentEra.id,
+            expectedOffset,
+            kind: 'sequence',
+            seqName,
+            start: hw.toString(),
+            end: hw.toString(),
+            grantee: runtime.hostId,
+            granteeEpoch: runtime.committer.epoch,
+          },
+        }),
+      ),
+    )
+    if (res.landed) return
+    await runtime.tailer.catchUp()
+  }
+  console.log(
+    `[pglite-cell-server] db ${runtime.databaseId}: grant high-water ` +
+      `re-assert into the new era kept losing its CAS — fresh joiners ` +
+      `may momentarily under-read the grant ceiling`,
+  )
 }
 
 /**
@@ -433,7 +485,13 @@ export async function rotateDatabase(
       }
     }
 
-    // --- sealed: 6. MANIFEST ---------------------------------------------
+    // --- sealed: hop our own tailer via the S/O chain, then re-assert the
+    // grant high-waters into era N+1 BEFORE the manifest points anyone at
+    // it (M4, §5.3 grants-across-rotation) -------------------------------
+    await runtime.tailer.catchUp()
+    await reassertGrantHighWaters(runtime)
+
+    // --- 6. MANIFEST -------------------------------------------------------
     const sealHeader: SFrameHeader = {
       v: 1,
       eraId: cur.id,
@@ -451,9 +509,6 @@ export async function rotateDatabase(
       baseOffset: nextBaseOffset,
       baseLsn: baseLsnText,
     })
-    // Hop the runtime's own tailer through the seal so the committer
-    // continues in era N+1 without a reconnect.
-    await runtime.tailer.catchUp()
     await runtime.refreshManifest()
     await ensureCheckpointCoversEraBase(runtime)
     return {

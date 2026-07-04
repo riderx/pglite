@@ -343,6 +343,64 @@ export class GatewayCore {
     return this.controlPlane.advanceCurrentEra(databaseId, from, to)
   }
 
+  /**
+   * Insert the era-N row (rotation step 6). Thin pass-through onto the control
+   * plane's guarded (database, ordinal) insert.
+   */
+  async addEra(
+    databaseId: string,
+    input: {
+      ordinal: number
+      eraId: string
+      path: string
+      baseOffset: string
+      baseLsn: string
+    },
+  ): Promise<void> {
+    await this.controlPlane.addEra({ databaseId, ...input })
+  }
+
+  /** Read an era row by (database, ordinal), or null (rotation repair-walk). */
+  async eraByOrdinal(
+    databaseId: string,
+    ordinal: number,
+  ): Promise<import('./control-plane').EraRow | null> {
+    return this.controlPlane.eraByOrdinal(databaseId, ordinal)
+  }
+
+  // --- Pins (control-plane mirror of L{gc-pin} frames; §6.4). Thin
+  // pass-throughs; the rotator/GC mirror pins here. -----------------------
+
+  async upsertPin(
+    databaseId: string,
+    pin: {
+      id: string
+      kind: string
+      holder: string
+      pinnedOffset: string
+      pinnedLsn: string
+      expiresAt: Date | string
+    },
+  ): Promise<void> {
+    await this.controlPlane.upsertPin({ databaseId, ...pin })
+  }
+
+  async deletePin(pinId: string): Promise<void> {
+    await this.controlPlane.deletePin(pinId)
+  }
+
+  /** Delete expired pins; returns how many were swept (TTL sweep). */
+  async expirePins(): Promise<number> {
+    return this.controlPlane.expirePins()
+  }
+
+  /** Live (unexpired) pins for a database. */
+  async livePins(
+    databaseId: string,
+  ): Promise<import('./control-plane').PinRow[]> {
+    return this.controlPlane.livePins(databaseId)
+  }
+
   /** The control plane (GC and rotator internals reach through this). */
   get catalog(): ControlPlane {
     return this.controlPlane

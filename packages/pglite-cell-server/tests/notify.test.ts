@@ -355,4 +355,80 @@ describe('cluster-wide LISTEN/NOTIFY (M3 §10.2)', () => {
     },
     TEST_TIMEOUT,
   )
+
+  it(
+    '5. NOTIFY-only distribution (M4 fix of the M3 gap): a pure NOTIFY txn (empty capture) lands N frames ALONE and is heard by another connection AND by a second CellHost subscriber',
+    async () => {
+      const ctx = await setup()
+      try {
+        const b = await connect(ctx)
+        const bSeen = tapNotifications(b)
+        await b.query(`listen bare`)
+
+        // A second CellHost on the same gateway, subscribing at the
+        // runtime level (zero pg connections on that host).
+        const host2 = new CellHost({
+          gateway: ctx.core,
+          dataRoot: join(ctx.root, 'host2'),
+          hostId: 'h2',
+        })
+        const s2 = await host2.connect('appdb')
+        const rt2 = host2.runtimeFor(ctx.dbId)!
+        const h2Seen: { channel: string; payload: string }[] = []
+        rt2.subscribeNotifications((n) =>
+          h2Seen.push({ channel: n.channel, payload: n.payload }),
+        )
+
+        // Pure NOTIFY: writes no WAL, capture is EMPTY — pre-M4 this was
+        // never distributed. Now the N frames CAS-append alone.
+        const a = await connect(ctx)
+        await a.query(`notify bare, 'hello'`)
+
+        await waitFor(() => bSeen.length >= 1)
+        expect(bSeen.map((n) => [n.channel, n.payload])).toEqual([
+          ['bare', 'hello'],
+        ])
+
+        // Host 2 hears it off ITS tailer once it catches up.
+        await rt2.linearizableSync()
+        expect(h2Seen).toEqual([{ channel: 'bare', payload: 'hello' }])
+
+        // Stream shape: exactly ONE N frame total (exactly-once). NOTE
+        // (M4 finding, contradicting the M3 "pure NOTIFY writes no WAL"
+        // comment): a NOTIFY-only transaction DOES publish a W frame in
+        // practice — the commit writes a commit record — so the N rides
+        // the normal commitSlice path here ([W, N]); the N-frames-ALONE
+        // fallback below covers the genuinely-empty-capture case.
+        const groups = await streamGroups(ctx)
+        const nFrames = groups
+          .flatMap((g) => g.frames)
+          .filter((f) => f.type === 'N')
+        expect(nFrames.length).toBe(1)
+
+        // The N-frames-alone mechanism itself (empty capture + pending
+        // notifications): drive it directly and assert a W-less group
+        // that still fans out through the tailer everywhere.
+        const rt1 = ctx.host.runtimeFor(ctx.dbId)!
+        await rt1.publishNotificationOnlyCommit([
+          { channel: 'bare', payload: 'alone' },
+        ])
+        await waitFor(() => bSeen.length >= 2)
+        expect(bSeen[1].payload).toBe('alone')
+        await rt2.linearizableSync()
+        expect(h2Seen[1]).toEqual({ channel: 'bare', payload: 'alone' })
+        const groups2 = await streamGroups(ctx)
+        const aloneGroups = groups2.filter((g) =>
+          g.frames.some((f) => f.type === 'N' && f.header.payload === 'alone'),
+        )
+        expect(aloneGroups.length).toBe(1)
+        expect(aloneGroups[0].frames.map((f) => f.type)).toEqual(['N'])
+
+        await s2.close()
+        await host2.shutdown()
+      } finally {
+        await ctx.teardown()
+      }
+    },
+    TEST_TIMEOUT,
+  )
 })

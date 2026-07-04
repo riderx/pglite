@@ -21,7 +21,7 @@
 // runners over it.
 
 import { randomUUID } from 'node:crypto'
-import { Cell } from '@electric-sql/pglite-cell'
+import { Cell, formatLsn } from '@electric-sql/pglite-cell'
 import type { Results } from '@electric-sql/pglite'
 import { serialize } from '@electric-sql/pg-protocol'
 import type { CellDirLease } from './base-dir'
@@ -55,6 +55,12 @@ export interface ExecResult {
   outcome: ExecOutcome
   /** The stream offset the commit landed at (outcome `committed` only). */
   landedOffset?: string
+  /**
+   * The commit's end LSN as pg_lsn text (outcome `committed` only) — the
+   * cross-host session token (§7 M4): carry it to any other host and
+   * `waitForLsn(parseLsn(token))` there before reading.
+   */
+  landedLsn?: string
 }
 
 /**
@@ -127,7 +133,7 @@ type DriveResult<T> =
   | { kind: 'mid-txn'; payload: T; threw?: unknown }
   | { kind: 'aborted'; payload: T; threw?: unknown }
   | { kind: 'read-only'; payload: T }
-  | { kind: 'landed'; payload: T; landedOffset: string }
+  | { kind: 'landed'; payload: T; landedOffset: string; landedLsn: bigint }
   | { kind: 'conflict'; detail: string }
   | { kind: 'pinned-write' }
 
@@ -257,6 +263,16 @@ export class HostSession {
     })
   }
 
+  /**
+   * Cross-host read-your-writes (§7 M4): block until this session's HOST
+   * has ingested the stream up to `lsn` (a `landedLsn` token from a
+   * commit acked anywhere), raising the host watermark so the session's
+   * next statement (in `session` freshness) serves at or past it.
+   */
+  waitForLsn(lsn: bigint, timeoutMs?: number): Promise<void> {
+    return this.runtime.waitForLsn(lsn, timeoutMs)
+  }
+
   /** Idle = no open cell mid-transaction (hibernation eligibility). */
   isIdle(): boolean {
     return this.cell === null || !this.cell.db.isInTransaction()
@@ -325,6 +341,7 @@ export class HostSession {
           rows: lastRows(r.payload),
           outcome: 'committed',
           landedOffset: r.landedOffset,
+          landedLsn: formatLsn(r.landedLsn),
         }
       case 'conflict':
         throw new SerializationConflictError(r.detail)
@@ -569,8 +586,19 @@ export class HostSession {
           const stray = await cell.captureSlice()
           if (stray !== null) cell.confirmPublished(stray.endLsn)
         }
-        // Write cells: stray abort WAL stays local and rides the next
-        // slice (capture-cursor invariant: contiguous, unfiltered).
+        if (this.mode === 'write') {
+          // Write cells: stray abort WAL stays local and rides the next
+          // slice (capture-cursor invariant: contiguous, unfiltered).
+          // M4 FINDING: an aborted transaction's tail (the abort record)
+          // is NOT synchronously flushed to pg_wal — a later capture of
+          // the stray range could read a torn tail and publish it, and
+          // every consumer's materialize then stops right before the
+          // unflushed record ("recovery did not replay to the head").
+          // Force the WAL to disk: an online CHECKPOINT flushes through
+          // the abort record; its own record joins the stray range and
+          // rides the next slice like any other WAL.
+          await cell.db.exec('checkpoint')
+        }
         await this.probeTaints(cell)
         return { kind: 'aborted', payload, threw }
       }
@@ -578,7 +606,14 @@ export class HostSession {
       const slice = await cell.captureSlice()
 
       if (slice === null) {
-        // Read-only: never CAS'd; response is immediately final.
+        // Read-only: never CAS'd; response is immediately final. A pure
+        // NOTIFY commit lands here (notifications write no WAL): its
+        // harvested notifications are CAS-appended as N frames ALONE so
+        // the tailer fanout still distributes them (M4 fix of the M3
+        // NOTIFY-only gap).
+        if (notifications.length > 0) {
+          await this.runtime.publishNotificationOnlyCommit(notifications)
+        }
         await this.probeTaints(cell)
         return { kind: 'read-only', payload }
       }
@@ -644,8 +679,16 @@ export class HostSession {
       if (res.landed) {
         cell.confirmPublished(slice.endLsn)
         this.streamPos = { offset: res.nextOffset, lsn: slice.endLsn }
+        // Grant maintenance (M4, §5.3): committed draws are the probe
+        // evidence that takes/renews this host's sequence grants.
+        await this.runtime.probeGrants(cell)
         await this.probeTaints(cell)
-        return { kind: 'landed', payload, landedOffset: res.offset }
+        return {
+          kind: 'landed',
+          payload,
+          landedOffset: res.offset,
+          landedLsn: slice.endLsn,
+        }
       }
 
       // ---- CAS loss (§3.7 contract) ----

@@ -96,6 +96,17 @@ interface ReadState {
   localHeadLsn: bigint
 }
 
+/**
+ * Small jittered delay between canonical-ensure attempts after a lost CAS
+ * (M4): under genuine cross-host contention the materialize+publish loop
+ * is slower than a foreign host's commit cadence — hammering re-attempts
+ * back-to-back starves; a jitter lets the ensure slot between foreign
+ * appends instead of always racing them from behind.
+ */
+function ensureBackoff(): Promise<void> {
+  return new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 45)))
+}
+
 export class BaseDirManager {
   private readonly root: string
   private readonly maxEnsureAttempts: number
@@ -258,12 +269,16 @@ export class BaseDirManager {
           })
         } catch (err) {
           rmSync(staging, { recursive: true, force: true })
-          if (err instanceof CaptureCursorError) continue // stream moved: retry
+          if (err instanceof CaptureCursorError) {
+            await ensureBackoff() // stream moved: retry
+            continue
+          }
           throw err
         }
         if (!res.landed) {
           rmSync(staging, { recursive: true, force: true })
-          continue // lost the CAS: someone appended; catch up and retry
+          await ensureBackoff() // lost the CAS: someone appended; retry
+          continue
         }
         // Landed: promote staging to the canonical base.
         const promoted = this.newDir('canonical')

@@ -439,7 +439,7 @@ export class ControlPlane {
     }>(
       `select database_id, ordinal, era_id, path, promoted from era_attempts
          where promoted = false
-           and created_at < now() - ($1::bigint * interval '1 millisecond')`,
+           and created_at <= now() - ($1::bigint * interval '1 millisecond')`,
       [String(olderThanMs)],
     )
     return res.rows.map((r) => ({

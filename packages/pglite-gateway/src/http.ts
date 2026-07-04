@@ -232,6 +232,57 @@ export class GatewayServer {
       return c.json({ advanced })
     })
 
+    // --- Era rows (M2c — insert / read the eras table over HTTP so the
+    // rotator's step-6 completes and the repair-walk reads work remotely) --
+    app.post('/v1/db/:id/era', async (c) => {
+      const body = (await c.req.json()) as {
+        ordinal: number
+        eraId: string
+        path: string
+        baseOffset: string
+        baseLsn: string
+      }
+      await core.addEra(c.req.param('id'), body)
+      return c.body(null, 204)
+    })
+    app.get('/v1/db/:id/era/:ordinal', async (c) => {
+      const ordinal = Number(c.req.param('ordinal'))
+      if (!Number.isInteger(ordinal)) {
+        return c.text('ordinal must be an integer', 400)
+      }
+      const row = await core.eraByOrdinal(c.req.param('id'), ordinal)
+      if (row === null) return c.text('no such era', 404)
+      return c.json(row)
+    })
+
+    // --- Pins (M2c — control-plane mirror of L{gc-pin} frames; §6.4. The
+    // queryable index the rotator/GC maintain; the in-band frames stay the
+    // truth) --------------------------------------------------------------
+    app.put('/v1/db/:id/pin', async (c) => {
+      const body = (await c.req.json()) as {
+        id: string
+        kind: string
+        holder: string
+        pinnedOffset: string
+        pinnedLsn: string
+        // ISO string (JSON has no Date); core accepts string|Date.
+        expiresAt: string
+      }
+      await core.upsertPin(c.req.param('id'), body)
+      return c.body(null, 204)
+    })
+    app.delete('/v1/db/:id/pin/:pinId', async (c) => {
+      await core.deletePin(c.req.param('pinId'))
+      return c.body(null, 204)
+    })
+    app.get('/v1/db/:id/pins', async (c) => {
+      return c.json(await core.livePins(c.req.param('id')))
+    })
+    app.post('/v1/db/:id/pins/expire', async (c) => {
+      const swept = await core.expirePins()
+      return c.json({ swept })
+    })
+
     // --- Checkpoints (M1e worker) ----------------------------------------
     app.get('/v1/db/:id/checkpoint/latest', async (c) => {
       const row = await core.latestCheckpoint(c.req.param('id'))

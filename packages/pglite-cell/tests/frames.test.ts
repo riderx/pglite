@@ -19,6 +19,7 @@ import {
   type LFrame,
   type FenceFrame,
   type GenericFrame,
+  type GFrame,
   type NFrame,
 } from '../src/frames'
 
@@ -149,8 +150,26 @@ describe('frame codec round-trips', () => {
     expect(decodeFrame(encodeFrame(f), 0)!.frame).toEqual(f)
   })
 
-  it('reserved generic frames (G,F,X)', () => {
-    for (const type of ['G', 'F', 'X'] as const) {
+  it('G (sequence grant) frame round-trips (M4 §5.3)', () => {
+    const f: GFrame = {
+      type: 'G',
+      header: {
+        v: 1,
+        eraId: ERA,
+        expectedOffset: INITIAL_OFFSET_TOKEN,
+        kind: 'sequence',
+        seqName: 'public.orders_id_seq',
+        start: '4096',
+        end: '8192',
+        grantee: 'host-a',
+        granteeEpoch: 3,
+      },
+    }
+    expect(decodeFrame(encodeFrame(f), 0)!.frame).toEqual(f)
+  })
+
+  it('reserved generic frames (F,X)', () => {
+    for (const type of ['F', 'X'] as const) {
       const f: GenericFrame = {
         type,
         header: {
