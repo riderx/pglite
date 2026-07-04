@@ -1,5 +1,10 @@
 # M1 implementation plan — single-host vertical slice
 
+> **STATUS: M1 CLOSED (2026-07-04).** All phases M1a–M1f shipped and
+> committed on `optimistic-physical-replication`; §15 of the design doc
+> carries the summary. This file remains as the record of the concrete
+> formats and the test-corrected findings (search "finding").
+
 Working companion to `OPTIMISTIC_PHYSICAL_REPLICATION_DESIGN.md` (the design
 doc governs; this file pins the concrete formats, algorithms, and scope cuts
 for M1 and is disposable once M1 closes). Everything here is buildable on

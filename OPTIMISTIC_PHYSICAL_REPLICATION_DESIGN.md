@@ -1948,7 +1948,41 @@ Each is independently demoable; the conflict path starts trivial and hardens.
   **deferred by decision** (compatibility with unmodified Durable
   Streams; see §2.3's dual-header posture; store-layer WIP parked on a
   local `durable-streams` branch). **M0 is closed.**
-- **M1 — single-host vertical slice.** Framed era streams; quiesced
+- **M1 — single-host vertical slice. DONE (2026-07-04; 105 tests across
+  the three §14.7 packages, all on published-equivalent PGlite 0.5.4 with
+  zero native changes and an UNMODIFIED Durable Streams server —
+  `M1_PLAN.md` holds the working spec and its test-corrected findings).**
+  Shipped: `pglite-cell` (frame codec v1 + W4 position-checked reader;
+  hybrid stream client over the official `@durable-streams/client` with a
+  purpose-built CAS append — upstream candidate at M4; pending journal +
+  §3.8 fence-then-read recovery; committer with byte-identical retries
+  and dedup-safe tail handling; era tailer; datadir engine incl. the
+  M0-2 mint recipe held for M3; materializer; cell with config-pin and
+  zero-boot-WAL asserts), `pglite-gateway` (content-addressed object
+  store; tar checkpoint objects; control-plane schema v0 on PGlite;
+  verbatim stream proxy — an unmodified cell client CAS-commits through
+  it; statelessness enforced by a two-instance kill-one-mid-flow test),
+  `pglite-cell-server` (read-attach vs write-attach base management —
+  readers advance with zero stream appends and never invalidate writers;
+  host sequencer + head-lease and gc-pin frames; watermark gate;
+  host-local sequence floors closing the abort-only nextval hazard;
+  hibernate/wake; checkpoint worker: canonical-ensure → tar → CAS'd `K`
+  frame → control-plane row, checkpoint-on-hibernate ⇒ wake replays zero
+  slices; session proxy speaking real PG wire to `pg` clients:
+  cell-per-connection, response buffering with the "client observed
+  nothing" property proven at the socket byte level, transparent
+  one-shot re-execute, interactive `40001` verbatim §4.0, tainted fatal
+  reset as FATAL 57P01). Measured: create ~1.4 s, cold connect ~670 ms,
+  wake-to-first-row ~940 ms, recycle ~100 ms. Key findings folded back:
+  first-reopen-after-initdb writes ~8 KB even with checksums off
+  (checkpoints need a settling boot); a diverged read base cannot be
+  delta-advanced (advances re-materialize from the last canonical dir —
+  bounded by checkpoint cadence); sync slices publish GENUINE
+  materialize-produced records at M1 (deterministic cross-host minting
+  deferred to M4 as designed). M1 scope cuts landing later, as planned:
+  era rotation (M2), live tail apply lifting recycle-advance (M3),
+  cross-host leases + strict-CAS/client upstreaming (M4).
+  Original scope: framed era streams; quiesced
   checkpoint objects + manifest; cold start via the synthesized
   clean-at-head control view (§6.5) — attach, never recover; head lease; one-shot CAS
   with re-execute-on-loss; **interactive transactions get `40001`-on-loss

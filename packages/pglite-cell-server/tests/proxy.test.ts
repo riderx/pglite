@@ -512,6 +512,228 @@ describe('CellProxyServer (M1d exit)', () => {
   )
 
   it(
+    '10. raced DDL one-shot re-execute: a stale-lease loser CREATE TABLE re-executes transparently; the catalog is consistent and the new table is usable',
+    async () => {
+      const ctx = await setup()
+      try {
+        // Prime a base table so A and B both attach at a non-empty head.
+        const s = await connect(ctx)
+        await s.query(`create table seed (id serial primary key)`)
+
+        const a = await connect(ctx)
+        const b = await connect(ctx)
+        // Prime BOTH with read cells so B's base is genuinely stale after A's
+        // commit (same interleaving as test 2).
+        await a.query(`select count(*) from seed`)
+        await b.query(`select count(*) from seed`)
+
+        // A lands a commit, stalings B's base.
+        const ra = await a.query(`insert into seed default values`)
+        expect(ra.rowCount).toBe(1)
+
+        // B's CREATE TABLE is a one-shot DDL committing from a stale base:
+        // watermark advance + write-upgrade + transparent re-execute behind
+        // the wire. The client just sees a clean CommandComplete (CREATE
+        // TABLE), never an error.
+        const events: UnitObservation[] = []
+        ctx.sessions[2]._unitObserver = (ev) => events.push(ev)
+        const tap = tapClient(b)
+        tap.clear()
+
+        const rb = await b.query(
+          `create table dtab (id serial primary key, v text not null, n int)`,
+        )
+        // node-postgres reports the leading token; the raw tag ('CREATE
+        // TABLE') is asserted on the socket census below.
+        expect(rb.command).toBe('CREATE')
+        await new Promise((r) => setImmediate(r))
+
+        // The unit executed TWICE (discarded first attempt + re-execution)
+        // and landed; the client saw exactly the re-execution's bytes.
+        const attempts = events.filter((e) => e.phase === 'attempt')
+        expect(attempts.length).toBe(2)
+        const result = events.find((e) => e.phase === 'result')
+        expect(result?.disposition).toBe('landed')
+        const seen = census(tap.bytes())
+        expect(seen.commandTags).toEqual(['CREATE TABLE'])
+        expect(seen.errorCodes).toEqual([])
+        expect(seen.rfq).toBe(1)
+
+        // The table exists with the correct shape (queried on B's own cell).
+        const shape = await b.query(
+          `select column_name, data_type, is_nullable
+             from information_schema.columns
+            where table_name = 'dtab'
+            order by ordinal_position`,
+        )
+        expect(shape.rows).toEqual([
+          {
+            column_name: 'id',
+            data_type: 'integer',
+            is_nullable: 'NO',
+          },
+          {
+            column_name: 'v',
+            data_type: 'text',
+            is_nullable: 'NO',
+          },
+          {
+            column_name: 'n',
+            data_type: 'integer',
+            is_nullable: 'YES',
+          },
+        ])
+
+        // A THIRD fresh connection materializes the catalog through the
+        // watermark gate and finds the table immediately usable: insert +
+        // select round-trips against the raced-in DDL.
+        const c = await connect(ctx)
+        const ins = await c.query(`insert into dtab (v, n) values ('x', 7)`)
+        expect(ins.rowCount).toBe(1)
+        const sel = await c.query(`select v, n from dtab order by id`)
+        expect(sel.rows).toEqual([{ v: 'x', n: 7 }])
+
+        // Oracle: a never-before-seen materialize of the FULL stream shows a
+        // consistent catalog — the table is present with the row landed.
+        const orows = await oracle<{ v: string; n: number }>(
+          ctx,
+          `select v, n from dtab order by id`,
+        )
+        expect(orows).toEqual([{ v: 'x', n: 7 }])
+      } finally {
+        await ctx.teardown()
+      }
+    },
+    TEST_TIMEOUT,
+  )
+
+  it(
+    '11. client observation under injected commit-path failure (§16 kill-the-CAS v0): a retried transient append lands exactly once; an all-attempts append failure is a clean ERROR with zero partial rows',
+    async () => {
+      const ctx = await setup()
+      try {
+        const s = await connect(ctx)
+        await s.query(`create table t11 (id serial primary key, v text)`)
+
+        // ---- (a) transient failure on the FIRST append attempt ----
+        // The committer's postWithRetry must re-POST byte-identically and
+        // land; the client sees EXACTLY one successful response.
+        const a = await connect(ctx)
+        // Make A write-attached and canonical-at-head FIRST, so the very next
+        // append is the commit's W frame (not an attach-time sync/floors/lease
+        // control append). This isolates the injection to the commit path.
+        await a.query(`insert into t11 (v) values ('seed')`)
+
+        const runtime = ctx.host.runtimeFor(ctx.dbId)!
+        const committer = runtime.committer
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const client = (committer as any).client
+        const realAppend = client.append.bind(client)
+
+        let appendCalls = 0
+        let failedOnce = false
+
+        client.append = async (...args: any[]) => {
+          appendCalls++
+          if (!failedOnce) {
+            failedOnce = true
+            // A network-style exception (NOT a StreamHttpError) — the exact
+            // shape postWithRetry treats as "outcome unknown, retry W2".
+            throw new Error('injected transient network failure')
+          }
+          return realAppend(...args)
+        }
+
+        const tapA = tapClient(a)
+        tapA.clear()
+        const ra = await a.query(`insert into t11 (v) values ('retry-lands')`)
+
+        client.append = realAppend
+        expect(ra.rowCount).toBe(1)
+        await new Promise((r) => setImmediate(r))
+
+        // The first attempt threw; the retry landed the SAME bytes.
+        expect(failedOnce).toBe(true)
+        expect(appendCalls).toBeGreaterThanOrEqual(2)
+        // The client saw exactly one INSERT 0 1 — no duplicate, no error.
+        const seenA = census(tapA.bytes())
+        expect(seenA.commandTags).toEqual(['INSERT 0 1'])
+        expect(seenA.rfq).toBe(1)
+        expect(seenA.errorCodes).toEqual([])
+
+        // Exactly-once at the stream level.
+        const rows1 = await oracle<{ v: string }>(
+          ctx,
+          `select v from t11 order by id`,
+        )
+        expect(rows1).toEqual([{ v: 'seed' }, { v: 'retry-lands' }])
+
+        // ---- (b) hard failure of ALL append attempts ----
+        // Every attempt throws a network-style error; postWithRetry exhausts
+        // its budget and rethrows. The client must receive a clean ERROR
+        // (never a hang, never partial rows) and the connection is cleanly
+        // reset (§3.3 fatal path). No DataRow bytes leak before the error.
+        const b = await connect(ctx)
+        const observed = { error: false, end: false }
+        b.on('error', () => {
+          observed.error = true
+        })
+        b.on('end', () => {
+          observed.end = true
+        })
+        // Prime B's cell (a read) so the failure is isolated to the commit
+        // append, not the attach.
+        await b.query(`select count(*) from t11`)
+
+        client.append = async () => {
+          throw new Error('injected hard append failure (all attempts)')
+        }
+
+        const tapB = tapClient(b)
+        tapB.clear()
+        let err: unknown
+        try {
+          await b.query(`insert into t11 (v) values ('never-lands')`)
+        } catch (e) {
+          err = e
+        }
+
+        client.append = realAppend
+        expect(err).toBeDefined()
+        await new Promise((r) => setTimeout(r, 200))
+
+        // The bytes the client saw before the error: NO DataRow, NO
+        // CommandComplete for the failed insert — only a clean ERROR (the
+        // §3.5 buffer died unsent), and the connection is torn down.
+        const seenB = census(tapB.bytes())
+        expect(seenB.commandTags).toEqual([]) // no partial CommandComplete
+        expect(seenB.errorCodes.length).toBe(1) // exactly one clean ERROR
+        let dataRows = 0
+        new Parser().parse(tapB.bytes(), (msg) => {
+          if (msg.name === 'dataRow') dataRows++
+        })
+        expect(dataRows).toBe(0) // no partial DataRows leaked
+        expect(observed.error || observed.end).toBe(true) // cleanly reset
+
+        // The failed insert is absent from a fresh oracle: exactly-once holds.
+        const rows2 = await oracle<{ v: string }>(
+          ctx,
+          `select v from t11 order by id`,
+        )
+        expect(rows2).toEqual([{ v: 'seed' }, { v: 'retry-lands' }])
+
+        // A fresh connection is fully usable after the reset.
+        const c = await connect(ctx)
+        const alive = await c.query(`select v from t11 order by id`)
+        expect(alive.rows).toEqual([{ v: 'seed' }, { v: 'retry-lands' }])
+      } finally {
+        await ctx.teardown()
+      }
+    },
+    TEST_TIMEOUT,
+  )
+
+  it(
     '9. unknown database name: clean 3D000 at connect',
     async () => {
       const ctx = await setup()
