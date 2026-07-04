@@ -1,0 +1,11 @@
+{
+  "name": "m0-wal-roundtrip",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node harness.mjs"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.4"
+  }
+}

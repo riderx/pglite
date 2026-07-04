@@ -1847,10 +1847,18 @@ names provisional; the boundaries are not.
 
 Each is independently demoable; the conflict path starts trivial and hardens.
 
-- **M0 — proofs.** WAL round-trip: run at pinned config, slice WAL between
-  LSNs via the VFS, replay into a second cell from a checkpoint, assert
-  identical dumps. Strict CAS extension in the TS server. Cell recycle timing.
-  FPI/WAL-volume accounting vs page-image manifests.
+- **M0 — proofs.** WAL round-trip — **DONE, 18/18
+  (`experiments/m0-wal-roundtrip`)**: slice reassembly and prefix
+  time-travel replay to identical state on published PGlite 0.5.4;
+  nextXid/nextMulti chain exactly through aborts, savepoints, temp-only
+  commits, and a minted multixact — first empirical confirmation of §5.1.
+  Two findings feed M1: reopen writes ~48 KB of bootstrap WAL (identify /
+  eliminate — per-attach write amplification the §6.5 attach story assumes
+  away) and session teardown writes a final cleanup transaction (slice
+  capture must run to the durable end of WAL, not the last statement).
+  Remaining: attach experiment (synthesized clean-at-head control view,
+  recipe in §6.5); strict CAS extension in the TS server; cell recycle
+  timing; FPI/WAL-volume accounting vs page-image manifests.
 - **M1 — single-host vertical slice.** Framed era streams; quiesced
   checkpoint objects + manifest; cold start via the synthesized
   clean-at-head control view (§6.5) — attach, never recover; head lease; one-shot CAS
