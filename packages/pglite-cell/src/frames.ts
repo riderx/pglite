@@ -101,18 +101,40 @@ export interface FenceFrame {
 }
 
 /**
- * Reserved control frames — codec support + tests only at M1, not produced
- * yet (S: M2 rotation, G: M4, N: M3, F: M2, X: M5). Their payload is an
- * opaque JSON header extending the common base.
+ * Era-seal frame (M2 rotation, §6.1 step 5). Rides the sealing
+ * `appendAndClose` CAS append; presence of a valid terminal S means sealed
+ * regardless of the stream's closed bit (§2.6). `nextEraUrl` is a stream
+ * PATH relative to the same client base (leading slash, M1 convention).
+ * `ordinal` is the sealed era's ordinal (the next era's is `ordinal + 1`,
+ * mirrored authoritatively in the next era's O frame).
+ */
+export interface SFrameHeader extends BaseHeader {
+  ordinal: number
+  finalOffset: string
+  finalLsn: string
+  nextEraUrl: string
+  nextEraId: string
+}
+
+export interface SFrame {
+  type: 'S'
+  header: SFrameHeader
+}
+
+/**
+ * Reserved control frames — codec support + tests only, not produced yet
+ * (G: M4, N: M3, F: M2b, X: M5). Their payload is an opaque JSON header
+ * extending the common base.
  */
 export interface GenericFrame {
-  type: 'S' | 'G' | 'N' | 'F' | 'X'
+  type: 'G' | 'N' | 'F' | 'X'
   header: BaseHeader & Record<string, unknown>
 }
 
 export type Frame =
   | WFrame
   | OFrame
+  | SFrame
   | KFrame
   | LFrame
   | FenceFrame

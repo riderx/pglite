@@ -3,6 +3,15 @@
 // every era-stream append is CAS'd — commits, syncs, leases, fences), and
 // journals each commit before its POST so §3.8 recovery can decide its
 // outcome after a crash.
+//
+// M2: the committer is era-aware. All era coordinates (path, id, W3 token
+// ordinal) come from the TAILER's current era at append time, not from
+// construction-time config. A `closed` append result is no longer terminal:
+// the committer catches up (which hops the era via the S/O chain) and — if
+// the slice still sits at the new head — RE-CASes the same WAL bytes into
+// the new era as a NEW append (new frame headers, new journal entry, same
+// commitId; W1/W2: never a byte-identical retry of the old one). Bounded at
+// two hops per commit, then `EraClosedError`.
 
 import { createHash, randomUUID } from 'node:crypto'
 import type { DsStreamClient } from './stream-client'
@@ -20,7 +29,8 @@ import {
   ProducerGapError,
 } from './errors'
 
-/** Era coordinates the committer appends into. */
+/** Era coordinates the committer starts from (kept for construction-time
+ *  bookkeeping; live coordinates always come from the tailer's current era). */
 export interface CommitterEra {
   /** Stream path relative to the client's base URL. */
   path: string
@@ -61,15 +71,19 @@ export type ControlAppendResult =
  *  same producer tuple — the server dedups replays of the winning POST). */
 const MAX_POST_ATTEMPTS = 3
 
+/** Maximum era hops one append may follow on `closed` results before the
+ *  committer gives up with EraClosedError. */
+const MAX_ROTATION_HOPS = 2
+
 function sha256Hex(bytes: Uint8Array): string {
   return 'sha256:' + createHash('sha256').update(bytes).digest('hex')
 }
 
 /**
- * The commit sequencer for one era. Create with `Committer.create()`, which
- * FIRST runs §3.8 journal recovery for any commits left pending by a prior
- * incarnation, then claims a producer epoch strictly above every epoch that
- * incarnation (or its recovery fences) used.
+ * The commit sequencer for one era chain. Create with `Committer.create()`,
+ * which FIRST runs §3.8 journal recovery for any commits left pending by a
+ * prior incarnation, then claims a producer epoch strictly above every epoch
+ * that incarnation (or its recovery fences) used.
  */
 export class Committer {
   /** The §3.8 recovery report produced during `create()`. */
@@ -78,12 +92,17 @@ export class Committer {
   readonly producerId: string
   readonly epoch: number
 
-  private seq = 0
+  /**
+   * Producer seq PER ERA STREAM: the server keeps producer state per
+   * stream and requires a producer's first append on a stream to carry
+   * seq 0 (verified against 0.3.7 validateProducer), so the counter cannot
+   * be global across era hops.
+   */
+  private readonly seqByPath = new Map<string, number>()
   private chain: Promise<unknown> = Promise.resolve()
 
   private constructor(
     private readonly client: DsStreamClient,
-    private readonly era: CommitterEra,
     private readonly tailer: EraTailer,
     journal: CommitJournal,
     producerId: string,
@@ -115,7 +134,6 @@ export class Committer {
 
     return new Committer(
       opts.client,
-      opts.era,
       opts.tailer,
       journal,
       meta.producerId,
@@ -147,94 +165,124 @@ export class Committer {
    * - `seq-conflict` ⇒ a definitive reject: resolves the journal entry and
    *   returns `{ landed: false }` (the caller rebases; NEVER re-POST these
    *   slice bytes — re-execute with a new commitId);
+   * - `closed` ⇒ the era rotated under us: resolve the entry
+   *   (lost-to-rotation), catch up (hops via the S/O chain), and if the
+   *   slice still sits at the new head, RE-CAS the same WAL bytes into the
+   *   new era (fresh frame + journal entry, same commitId); otherwise
+   *   `{ landed: false }`. Bounded at 2 hops, then `EraClosedError`;
    * - network errors ⇒ retries the SAME bytes with the SAME producer tuple
    *   up to 3 attempts (W2 — the server dedups), then rethrows leaving the
    *   journal entry pending for the next incarnation's recovery;
-   * - `closed` / `stale-epoch` / `producer-gap` ⇒ typed errors.
+   * - `stale-epoch` / `producer-gap` ⇒ typed errors.
    */
   commitSlice(input: CommitSliceInput): Promise<CommitResult> {
     return this.run(async () => {
-      const head = this.tailer.head
-      if (input.baseLsn !== head.lsn) {
-        throw new CaptureCursorError(input.baseLsn, head.lsn)
+      if (input.baseLsn !== this.tailer.head.lsn) {
+        throw new CaptureCursorError(input.baseLsn, this.tailer.head.lsn)
       }
-      const expectedOffset = head.offset
-      const sliceHash = sha256Hex(input.bytes)
-      const frame: WFrame = {
-        type: 'W',
-        header: {
-          v: 1,
-          eraId: this.era.id,
-          expectedOffset,
-          commitId: input.commitId,
-          kind: input.kind,
-          baseLsn: formatLsn(input.baseLsn),
-          endLsn: formatLsn(input.endLsn),
-          sliceHash,
-        },
-        wal: input.bytes,
-      }
-      const body = encodeAppend([frame])
-      const seqToken = casToken(this.era.ordinal, expectedOffset)
-      const producer = { id: this.producerId, epoch: this.epoch, seq: this.seq }
+      return this.postSlice(input, MAX_ROTATION_HOPS)
+    })
+  }
 
-      this.journal.record({
-        commitId: input.commitId,
-        eraId: this.era.id,
-        eraPath: this.era.path,
-        eraOrdinal: this.era.ordinal,
+  /** One CAS attempt of `input` into the tailer's CURRENT era, following up
+   *  to `hopsLeft` era rotations on `closed` results. Mutex held by caller. */
+  private async postSlice(
+    input: CommitSliceInput,
+    hopsLeft: number,
+  ): Promise<CommitResult> {
+    const era = this.tailer.currentEra
+    const expectedOffset = this.tailer.head.offset
+    const sliceHash = sha256Hex(input.bytes)
+    const frame: WFrame = {
+      type: 'W',
+      header: {
+        v: 1,
+        eraId: era.id,
         expectedOffset,
-        casToken: seqToken,
+        commitId: input.commitId,
+        kind: input.kind,
         baseLsn: formatLsn(input.baseLsn),
         endLsn: formatLsn(input.endLsn),
         sliceHash,
-        producerId: producer.id,
-        producerEpoch: producer.epoch,
-        producerSeq: producer.seq,
-        fenceEpoch: producer.epoch,
-      })
+      },
+      wal: input.bytes,
+    }
+    const body = encodeAppend([frame])
+    const seqToken = casToken(era.ordinal, expectedOffset)
+    const producer = {
+      id: this.producerId,
+      epoch: this.epoch,
+      seq: this.seqByPath.get(era.path) ?? 0,
+    }
 
-      const res = await this.postWithRetry(body, {
-        seq: seqToken,
-        expectedOffset,
-        producer,
-      })
-
-      switch (res.kind) {
-        case 'ok': {
-          if (res.deduped) {
-            // Our append landed on an earlier attempt (network retry deduped).
-            // The recovered nextOffset is the CURRENT tail — a foreign append
-            // may sit between ours and it, so advancing locally would skip
-            // frames. Re-download from the pre-append boundary instead.
-            await this.tailer.catchUp()
-          } else {
-            this.tailer.advanceLocal([frame], res.nextOffset)
-          }
-          this.seq += 1
-          this.journal.resolve(input.commitId)
-          return {
-            landed: true,
-            offset: expectedOffset,
-            nextOffset: this.tailer.head.offset,
-          }
-        }
-        case 'seq-conflict':
-          // A 409 is a definitive reject: nothing mutated server-side, the
-          // producer seq was not consumed. Journal entry resolved.
-          this.journal.resolve(input.commitId)
-          return { landed: false }
-        case 'closed':
-          this.journal.resolve(input.commitId)
-          throw new EraClosedError(res.nextOffset)
-        case 'stale-epoch':
-          this.journal.resolve(input.commitId)
-          throw new FencedError(this.epoch, res.currentEpoch)
-        case 'producer-gap':
-          this.journal.resolve(input.commitId)
-          throw new ProducerGapError(res.expectedSeq, res.receivedSeq)
-      }
+    this.journal.record({
+      commitId: input.commitId,
+      eraId: era.id,
+      eraPath: era.path,
+      eraOrdinal: era.ordinal,
+      expectedOffset,
+      casToken: seqToken,
+      baseLsn: formatLsn(input.baseLsn),
+      endLsn: formatLsn(input.endLsn),
+      sliceHash,
+      producerId: producer.id,
+      producerEpoch: producer.epoch,
+      producerSeq: producer.seq,
+      fenceEpoch: producer.epoch,
     })
+
+    const res = await this.postWithRetry(era.path, body, {
+      seq: seqToken,
+      expectedOffset,
+      producer,
+    })
+
+    switch (res.kind) {
+      case 'ok': {
+        if (res.deduped) {
+          // Our append landed on an earlier attempt (network retry deduped).
+          // The recovered nextOffset is the CURRENT tail — a foreign append
+          // may sit between ours and it, so advancing locally would skip
+          // frames. Re-download from the pre-append boundary instead.
+          await this.tailer.catchUp()
+        } else {
+          this.tailer.advanceLocal([frame], res.nextOffset)
+        }
+        this.seqByPath.set(era.path, producer.seq + 1)
+        this.journal.resolve(input.commitId)
+        return {
+          landed: true,
+          offset: expectedOffset,
+          nextOffset: this.tailer.head.offset,
+        }
+      }
+      case 'seq-conflict':
+        // A 409 is a definitive reject: nothing mutated server-side, the
+        // producer seq was not consumed. Journal entry resolved.
+        this.journal.resolve(input.commitId)
+        return { landed: false }
+      case 'closed': {
+        // The era rotated under us. The 409 was a definitive reject, so the
+        // journal entry resolves as lost-to-rotation; the re-CAS below is a
+        // NEW append with a FRESH entry against the new era (never a
+        // byte-identical retry — W1/W2).
+        this.journal.resolve(input.commitId)
+        if (hopsLeft <= 0) throw new EraClosedError(res.nextOffset)
+        await this.tailer.catchUp() // hops via the S/O chain (or throws)
+        if (input.baseLsn !== this.tailer.head.lsn) {
+          // Another commit landed ahead of us in the new era: ordinary
+          // lost race — the caller rebases and re-executes.
+          return { landed: false }
+        }
+        return this.postSlice(input, hopsLeft - 1)
+      }
+      case 'stale-epoch':
+        this.journal.resolve(input.commitId)
+        throw new FencedError(this.epoch, res.currentEpoch)
+      case 'producer-gap':
+        this.journal.resolve(input.commitId)
+        throw new ProducerGapError(res.expectedSeq, res.receivedSeq)
+    }
   }
 
   /**
@@ -243,49 +291,65 @@ export class Committer {
    * entry. `build` receives the append position so headers can carry it
    * (W4); every returned frame must use exactly that `expectedOffset`.
    * `seq-conflict` ⇒ `{ landed: false }` (re-observe the tail and retry).
+   * `closed` ⇒ catch up (era hop) and rebuild via `build` at the new
+   * position, bounded at 2 hops.
    */
   appendControl(
     build: (expectedOffset: string) => Frame[],
   ): Promise<ControlAppendResult> {
-    return this.run(async () => {
-      const expectedOffset = this.tailer.head.offset
-      const frames = build(expectedOffset)
-      const body = encodeAppend(frames)
-      if (frames.some((f) => f.header.expectedOffset !== expectedOffset)) {
-        throw new Error(
-          'appendControl: built frames must carry the provided expectedOffset',
-        )
-      }
-      const res = await this.postWithRetry(body, {
-        seq: casToken(this.era.ordinal, expectedOffset),
-        expectedOffset,
-        producer: { id: this.producerId, epoch: this.epoch, seq: this.seq },
-      })
-      switch (res.kind) {
-        case 'ok':
-          if (res.deduped) {
-            // Same skip hazard as commitSlice: re-download, never advance
-            // locally past a tail we did not observe frame-by-frame.
-            await this.tailer.catchUp()
-          } else {
-            this.tailer.advanceLocal(frames, res.nextOffset)
-          }
-          this.seq += 1
-          return {
-            landed: true,
-            offset: expectedOffset,
-            nextOffset: this.tailer.head.offset,
-          }
-        case 'seq-conflict':
-          return { landed: false }
-        case 'closed':
-          throw new EraClosedError(res.nextOffset)
-        case 'stale-epoch':
-          throw new FencedError(this.epoch, res.currentEpoch)
-        case 'producer-gap':
-          throw new ProducerGapError(res.expectedSeq, res.receivedSeq)
-      }
+    return this.run(async () => this.postControl(build, MAX_ROTATION_HOPS))
+  }
+
+  private async postControl(
+    build: (expectedOffset: string) => Frame[],
+    hopsLeft: number,
+  ): Promise<ControlAppendResult> {
+    const era = this.tailer.currentEra
+    const expectedOffset = this.tailer.head.offset
+    const frames = build(expectedOffset)
+    const body = encodeAppend(frames)
+    if (frames.some((f) => f.header.expectedOffset !== expectedOffset)) {
+      throw new Error(
+        'appendControl: built frames must carry the provided expectedOffset',
+      )
+    }
+    const producer = {
+      id: this.producerId,
+      epoch: this.epoch,
+      seq: this.seqByPath.get(era.path) ?? 0,
+    }
+    const res = await this.postWithRetry(era.path, body, {
+      seq: casToken(era.ordinal, expectedOffset),
+      expectedOffset,
+      producer,
     })
+    switch (res.kind) {
+      case 'ok':
+        if (res.deduped) {
+          // Same skip hazard as commitSlice: re-download, never advance
+          // locally past a tail we did not observe frame-by-frame.
+          await this.tailer.catchUp()
+        } else {
+          this.tailer.advanceLocal(frames, res.nextOffset)
+        }
+        this.seqByPath.set(era.path, producer.seq + 1)
+        return {
+          landed: true,
+          offset: expectedOffset,
+          nextOffset: this.tailer.head.offset,
+        }
+      case 'seq-conflict':
+        return { landed: false }
+      case 'closed':
+        if (hopsLeft <= 0) throw new EraClosedError(res.nextOffset)
+        await this.tailer.catchUp() // hops via the S/O chain (or throws)
+        // `build` re-derives headers at the new position (new era's frames).
+        return this.postControl(build, hopsLeft - 1)
+      case 'stale-epoch':
+        throw new FencedError(this.epoch, res.currentEpoch)
+      case 'producer-gap':
+        throw new ProducerGapError(res.expectedSeq, res.receivedSeq)
+    }
   }
 
   /**
@@ -295,6 +359,7 @@ export class Committer {
    * AppendResult kinds, StreamHttpError) are never retried.
    */
   private async postWithRetry(
+    path: string,
     body: Uint8Array,
     opts: {
       seq: string
@@ -305,7 +370,7 @@ export class Committer {
     let lastErr: unknown
     for (let attempt = 1; attempt <= MAX_POST_ATTEMPTS; attempt++) {
       try {
-        return await this.client.append(this.era.path, body, opts)
+        return await this.client.append(path, body, opts)
       } catch (err) {
         if (err instanceof StreamHttpError) throw err
         lastErr = err // network-level failure: outcome unknown, retry W2

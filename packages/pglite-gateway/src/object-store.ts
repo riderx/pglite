@@ -11,6 +11,7 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
   renameSync,
   existsSync,
   rmSync,
@@ -107,5 +108,25 @@ export class FsObjectStore {
   /** True iff an object with `ref` is present. */
   async has(ref: string): Promise<boolean> {
     return existsSync(this.pathFor(ref))
+  }
+
+  /**
+   * Delete the object at `ref` (GC of unreferenced checkpoint objects).
+   * Idempotent — a missing object is a no-op. Returns true iff a file was
+   * removed.
+   */
+  async delete(ref: string): Promise<boolean> {
+    const dst = this.pathFor(ref)
+    if (!existsSync(dst)) return false
+    rmSync(dst, { force: true })
+    return true
+  }
+
+  /** List every stored object's ref (`sha256:<hex>`). */
+  async list(): Promise<string[]> {
+    if (!existsSync(this.objectsDir)) return []
+    return readdirSync(this.objectsDir)
+      .filter((n) => /^[0-9a-f]{64}$/.test(n))
+      .map((hex) => 'sha256:' + hex)
   }
 }

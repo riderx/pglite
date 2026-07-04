@@ -1,10 +1,30 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, readdirSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { create as tarCreate } from 'tar'
 import { PGlite } from '@electric-sql/pglite'
-import { readControl } from '@electric-sql/pglite-cell'
+import {
+  readControl,
+  lsnToSegment,
+  walSegmentName,
+} from '@electric-sql/pglite-cell'
 import { packDatadir, extractDatadir } from '../src/checkpoint-object'
+
+/** v1 packer: plain uncompressed tar of the WHOLE datadir (the old format). */
+async function packV1(dir: string): Promise<Uint8Array> {
+  const scratch = mkdtempSync(join(tmpdir(), 'pgl-v1-'))
+  const tarPath = join(scratch, 'v1.tar')
+  try {
+    await tarCreate(
+      { file: tarPath, cwd: dir, portable: true, noMtime: true },
+      ['.'],
+    )
+    return readFileSync(tarPath)
+  } finally {
+    rmSync(scratch, { recursive: true, force: true })
+  }
+}
 
 const TEST_TIMEOUT = 120_000
 
@@ -68,6 +88,76 @@ describe('checkpoint-object pack/extract', () => {
       // Deterministic-ish: same tree, sorted entries, no mtime. Sizes match and
       // the extracted control is identical.
       expect(b1.length).toBe(b2.length)
+    },
+    TEST_TIMEOUT,
+  )
+
+  it(
+    'v2 is gzipped and dramatically smaller than v1 (the 99 MB fix)',
+    async () => {
+      const v1 = await packV1(sourceDir)
+      const v2 = await packDatadir(sourceDir)
+      // v2 sniffs as gzip.
+      expect(v2[0]).toBe(0x1f)
+      expect(v2[1]).toBe(0x8b)
+      // v2 is dramatically smaller than v1. The win scales with the number of
+      // pristine WAL segments dropped: this fixture has only a handful, and the
+      // single RETAINED 16 MiB checkpoint segment barely gzips (WAL is
+      // near-incompressible in this build), so v2 lands around a third of v1
+      // here; a many-era production datadir (the "99 MB" case) collapses to
+      // single-digit MB. Assert a conservative < 40% so the fix is proven
+      // without being brittle to WAL entropy.
+      expect(v2.length).toBeLessThan(v1.length * 0.4)
+    },
+    TEST_TIMEOUT,
+  )
+
+  it(
+    'v2 keeps ONLY the checkpoint WAL segment; extract yields a working db',
+    async () => {
+      const { segno } = lsnToSegment(readControl(sourceDir).checkPoint)
+      const keepSeg = walSegmentName(segno)
+
+      const dest = join(root, 'dest-slim')
+      await extractDatadir(await packDatadir(sourceDir), dest)
+
+      const segs = readdirSync(join(dest, 'pg_wal')).filter((n) =>
+        /^[0-9A-F]{24}$/.test(n),
+      )
+      expect(segs).toEqual([keepSeg])
+
+      // pg_wal subdirs survive.
+      const entries = readdirSync(join(dest, 'pg_wal'))
+      expect(entries).toContain('archive_status')
+
+      const reopened = new PGlite(dest)
+      const rows = (
+        await reopened.query<{ v: string }>(`select v from t order by id`)
+      ).rows
+      expect(rows).toEqual([{ v: 'one' }, { v: 'two' }, { v: 'three' }])
+      await reopened.close()
+    },
+    TEST_TIMEOUT,
+  )
+
+  it(
+    'v1 archives still extract (backward compat by magic-byte sniff)',
+    async () => {
+      const v1 = await packV1(sourceDir)
+      expect(v1[0]).not.toBe(0x1f) // plain tar, not gzip
+      const dest = join(root, 'dest-v1')
+      await extractDatadir(v1, dest)
+      const b = readControl(dest)
+      expect(b.checkPoint).toBe(readControl(sourceDir).checkPoint)
+      const reopened = new PGlite(dest)
+      expect(
+        (
+          await reopened.query<{ n: number }>(
+            `select count(*)::int as n from t`,
+          )
+        ).rows[0].n,
+      ).toBe(3)
+      await reopened.close()
     },
     TEST_TIMEOUT,
   )

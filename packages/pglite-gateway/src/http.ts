@@ -165,6 +165,73 @@ export class GatewayServer {
       }
     })
 
+    // --- Forks (M2) ------------------------------------------------------
+    app.post('/v1/db/:id/fork', async (c) => {
+      const body = (await c.req.json().catch(() => ({}))) as { name?: string }
+      if (!body.name) return c.text('missing "name"', 400)
+      try {
+        const manifest = await core.forkDatabase(c.req.param('id'), body.name)
+        return c.json(manifest, 201)
+      } catch (err) {
+        return c.text(err instanceof Error ? err.message : String(err), 400)
+      }
+    })
+
+    // --- Dials (M2) ------------------------------------------------------
+    app.patch('/v1/db/:id/dials', async (c) => {
+      const body = (await c.req.json().catch(() => ({}))) as {
+        checkpointEveryBytes?: string | number
+        rotateEveryBytes?: string | number
+        gcGraceMs?: string | number
+      }
+      await core.setDials(c.req.param('id'), body)
+      return c.json((await core.getManifest(c.req.param('id'))).dials)
+    })
+
+    // --- GC (M2) ---------------------------------------------------------
+    app.post('/v1/gc', async (c) => {
+      return c.json(await core.runGc())
+    })
+    app.post('/v1/db/:id/gc', async (c) => {
+      return c.json(await core.runGc(c.req.param('id')))
+    })
+
+    // --- Era rotation primitives (M2 — the cell-server rotator calls these;
+    // thin 1:1 mappings onto the control plane) ---------------------------
+    app.post('/v1/db/:id/era/attempt', async (c) => {
+      const body = (await c.req.json()) as {
+        ordinal: number
+        eraId: string
+        path: string
+      }
+      await core.registerEraAttempt(c.req.param('id'), body)
+      return c.body(null, 204)
+    })
+    app.post('/v1/db/:id/era/promote', async (c) => {
+      const body = (await c.req.json()) as { eraId: string }
+      await core.promoteEraAttempt(c.req.param('id'), body.eraId)
+      return c.body(null, 204)
+    })
+    app.post('/v1/db/:id/era/seal', async (c) => {
+      const body = (await c.req.json()) as {
+        ordinal: number
+        finalOffset: string
+        finalLsn: string
+        nextOrdinal: number
+      }
+      await core.sealEra(c.req.param('id'), body.ordinal, body)
+      return c.body(null, 204)
+    })
+    app.post('/v1/db/:id/era/advance', async (c) => {
+      const body = (await c.req.json()) as { from: number; to: number }
+      const advanced = await core.advanceCurrentEra(
+        c.req.param('id'),
+        body.from,
+        body.to,
+      )
+      return c.json({ advanced })
+    })
+
     // --- Checkpoints (M1e worker) ----------------------------------------
     app.get('/v1/db/:id/checkpoint/latest', async (c) => {
       const row = await core.latestCheckpoint(c.req.param('id'))

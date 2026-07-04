@@ -17,12 +17,14 @@ import { PGlite } from '@electric-sql/pglite'
 import {
   DsStreamClient,
   encodeAppend,
+  encodeFrame,
+  casToken,
   INITIAL_OFFSET_TOKEN,
   formatLsn,
   readControl,
   SHUTDOWN_CKPT_ALIGNED,
 } from '@electric-sql/pglite-cell'
-import type { OFrame } from '@electric-sql/pglite-cell'
+import type { OFrame, Frame } from '@electric-sql/pglite-cell'
 import { FsObjectStore } from './object-store'
 import { packDatadir } from './checkpoint-object'
 import { ControlPlane } from './control-plane'
@@ -56,6 +58,14 @@ export interface Manifest {
     /** pg_lsn text of the snapshot end (the attach point). */
     snapEnd: string
     streamOffset: string
+  }
+  /** Per-database lifecycle dials (§ M2_PLAN), surfaced for clients/rotators. */
+  dials: {
+    currentEraOrdinal: number
+    /** Bytes as decimal strings (bigint columns; 0 = disabled). */
+    checkpointEveryBytes: string
+    rotateEveryBytes: string
+    gcGraceMs: string
   }
 }
 
@@ -243,16 +253,7 @@ export class GatewayCore {
     })
 
     // (7) manifest.
-    return this.buildManifest(databaseId, name, {
-      eraId,
-      ordinal,
-      relPath,
-      eraBaseOffset,
-      snapEndLsn,
-      checkpointRef,
-      checkpointLsn: formatLsn(checkpointC0),
-      streamOffset: eraBaseOffset,
-    })
+    return this.getManifest(databaseId)
   }
 
   /**
@@ -295,40 +296,213 @@ export class GatewayCore {
         snapEnd: checkpoint.snapEnd,
         streamOffset: checkpoint.streamOffset,
       },
+      dials: {
+        currentEraOrdinal: db.currentEraOrdinal,
+        checkpointEveryBytes: db.checkpointEveryBytes,
+        rotateEveryBytes: db.rotateEveryBytes,
+        gcGraceMs: db.gcGraceMs,
+      },
     }
   }
 
-  private buildManifest(
+  /** Update any subset of a database's dials. */
+  async setDials(
     databaseId: string,
-    name: string,
-    parts: {
-      eraId: string
-      ordinal: number
-      relPath: string
-      eraBaseOffset: string
-      snapEndLsn: string
-      checkpointRef: string
-      checkpointLsn: string
-      streamOffset: string
-    },
-  ): Manifest {
-    return {
-      databaseId,
-      name,
-      era: {
-        id: parts.eraId,
-        ordinal: parts.ordinal,
-        path: parts.relPath,
-        baseOffset: parts.eraBaseOffset,
-        baseLsn: parts.snapEndLsn,
+    dials: import('./control-plane').Dials,
+  ): Promise<void> {
+    await this.controlPlane.setDials(databaseId, dials)
+  }
+
+  // --- Era rotation primitives (thin pass-throughs for the cell-server
+  // rotator; steps 0/3/5/6). Kept stateless — the rotator drives them. ----
+
+  async registerEraAttempt(
+    databaseId: string,
+    input: { ordinal: number; eraId: string; path: string },
+  ): Promise<void> {
+    await this.controlPlane.registerEraAttempt({ databaseId, ...input })
+  }
+
+  async promoteEraAttempt(databaseId: string, eraId: string): Promise<void> {
+    await this.controlPlane.promoteEraAttempt(databaseId, eraId)
+  }
+
+  async sealEra(
+    databaseId: string,
+    ordinal: number,
+    seal: { finalOffset: string; finalLsn: string; nextOrdinal: number },
+  ): Promise<void> {
+    await this.controlPlane.sealEra(databaseId, ordinal, seal)
+  }
+
+  async advanceCurrentEra(
+    databaseId: string,
+    from: number,
+    to: number,
+  ): Promise<boolean> {
+    return this.controlPlane.advanceCurrentEra(databaseId, from, to)
+  }
+
+  /** The control plane (GC and rotator internals reach through this). */
+  get catalog(): ControlPlane {
+    return this.controlPlane
+  }
+
+  /**
+   * A DsStreamClient scoped to a database's mount (exposed for GC's stream
+   * deletion — same base as `streamClientFor`). Alias kept explicit for intent.
+   */
+  streamClientForGc(databaseId: string): DsStreamClient {
+    return this.streamClientFor(databaseId)
+  }
+
+  /** Run garbage collection (see GcExecutor). Optionally scoped to one db. */
+  async runGc(databaseId?: string): Promise<import('./gc').GcReport> {
+    const { GcExecutor } = await import('./gc')
+    return new GcExecutor(this).run(databaseId)
+  }
+
+  /**
+   * Fork `parentId` into a new database `name` at the parent's LATEST
+   * checkpoint position (M2 restriction — arbitrary-LSN forks arrive with M3).
+   * The fork point is that checkpoint's `(snapEnd, streamOffset)`.
+   *
+   * Steps (M2_PLAN "Forks"):
+   *  1. Control-plane txn: child databases row + lineage edge + child era row
+   *     (keeps the PARENT's current ordinal, gets a NEW era_id) + child
+   *     checkpoint row pointing at the PARENT's checkpoint OBJECT (shared,
+   *     content-addressed).
+   *  2. Stream-fork PUT of the parent era to the child path at `fork_offset`
+   *     (Stream-Forked-From / Stream-Fork-Offset — VERIFIED against the DS
+   *     server: offset is a range-checked token, prefix is shared by
+   *     reference, reads continue from the fork point).
+   *  3. CAS-append an `F` frame to the PARENT era (in-band announcement + GC
+   *     pin signal), via a plain seq-token append at the parent's head.
+   */
+  async forkDatabase(parentId: string, name: string): Promise<Manifest> {
+    const parent = await this.controlPlane.getDatabaseById(parentId)
+    if (!parent) throw new Error(`parent database not found: ${parentId}`)
+    const parentEra = await this.controlPlane.currentEra(parentId)
+    if (!parentEra) throw new Error(`parent has no era: ${parentId}`)
+    const parentCkpt = await this.controlPlane.latestCheckpoint(parentId)
+    if (!parentCkpt) throw new Error(`parent has no checkpoint: ${parentId}`)
+
+    // Fork point = parent's latest checkpoint position.
+    const forkOffset = parentCkpt.streamOffset
+    const forkLsn = parentCkpt.snapEnd
+    const ordinal = parentEra.ordinal
+
+    // (1) Control-plane rows. The child era keeps the parent's ordinal (so W3
+    // offset tokens stay monotone across the shared prefix) but a fresh era_id
+    // names the child's own writes.
+    const childId = await this.controlPlane.createDatabase(name)
+    const childEraId = `${String(ordinal).padStart(6, '0')}-${sortableId()}`
+    const childStreamPath = `/era/${childEraId}`
+    await this.controlPlane.insertLineage({
+      childId,
+      parentId,
+      forkLsn,
+      forkOffset,
+    })
+    await this.controlPlane.addEra({
+      databaseId: childId,
+      ordinal,
+      eraId: childEraId,
+      path: childStreamPath,
+      baseOffset: forkOffset,
+      baseLsn: forkLsn,
+    })
+    await this.controlPlane.registerCheckpoint({
+      databaseId: childId,
+      lsn: parentCkpt.lsn,
+      snapEnd: parentCkpt.snapEnd,
+      streamOffset: forkOffset,
+      objectRef: parentCkpt.objectRef, // SHARED content-addressed object
+    })
+
+    // (2) Stream-fork PUT: the child era stream is a fork of the parent era at
+    // `forkOffset`. `Stream-Forked-From` is the parent era's path AS THE DS
+    // SERVER KNOWS IT (its full mount-qualified path), not the child-relative
+    // path. The DS server shares the prefix by reference and continues the
+    // fork's offset space from the fork point.
+    const parentDsPath = this.streamMountPath(parentId) + parentEra.path
+    const childUrl =
+      this.dsUrl + this.streamMountPath(childId) + childStreamPath
+    const putRes = await fetch(childUrl, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Stream-Forked-From': parentDsPath,
+        'Stream-Fork-Offset': forkOffset,
       },
-      checkpoint: {
-        ref: parts.checkpointRef,
-        lsn: parts.checkpointLsn,
-        snapEnd: parts.snapEndLsn,
-        streamOffset: parts.streamOffset,
-      },
+    })
+    if (!putRes.ok && putRes.status !== 200) {
+      const body = await putRes.text().catch(() => '')
+      throw new Error(
+        `fork PUT failed: HTTP ${putRes.status} ${body} (parent=${parentDsPath} offset=${forkOffset})`,
+      )
     }
+
+    // (3) CAS-append an F frame to the PARENT era announcing the fork. The
+    // gateway has no committer, so we do a plain seq-token append at the
+    // parent's current head, retrying a bounded number of times on seq
+    // conflict (a concurrent commit moved the head).
+    await this.appendForkFrame(
+      parentId,
+      parentEra.eraId,
+      parentEra.path,
+      ordinal,
+      {
+        childDatabaseId: childId,
+        forkOffset,
+        forkLsn,
+      },
+    )
+
+    return this.getManifest(childId)
+  }
+
+  /**
+   * CAS-append an `F` frame to a parent era at its current head. Bounded retry
+   * on seq-conflict (a commit raced in and moved the head). Uses a seq token
+   * built from the era ordinal + observed head, matching the W3 CAS convention.
+   */
+  private async appendForkFrame(
+    parentId: string,
+    parentEraId: string,
+    parentEraPath: string,
+    parentOrdinal: number,
+    info: { childDatabaseId: string; forkOffset: string; forkLsn: string },
+  ): Promise<void> {
+    const client = this.streamClientFor(parentId)
+    const maxAttempts = 8
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const head = await client.head(parentEraPath)
+      const fFrame: Frame = {
+        type: 'F',
+        header: {
+          v: 1,
+          eraId: parentEraId,
+          expectedOffset: head.nextOffset,
+          childDatabaseId: info.childDatabaseId,
+          forkOffset: info.forkOffset,
+          forkLsn: info.forkLsn,
+        },
+      }
+      const body = encodeFrame(fFrame)
+      const res = await client.append(parentEraPath, body, {
+        seq: casToken(parentOrdinal, head.nextOffset),
+        expectedOffset: head.nextOffset,
+      })
+      if (res.kind === 'ok') return
+      if (res.kind === 'seq-conflict') continue // head moved; re-read and retry
+      throw new Error(
+        `fork F-frame append rejected: ${res.kind} (parent era ${parentEraId})`,
+      )
+    }
+    throw new Error(
+      `fork F-frame append exhausted retries on parent era ${parentEraId}`,
+    )
   }
 
   /**
@@ -361,6 +535,16 @@ export class GatewayCore {
   /** Store bytes; returns the content-address ref (idempotent). */
   async putObject(bytes: Uint8Array): Promise<{ ref: string }> {
     return this.store.put(bytes)
+  }
+
+  /** Delete an object (GC of unreferenced checkpoint objects). */
+  async deleteObject(ref: string): Promise<boolean> {
+    return this.store.delete(ref)
+  }
+
+  /** List all stored object refs. */
+  async listObjects(): Promise<string[]> {
+    return this.store.list()
   }
 
   /** Whether an object is present. */

@@ -41,6 +41,11 @@ import {
 /** Advisory strict-position header (ignored by the 0.3.7 server; §W1 posture). */
 const STREAM_EXPECTED_OFFSET_HEADER = 'Stream-Expected-Offset'
 
+/** Fork-create headers (server 0.3.7 protocol; the official client 0.2.6
+ *  exports no constants for them, so they are kept local until upstreamed). */
+const STREAM_FORKED_FROM_HEADER = 'Stream-Forked-From'
+const STREAM_FORK_OFFSET_HEADER = 'Stream-Fork-Offset'
+
 const OCTET = 'application/octet-stream'
 
 export type FetchImpl = typeof fetch
@@ -168,6 +173,35 @@ export class DsStreamClient {
       created: !preExisting,
       nextOffset: head.exists ? (head.offset ?? '') : '',
     }
+  }
+
+  /**
+   * PUT-create `newPath` as a FORK of `sourcePath` at `atOffset` (§2.5 era
+   * forks: the child stream inherits the parent's bytes up to the fork
+   * point; its own offsets continue from `atOffset`). Purpose-built raw
+   * fetch: the official client's create() has no fork-header support in
+   * 0.2.6. `atOffset` must be a boundary token of the source stream; the
+   * server rejects offsets past the source tail (400) and missing sources
+   * (404) — both surface as StreamHttpError.
+   */
+  async forkStream(
+    sourcePath: string,
+    newPath: string,
+    atOffset: string,
+  ): Promise<CreateResult> {
+    const res = await this.fetchImpl(this.url(newPath), {
+      method: 'PUT',
+      headers: {
+        'Content-Type': OCTET,
+        [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        [STREAM_FORK_OFFSET_HEADER]: atOffset,
+      },
+    })
+    if (res.status !== 200 && res.status !== 201) {
+      throw new StreamHttpError(res.status, await res.text())
+    }
+    const head = await this.head(newPath)
+    return { created: res.status === 201, nextOffset: head.nextOffset }
   }
 
   /**

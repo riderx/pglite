@@ -35,11 +35,49 @@ export class CaptureCursorError extends Error {
   }
 }
 
-/** The era stream is closed; era rotation handling is M2. */
+/**
+ * The era stream is closed and rotation retries are exhausted: the committer
+ * hopped the maximum number of eras for one commit and every landing target
+ * was closed too. The caller should rebuild from a fresh tail.
+ */
 export class EraClosedError extends Error {
   constructor(public readonly nextOffset: string) {
-    super(`era stream is closed (tail ${nextOffset}) — rotation is M2`)
+    super(
+      `era stream is closed (tail ${nextOffset}) and rotation retries are exhausted`,
+    )
     this.name = 'EraClosedError'
+  }
+}
+
+/**
+ * The S→O era chain is broken: the next era's O frame does not mirror the
+ * sealed era's terminal S (`O.prevEraId === S.eraId && O.eraId ===
+ * S.nextEraId && O.baseLsn === S.finalLsn`), the next era does not open
+ * with an O frame, or the chain's LSN continuity does not match the
+ * tailer's head. The chain is corrupt — do not follow it.
+ */
+export class EraChainError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'EraChainError'
+  }
+}
+
+/**
+ * An era stream is closed WITHOUT a terminal S frame (§2.6 sealed-detection
+ * rule): the era is wedged. Writers must stop; repair is the rotator's job
+ * (design §6.1 step 0), not the tailer's.
+ */
+export class WedgedEraError extends Error {
+  constructor(
+    public readonly eraId: string,
+    public readonly tailOffset: string,
+  ) {
+    super(
+      `era ${eraId} is closed at ${tailOffset} without a terminal S frame — ` +
+        `wedged; writers stop, repair belongs to the rotator`,
+    )
+    this.name = 'WedgedEraError'
   }
 }
 
