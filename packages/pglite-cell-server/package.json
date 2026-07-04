@@ -45,12 +45,15 @@
     "test": "vitest"
   },
   "dependencies": {
+    "@electric-sql/pg-protocol": "workspace:*",
     "@electric-sql/pglite": "workspace:*",
     "@electric-sql/pglite-cell": "workspace:*",
     "@electric-sql/pglite-gateway": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^20.16.11",
+    "@types/pg": "^8.15.2",
+    "pg": "^8.14.0",
     "tsx": "^4.19.2",
     "vitest": "^1.3.1"
   },

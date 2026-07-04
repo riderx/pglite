@@ -1,5 +1,5 @@
-// HostSession — the programmatic session API (the M1d proxy will drive a
-// lower-level variant of this). One session = one PGlite cell, read-attached
+// HostSession — the programmatic session API and the protocol-level unit
+// executor the M1d proxy drives. One session = one PGlite cell, read-attached
 // by default, write-attached (sticky) after its first write. Enforces the
 // §3.7 contract row by row:
 //
@@ -14,10 +14,16 @@
 // plus the §7 watermark gate (advance before executing when the cell's base
 // is behind the host watermark; tainted sessions are PINNED and never
 // advance) and the post-transaction taint probe.
+//
+// The contract state machine lives ONCE, in `drive()`; `exec()` (SQL-level,
+// results parsed by PGlite) and `execUnit()` (wire-level, §3.5 response
+// buffering — bytes in, buffered bytes + a flush disposition out) are thin
+// runners over it.
 
 import { randomUUID } from 'node:crypto'
 import { Cell } from '@electric-sql/pglite-cell'
 import type { Results } from '@electric-sql/pglite'
+import { serialize } from '@electric-sql/pg-protocol'
 import type { CellDirLease } from './base-dir'
 import type { DatabaseRuntime } from './database-runtime'
 import {
@@ -27,6 +33,8 @@ import {
   SessionClosedError,
   SessionPinnedExpiredError,
 } from './errors'
+import { concatBytes, scanBackendOutput } from './proxy/wire'
+import type { BackendScan } from './proxy/wire'
 
 export type ExecOutcome =
   | 'committed'
@@ -44,11 +52,65 @@ export interface ExecResult {
   landedOffset?: string
 }
 
+/**
+ * One protocol-level unit of work: a simple 'Q' message, an
+ * extended-protocol batch closed by Sync, or the connection's
+ * StartupMessage. The unit's bytes are re-executable as-is (§3.3: the
+ * client observed nothing until the unit's disposition is known).
+ */
+export interface ProtocolUnit {
+  bytes: Uint8Array
+  /** Simple-protocol SQL text (SET tracking / diagnostics). */
+  sqlForReplay?: string
+  kind: 'simple' | 'extended' | 'startup'
+}
+
+export type UnitDisposition =
+  | 'flushed-readonly' // empty slice: never CAS'd, response final (§3.5)
+  | 'landed' // commit CAS'd and landed: buffered response is now true
+  | 'held-conflict' // unrecoverable loss: output DISCARDED, proxy sends 40001
+  | 'mid-txn' // interactive transaction in progress: streams by design
+  | 'aborted' // transaction aborted (error / ROLLBACK): nothing to publish
+
+export interface UnitResult {
+  /** The (possibly re-executed) buffered backend response to flush. */
+  output: Uint8Array
+  /** Trailing ReadyForQuery status of `output`. */
+  rfqStatus: 'I' | 'T' | 'E'
+  disposition: UnitDisposition
+}
+
+/** TEST HOOK event: one raw execution attempt / the final disposition. */
+export interface UnitObservation {
+  phase: 'attempt' | 'result'
+  unitKind: ProtocolUnit['kind']
+  attempt: number
+  outputBytes: number
+  disposition?: UnitDisposition
+}
+
 interface Taints {
   tempSchema: boolean
   holdableCursors: boolean
   advisoryLocks: boolean
 }
+
+/** What one execution attempt produced, as the shared driver sees it. */
+interface AttemptOutcome<T> {
+  payload: T
+  /** Error thrown by the runner (SQL-level exec); rethrown by the caller. */
+  threw?: unknown
+  /** The transaction this unit ended ABORTED (only read at txn end). */
+  aborted: boolean
+}
+
+/** The shared state machine's classification of a finished unit. */
+type DriveResult<T> =
+  | { kind: 'mid-txn'; payload: T; threw?: unknown }
+  | { kind: 'aborted'; payload: T; threw?: unknown }
+  | { kind: 'read-only'; payload: T }
+  | { kind: 'landed'; payload: T; landedOffset: string }
+  | { kind: 'conflict'; detail: string }
 
 /** Last non-empty statement is `ROLLBACK` / `ABORT` (not `ROLLBACK TO`). */
 function endsWithRollback(sql: string): boolean {
@@ -60,6 +122,14 @@ function endsWithRollback(sql: string): boolean {
   const last = statements[statements.length - 1].toLowerCase()
   if (last.startsWith('rollback to')) return false
   return last.startsWith('rollback') || last.startsWith('abort')
+}
+
+/**
+ * Session-level `SET`s are replayed on recycle; transaction-scoped ones
+ * (`SET TRANSACTION`, `SET LOCAL`) are not session state.
+ */
+function isReplayableSet(sql: string): boolean {
+  return /^\s*set\b/i.test(sql) && !/^\s*set\s+(transaction|local)\b/i.test(sql)
 }
 
 export class HostSession {
@@ -79,6 +149,19 @@ export class HostSession {
   private pinExpiresAt = 0
   private dead: string | null = null
   private chain: Promise<unknown> = Promise.resolve()
+
+  /**
+   * Session-state replay on cell recycle (§3.5, M1 subset): the
+   * connection's StartupMessage bytes + tracked session-level SET
+   * statements, re-run on every fresh cell with output discarded.
+   * Prepared statements are NOT replayed — a conflict recycle loses them
+   * (documented M1 limitation, pooler-grade replay later).
+   */
+  private startupBytes: Uint8Array | null = null
+  private setStatements: string[] = []
+
+  /** TEST HOOK (§16 client-observation property): unit execution events. */
+  _unitObserver: ((ev: UnitObservation) => void) | null = null
 
   constructor(private readonly runtime: DatabaseRuntime) {}
 
@@ -118,6 +201,196 @@ export class HostSession {
   }
 
   private async execInner(sql: string): Promise<ExecResult> {
+    const r = await this.drive<Results[]>(async (cell) => {
+      let threw: unknown
+      let results: Results[] = []
+      try {
+        results = await cell.db.exec(sql)
+      } catch (err) {
+        threw = err
+      }
+      return {
+        payload: results,
+        threw,
+        aborted: threw !== undefined || endsWithRollback(sql),
+      }
+    })
+
+    switch (r.kind) {
+      case 'mid-txn':
+        // Mid interactive transaction (possibly in aborted state after an
+        // error): no capture, no probes — everything rides txn end.
+        if (r.threw !== undefined) throw r.threw
+        return {
+          results: r.payload,
+          rows: lastRows(r.payload),
+          outcome: 'in-transaction',
+        }
+      case 'aborted':
+        if (r.threw !== undefined) throw r.threw
+        return {
+          results: r.payload,
+          rows: lastRows(r.payload),
+          outcome: 'aborted',
+        }
+      case 'read-only':
+        return {
+          results: r.payload,
+          rows: lastRows(r.payload),
+          outcome: 'read-only',
+        }
+      case 'landed':
+        return {
+          results: r.payload,
+          rows: lastRows(r.payload),
+          outcome: 'committed',
+          landedOffset: r.landedOffset,
+        }
+      case 'conflict':
+        throw new SerializationConflictError(r.detail)
+    }
+  }
+
+  /**
+   * Execute one protocol-level unit (§3.5 response buffering): run the raw
+   * frontend bytes on the cell, collect the raw backend response, and
+   * resolve the §3.7 contract at byte level WITHOUT sending anything —
+   * the returned disposition tells the proxy what to flush:
+   *
+   *   flushed-readonly / landed -> flush `output` (possibly a re-execution's)
+   *   mid-txn / aborted         -> flush `output` (streams by design; only
+   *                                the COMMIT response is ever held)
+   *   held-conflict             -> `output` is EMPTY (the §3.5 invariant:
+   *                                the buffer died unsent); the proxy
+   *                                synthesizes the §4.0 40001 + ReadyForQuery
+   *
+   * One-shot CAS losses re-execute the same unit bytes INSIDE this call
+   * (recycle + replay + re-run), so the proxy only ever sees the final
+   * output. `FatalSessionResetError` propagates (§3.3): the proxy sends the
+   * error and terminates the connection.
+   */
+  execUnit(unit: ProtocolUnit): Promise<UnitResult> {
+    return this.run(() => this.execUnitInner(unit))
+  }
+
+  private async execUnitInner(unit: ProtocolUnit): Promise<UnitResult> {
+    let attempt = 0
+    const r = await this.drive<{ output: Uint8Array; scan: BackendScan }>(
+      async (cell) => {
+        const chunks: Uint8Array[] = []
+        let threw: unknown
+        try {
+          await cell.db.runExclusive(() =>
+            cell.db.execProtocolRawStream(unit.bytes, {
+              onRawData: (data) => {
+                chunks.push(data.slice())
+              },
+            }),
+          )
+        } catch (err) {
+          threw = err
+        }
+        const output = concatBytes(chunks)
+        const scan = scanBackendOutput(output)
+        this._unitObserver?.({
+          phase: 'attempt',
+          unitKind: unit.kind,
+          attempt: attempt++,
+          outputBytes: output.length,
+        })
+        return {
+          payload: { output, scan },
+          threw,
+          // A trailing ROLLBACK tag at txn end is an abort in disguise
+          // (M1c finding) — floors must be probed, nothing published.
+          aborted:
+            threw !== undefined ||
+            scan.hasError ||
+            scan.lastCommandTag === 'ROLLBACK',
+        }
+      },
+    )
+
+    let result: UnitResult
+    switch (r.kind) {
+      case 'mid-txn':
+        if (r.threw !== undefined) throw r.threw
+        result = {
+          output: r.payload.output,
+          rfqStatus: r.payload.scan.rfqStatus ?? 'T',
+          disposition: 'mid-txn',
+        }
+        break
+      case 'aborted':
+        if (r.threw !== undefined) throw r.threw
+        result = {
+          output: r.payload.output,
+          rfqStatus: r.payload.scan.rfqStatus ?? 'I',
+          disposition: 'aborted',
+        }
+        break
+      case 'read-only':
+        this.trackReplayState(unit)
+        result = {
+          output: r.payload.output,
+          rfqStatus: r.payload.scan.rfqStatus ?? 'I',
+          disposition: 'flushed-readonly',
+        }
+        break
+      case 'landed':
+        this.trackReplayState(unit)
+        result = {
+          output: r.payload.output,
+          rfqStatus: r.payload.scan.rfqStatus ?? 'I',
+          disposition: 'landed',
+        }
+        break
+      case 'conflict':
+        // The buffered output dies here, unsent — the §3.5 invariant. The
+        // proxy synthesizes the §4.0 error in its place.
+        result = {
+          output: new Uint8Array(0),
+          rfqStatus: 'I',
+          disposition: 'held-conflict',
+        }
+        break
+    }
+    this._unitObserver?.({
+      phase: 'result',
+      unitKind: unit.kind,
+      attempt,
+      outputBytes: result.output.length,
+      disposition: result.disposition,
+    })
+    return result
+  }
+
+  /** Record replayable session state from a successfully finished unit. */
+  private trackReplayState(unit: ProtocolUnit): void {
+    if (unit.kind === 'startup') {
+      this.startupBytes = unit.bytes.slice()
+      return
+    }
+    if (
+      unit.kind === 'simple' &&
+      unit.sqlForReplay !== undefined &&
+      isReplayableSet(unit.sqlForReplay)
+    ) {
+      this.setStatements.push(unit.sqlForReplay)
+    }
+  }
+
+  /**
+   * THE §3.7 contract state machine, shared by `exec` and `execUnit`. Runs
+   * `runner` on an attached cell and resolves the transaction outcome:
+   * watermark gate before idle units, capture at txn end, read-cell
+   * write-upgrade, publish through the host sequencer, floors probe on
+   * abort/discard, taint probe, transparent re-execution of one-shots
+   * (bounded), fatal reset for tainted losses.
+   */
+  private async drive<T>(
+    runner: (cell: Cell) => Promise<AttemptOutcome<T>>,
+  ): Promise<DriveResult<T>> {
     if (this.dead !== null) throw new SessionClosedError(this.dead)
     if (this._tainted && Date.now() > this.pinExpiresAt) {
       await this.destroyCell()
@@ -135,24 +408,17 @@ export class HostSession {
       if (cell === null) throw new SessionClosedError('cell attach failed')
       const wasInTxn = cell.db.isInTransaction()
 
-      let execErr: unknown
-      let results: Results[] = []
-      try {
-        results = await cell.db.exec(sql)
-      } catch (err) {
-        execErr = err
-      }
+      const { payload, threw, aborted } = await runner(cell)
 
       if (cell.db.isInTransaction()) {
         // Mid interactive transaction (possibly in aborted state after an
         // error): no capture, no probes — everything rides txn end.
-        if (execErr !== undefined) throw execErr
-        return { results, rows: lastRows(results), outcome: 'in-transaction' }
+        return { kind: 'mid-txn', payload, threw }
       }
 
       // ---- transaction over ----
 
-      if (execErr !== undefined || endsWithRollback(sql)) {
+      if (threw !== undefined || aborted) {
         // Aborted: probe sequence floors FIRST (the abort-only nextval
         // hazard, §5.3 rule 7 — the only case where a drawn value was
         // observed with no slice ever publishing it).
@@ -171,8 +437,7 @@ export class HostSession {
         // Write cells: stray abort WAL stays local and rides the next
         // slice (capture-cursor invariant: contiguous, unfiltered).
         await this.probeTaints(cell)
-        if (execErr !== undefined) throw execErr
-        return { results, rows: lastRows(results), outcome: 'aborted' }
+        return { kind: 'aborted', payload, threw }
       }
 
       const slice = await cell.captureSlice()
@@ -180,7 +445,7 @@ export class HostSession {
       if (slice === null) {
         // Read-only: never CAS'd; response is immediately final.
         await this.probeTaints(cell)
-        return { results, rows: lastRows(results), outcome: 'read-only' }
+        return { kind: 'read-only', payload }
       }
 
       if (this.mode === 'read') {
@@ -209,9 +474,11 @@ export class HostSession {
         // 40001 at COMMIT. Attach the write cell eagerly so the client's
         // retry lands upgraded.
         await this.ensureCell()
-        throw new SerializationConflictError(
-          'transaction wrote on a read-attached cell; its slice cannot be published',
-        )
+        return {
+          kind: 'conflict',
+          detail:
+            'transaction wrote on a read-attached cell; its slice cannot be published',
+        }
       }
 
       // ---- write-attached: publish through the host sequencer ----
@@ -227,12 +494,7 @@ export class HostSession {
         cell.confirmPublished(slice.endLsn)
         this.streamPos = { offset: res.nextOffset, lsn: slice.endLsn }
         await this.probeTaints(cell)
-        return {
-          results,
-          rows: lastRows(results),
-          outcome: 'committed',
-          landedOffset: res.offset,
-        }
+        return { kind: 'landed', payload, landedOffset: res.offset }
       }
 
       // ---- CAS loss (§3.7 contract) ----
@@ -252,15 +514,17 @@ export class HostSession {
       if (wasInTxn) {
         // Interactive COMMIT loss: 40001; the session survives and its
         // next statement attaches a fresh cell at head.
-        throw new SerializationConflictError(
-          'interactive transaction lost the commit race at COMMIT',
-        )
+        return {
+          kind: 'conflict',
+          detail: 'interactive transaction lost the commit race at COMMIT',
+        }
       }
       attempt++
       if (attempt > this.runtime.opts.maxRetries) {
-        throw new SerializationConflictError(
-          `one-shot re-execution budget exhausted (${this.runtime.opts.maxRetries} retries)`,
-        )
+        return {
+          kind: 'conflict',
+          detail: `one-shot re-execution budget exhausted (${this.runtime.opts.maxRetries} retries)`,
+        }
       }
       // One-shot, untainted, nothing acked: transparent re-execute (§3.3).
     }
@@ -273,6 +537,8 @@ export class HostSession {
    * write cells re-ensure the canonical position). Tainted sessions are
    * PINNED: they never advance (their pinned base is gc-pin leased).
    * A session's base never decreases (advances always target the head).
+   * Every freshly attached cell gets the session-state replay (startup
+   * bytes + tracked SETs) before it serves anything.
    */
   private async ensureCell(): Promise<void> {
     if (this.cell !== null) {
@@ -290,14 +556,16 @@ export class HostSession {
     if (this.mode === 'read') {
       await this.runtime.baseDirs.ensureAtHeadLocal(this.runtime.tailer)
       const lease = await this.runtime.baseDirs.takeCellDir('read')
-      this.cell = await Cell.open(lease.dir, {
+      const cell = await Cell.open(lease.dir, {
         // Read-attach: the cell's insert position is the dir's own LOCAL
         // clean head (past the stream head by the unpublished boot
         // records); its capture cursor tracks local position.
         expectedHeadLsn: lease.base.localHeadLsn,
       })
+      this.cell = cell
       this.lease = lease
       this.streamPos = { offset: lease.base.offset, lsn: lease.base.lsn }
+      await this.replaySessionState(cell)
       return
     }
 
@@ -324,9 +592,29 @@ export class HostSession {
         offset: lease.base.offset,
         lsn: lease.base.lsn,
       }
+      await this.replaySessionState(cell)
       return
     }
     throw new AdvanceRaceError(this.runtime.opts.attachAttempts)
+  }
+
+  /**
+   * Re-establish wire-session state on a fresh cell: replay the recorded
+   * StartupMessage, then every tracked session-level SET, discarding all
+   * output. None of it writes WAL, so read cells stay publish-clean.
+   * No-op for purely programmatic (SQL-level) sessions.
+   */
+  private async replaySessionState(cell: Cell): Promise<void> {
+    if (this.startupBytes === null && this.setStatements.length === 0) return
+    const discard = { onRawData: () => {} }
+    await cell.db.runExclusive(async () => {
+      if (this.startupBytes !== null) {
+        await cell.db.execProtocolRawStream(this.startupBytes, discard)
+      }
+      for (const sql of this.setStatements) {
+        await cell.db.execProtocolRawStream(serialize.query(sql), discard)
+      }
+    })
   }
 
   /**

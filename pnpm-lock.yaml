@@ -277,6 +277,9 @@ importers:
 
   packages/pglite-cell-server:
     dependencies:
+      '@electric-sql/pg-protocol':
+        specifier: workspace:*
+        version: link:../pg-protocol
       '@electric-sql/pglite':
         specifier: workspace:*
         version: link:../pglite
@@ -290,6 +293,12 @@ importers:
       '@types/node':
         specifier: ^20.16.11
         version: 20.16.11
+      '@types/pg':
+        specifier: ^8.15.2
+        version: 8.15.2
+      pg:
+        specifier: ^8.14.0
+        version: 8.14.0
       tsx:
         specifier: ^4.19.2
         version: 4.19.2
