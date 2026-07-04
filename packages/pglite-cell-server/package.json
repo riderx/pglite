@@ -1,0 +1,60 @@
+{
+  "name": "@electric-sql/pglite-cell-server",
+  "version": "0.0.0",
+  "description": "Multi-tenant cell host for optimistic physical replication of PGlite",
+  "author": "Electric DB Limited",
+  "homepage": "https://pglite.dev",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/electric-sql/pglite",
+    "directory": "packages/pglite-cell-server"
+  },
+  "keywords": [
+    "postgres",
+    "sql",
+    "database",
+    "wasm",
+    "pglite",
+    "replication",
+    "server"
+  ],
+  "private": true,
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "lint": "eslint ./src ./tests --report-unused-disable-directives --max-warnings 0",
+    "format": "prettier --write ./src ./tests",
+    "typecheck": "tsc",
+    "stylecheck": "pnpm lint && prettier --check ./src ./tests",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "workspace:*",
+    "@electric-sql/pglite-cell": "workspace:*",
+    "@electric-sql/pglite-gateway": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.16.11",
+    "tsx": "^4.19.2",
+    "vitest": "^1.3.1"
+  },
+  "peerDependencies": {
+    "@electric-sql/pglite": "workspace:*"
+  }
+}

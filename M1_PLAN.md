@@ -64,6 +64,34 @@ Cold start or advance-to-head for database D on host H:
   (open + `select 1` + close) → cut checkpoint 0. Any checkpoint object
   must be cut from a datadir ≥ 1 reopen past initdb or its snapEnd is not
   a valid zero-boot-WAL attach point.
+- **Read-attach vs write-attach (M1c amendment).** Publishing the sync
+  slice on EVERY advance would let any advancing cell invalidate every
+  writer's base (a mere reader would force the writer through a recycle
+  per commit). Only a cell that will PUBLISH needs canonical WAL
+  position, so: **read-attach** (default) = materialize locally, publish
+  nothing; the cell's local recovery/shutdown records diverge from the
+  stream, so publishing from it is mechanically forbidden (a nonempty
+  capture on a read-attached cell triggers discard + write-upgrade +
+  re-execute, never a publish). **Write-attach** = materialize + publish
+  the sync slice; position canonical until the next foreign append.
+  Sessions carry a sticky write-intent flag after their first write so
+  ORM-shaped traffic stays write-attached. Consequences: readers advance
+  with zero stream appends and never perturb writers; writer-writer
+  alternation pays the documented §3.4 recycle (head-lease affinity makes
+  steady state single-writer); an interactive txn that first writes on a
+  read-attached cell gets `40001` at COMMIT (client retry lands on the
+  upgraded cell).
+  **M1c finding: a diverged read base cannot be delta-advanced** — its
+  pg_control anchor sits INSIDE the divergent range (streamLsn+120), and
+  the next stream slice starts at streamLsn, overwriting the anchor
+  (verified: WASM abort, Postgres PANIC). BaseDirManager therefore keeps
+  the last CANONICAL dir (checkpoint snapEnd or landed-sync position) and
+  every advance re-materializes from it; read-only hosts replay
+  ever-longer tails until a write-attach or checkpoint re-anchors —
+  bounded by checkpoint cadence (M1e/M2 dial). Also: `pg_sequences` has
+  no `is_called` column — floors derive it from `last_value IS NOT NULL`;
+  and a LOST commit is an abort in disguise (floors probed on every
+  discard of a completed-but-unpublished txn, not just error/ROLLBACK).
 - **Detach / hibernate**: clean close writes session-teardown WAL + a real
   shutdown checkpoint; publish `(cursor .. checkPoint+120]` as the detach
   sync slice. The stream tail then ends in a shutdown record — the next
