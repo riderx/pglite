@@ -31,13 +31,18 @@ empirically, not hardcoded) so ordinary crash recovery replays the tail.
 
 ## Findings for the design doc
 
-1. **PGlite reopen writes ~48 KB of WAL before the first user transaction**
-   (bootstrap SQL). Slices are contiguous from the prior EndOfLog so the
-   bytes simply ride in slice zero — but this must be identified and
-   ideally eliminated before M1: it is per-attach write amplification, and
-   the §6.5 attach story assumes boot writes nothing. (Confirms the
-   control-view report's boot-time-WAL hazard, at much larger scale than
-   the `PARAMETER_CHANGE` case it predicted.)
+1. **Published PGlite builds initdb with `data_checksums = on`** — and that
+   is the entire explanation of the "boot WAL" (RESOLVED, see
+   `inspect-boot-wal.mjs`): there is no bootstrap SQL. The ~48 KB (M0-1) /
+   ~21 KB (M0-2) written on every reopen is 3–6 `XLOG/FPI_FOR_HINT`
+   records — 8 KB full-page images emitted when the first catalog reads
+   set hint bits, which checksums force to be WAL-logged. Zero
+   transactions, zero xids consumed at boot. This is precisely the
+   read-noise the design's §9 pin (`data_checksums = off`) exists to kill —
+   encountered empirically on the very first experiment. Consequence: the
+   pin is a **required initdb delta from stock PGlite**, not an inherited
+   default; with it, boot writes nothing and the §6.5 attach story holds
+   exactly as written.
 2. **Session teardown writes WAL after the last user transaction**
    (~1.2 KB: temp-table cleanup runs a final transaction). Slice capture
    must extend to the true durable end of WAL, not the last statement
@@ -79,10 +84,9 @@ published build, zero C changes:
 
 Additional findings:
 
-6. **Boot SQL runs after attach too** (~21 KB of WAL past H+120 before the
-   first user statement) — same bootstrap as finding 1, now quantified on
-   the attach path. Until it is identified/eliminated, the first slice
-   after attach contains it.
+6. **The same hint-bit FPIs appear after attach** (~21 KB past H+120) —
+   finding 1 on the attach path. With the checksums-off pin they vanish;
+   until then the first slice after any attach carries them.
 7. **Harness bug worth remembering**: a multi-statement `exec` batch runs
    in ONE implicit transaction under the simple protocol — a trailing
    `rollback` rolled back the setup's CREATEs and made every comparison

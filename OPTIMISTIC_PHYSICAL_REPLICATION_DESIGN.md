@@ -277,7 +277,9 @@ Rotation, narratively (§6.1 holds the normative state machine):
    checkpoint identities. The `O` (era-open) frame rides in the PUT body,
    atomic with creation; the `S` frame is the sole naming authority — a
    losing rotator's era is an orphan by construction, swept by GC after a
-   grace period.
+   grace period. Era base LSNs may round up to a fresh WAL-segment
+   boundary — M0-2 proved jump-ahead attaches are valid — keeping the
+   era↔segment mapping clean.
 3. The rotator seals era `N`: `POST` body = `S` frame, `Stream-Closed:
    true`, CAS token, producer headers. Verified: append+close is atomic and
    closure terminal. **Never seal with close-only** — the close-only path
@@ -1004,7 +1006,16 @@ hosts can never mint divergent bytes at the same LSN. MVP protocol: the
 host sequencer quiesces the database (it holds appends — with multiple
 cells per host there is no single "producing cell"), one cell runs a
 genuine shutdown-style checkpoint, the worker snapshots the datadir into
-the object, appends the `K` frame. Fuzzy
+the object, appends the `K` frame. Two mechanics proven by M0: the
+**detach flow publishes a final slice through the session-teardown
+transaction and the shutdown checkpoint record** (teardown WAL exists —
+temp cleanup runs after the last user statement — and the shutdown record
+then doubles as the next attach's minted record); and the **v0
+checkpoint/materializer worker needs no custom redo machinery at all** —
+lay the tail onto a snapshot copy, flip `pg_control` to the crash state,
+boot a throwaway cell (ordinary crash recovery replays), close cleanly,
+capture the datadir. That is M0-1's harness, verbatim, as
+infrastructure. Fuzzy
 (non-quiesced) checkpoints come later and must drive the backup-recovery path
 (`backupStartPoint`/`minRecoveryPoint`) so consistency is not declared before
 the snapshot end.
@@ -1288,7 +1299,12 @@ wal_level = replica          minimal legally skips WAL for bulk-loaded
 full_page_writes = on        the §6.2 invariant depends on it
 data_checksums = off         kills XLOG_FPI_FOR_HINT read-noise; page
 wal_log_hints = off          integrity comes from object hashes; accept
-                             byte-level (not logical) replica divergence
+                             byte-level (not logical) replica divergence.
+                             M0 FINDING: published PGlite initdb's with
+                             checksums ON — every reopen emitted 3–6
+                             hint-bit FPIs (~48 KB) until decoded. This
+                             pin is a REQUIRED initdb delta from stock
+                             PGlite, not an inherited default.
 synchronous ack semantics    COMMIT ack strictly after CAS win; the
                              synchronous_commit GUC is accepted but inert
 stream TTL: none             explicit lifecycle deletion only
@@ -1852,17 +1868,20 @@ Each is independently demoable; the conflict path starts trivial and hardens.
   time-travel replay to identical state on published PGlite 0.5.4;
   nextXid/nextMulti chain exactly through aborts, savepoints, temp-only
   commits, and a minted multixact — first empirical confirmation of §5.1.
-  Two findings feed M1: reopen writes ~48 KB of bootstrap WAL (identify /
-  eliminate — per-attach write amplification the §6.5 attach story assumes
-  away) and session teardown writes a final cleanup transaction (slice
-  capture must run to the durable end of WAL, not the last statement).
-  Attach-never-recover — **DONE, 20/20 (`attach.mjs`)**: synthesized
-  `pg_control` + host-minted checkpoint record boot with ALL historical
-  WAL deleted, in both continuity and jump-ahead shapes; identity installs
-  from the control copy; a plain reopen afterwards is sound. Remaining:
-  strict CAS extension in the TS server; cell recycle timing;
-  FPI/WAL-volume accounting vs page-image manifests; identify/eliminate
-  the ~48 KB bootstrap WAL both experiments measured.
+  Two findings feed M1: the reopen-WAL mystery is **resolved**
+  (`inspect-boot-wal.mjs`) — published PGlite initdb's with
+  `data_checksums=on`, so first catalog reads emit 3–6 hint-bit FPIs
+  (~48 KB), no bootstrap SQL, no xids consumed; the §9 checksums-off pin
+  (now flagged as a required initdb delta) eliminates it entirely. And
+  session teardown writes a final cleanup transaction — slice capture
+  must run to the durable end of WAL, not the last statement (detach
+  mechanics in §6.1). Attach-never-recover — **DONE, 20/20
+  (`attach.mjs`)**: synthesized `pg_control` + host-minted checkpoint
+  record boot with ALL historical WAL deleted, in both continuity and
+  jump-ahead shapes; identity installs from the control copy; a plain
+  reopen afterwards is sound. Remaining: strict CAS extension in the TS
+  server; cell recycle timing; FPI/WAL-volume accounting vs page-image
+  manifests.
 - **M1 — single-host vertical slice.** Framed era streams; quiesced
   checkpoint objects + manifest; cold start via the synthesized
   clean-at-head control view (§6.5) — attach, never recover; head lease; one-shot CAS
