@@ -97,6 +97,38 @@ Additional findings:
    guards. (Cost: one debugging detour via catalog forensics; the attach
    mechanism itself had been working the whole time.)
 
+## M0 experiment 3: recycle timing (`recycle-timing.mjs`)
+
+| Operation | Time |
+| --- | --- |
+| fresh initdb + ready | ~1400 ms |
+| clean close | 3–54 ms |
+| reopen, small db (median of 5) | ~80 ms |
+| reopen, **67 MB** db (median of 5) | ~60 ms |
+
+Reopen — the recycle+reattach path — is **sub-100 ms and independent of
+database size**, which is the number the §3.4 "recycle is cheap, hide it
+behind the proxy" claim rests on. Fresh initdb at ~1.4 s is the number
+that justifies checkpoint-template hydration for database creation.
+
+## M0 experiment 4: WAL bytes vs page-image manifests (`fpi-accounting.mjs`)
+
+100 single-statement transactions per workload, stock `full_page_writes`,
+checkpoint re-arming measured:
+
+| Workload | real WAL | FPIs | page-image model | ratio |
+| --- | --- | --- | --- | --- |
+| hot-row update ×100 | 18.7 KB | 2 | 827 KB | **44×** |
+| append insert ×100 | 16.9 KB | 0 | 1.69 MB | **100×** |
+| spread update (fresh page each) ×100 | 26.2 KB | 10 | 819 KB | **31×** |
+| hot-row ×100 + mid-run checkpoint | 22.3 KB | 2 | 819 KB | **37×** |
+
+Page-image commit manifests carry **30–100× write amplification** versus
+real delta WAL, even in the spread-update case engineered to favor them
+(FPI hole-compression on sparse pages keeps real WAL small there too).
+**On-ramp decision: real WAL bytes as the stream payload from day one**;
+page-image manifests survive only as the checkpoint-object format.
+
 ## What this de-risks
 
 M1's commit path is now known-good end-to-end at the storage level: capture

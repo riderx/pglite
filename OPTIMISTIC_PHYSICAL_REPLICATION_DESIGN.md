@@ -224,12 +224,16 @@ Two layers on every commit POST:
 Caveats to engineer around:
 
 - Cooperative, not enforced: the server checks monotonicity, not
-  tail-equality. A strict `Stream-Expected-Offset: <offset>` extension
-  (append iff tail == X, 409 carries `Stream-Next-Offset`) is a ~30–40 line
-  change to the TS server (append path already holds the lock with the tail in
-  hand) and fits the spec's additive-header extension rules. Do this early;
-  it also removes the extra HEAD round-trip losers pay today (seq-conflict
-  409s carry no next-offset header).
+  tail-equality. **Compatibility posture (decided): work with unmodified
+  Durable Streams servers today via a dual-header protocol** — every
+  commit POST carries both `Stream-Seq` (the enforced cooperative floor;
+  what W1 rides on now) *and* `Stream-Expected-Offset` (advisory:
+  unknown headers are ignored by current servers, so this costs nothing
+  and becomes enforced automatically if/when the strict extension lands
+  upstream). The extension itself — append-iff-tail, ~30–40 lines in the
+  TS server, `Stream-Next-Offset` on 409s — is **deferred**; cells are
+  trusted and cooperative through M3, and the fleet milestone (M4) is
+  the natural forcing function to upstream it.
 - Spec permits per-writer `Stream-Seq` scope; the production deployment must
   document per-stream scope before the commit protocol relies on it.
 - Never set a TTL on database streams: sliding TTL deletes the stream on
@@ -1525,7 +1529,7 @@ coordination state this design exists to eliminate.
 | --- | --- |
 | `TrackingNodeFS` + dirty tracker | dirty overlay + slice/overlay bookkeeping |
 | `LazyPrimaryFS` / `LazyReplicaFS` + page cache | cell VFS: lazy checkpoint hydration, overlay |
-| Page-image commit manifests | interim stream payload option; superseded by WAL slices (a page-image commit ≡ all-FPI WAL) |
+| Page-image commit manifests | superseded as stream payload — M0-4 measured 30–100× write amplification vs real WAL; survives only as the checkpoint-object format |
 | Pageserver (objects, atomic promotion) | checkpoint object store + materializer |
 | Tailer + apply journal + page-version index | follower applier (§6.2–6.3), extended from images to (base, deltas) + special records |
 | Native buffer invalidation (`PgliteDropRelationBuffersRange`) | live-follower invalidation + reset-to-head |
@@ -1757,8 +1761,9 @@ Responsibilities:
   The DS server remains the append serializer; the gateway adds tenant
   authorization and frame validation (well-formed frames, size caps, sanity
   of `W.baseLsn`), and **validates-and-forwards** the strict
-  `Stream-Expected-Offset` header — enforcement lands in the DS server's
-  append lock (§2.3), never in the gateway (see the statelessness
+  `Stream-Expected-Offset` header — advisory today under the dual-header
+  posture (§2.3); when the deferred extension lands, enforcement lives in
+  the DS server's append lock, never in the gateway (see the statelessness
   invariant below for why this is forced, not chosen);
 - **mint and validate tenant-scoped capability tokens** (backed by
   control-plane auth, §14.6) — the concrete enforcement point for §11.2's
@@ -1932,9 +1937,17 @@ Each is independently demoable; the conflict path starts trivial and hardens.
   (`attach.mjs`)**: synthesized `pg_control` + host-minted checkpoint
   record boot with ALL historical WAL deleted, in both continuity and
   jump-ahead shapes; identity installs from the control copy; a plain
-  reopen afterwards is sound. Remaining: strict CAS extension in the TS
-  server; cell recycle timing; FPI/WAL-volume accounting vs page-image
-  manifests.
+  reopen afterwards is sound. Recycle timing — **DONE**
+  (`recycle-timing.mjs`): reopen is ~60–80 ms median and independent of
+  database size (67 MB reopens as fast as empty); fresh initdb ~1.4 s
+  (why checkpoint-template hydration matters). FPI accounting — **DONE**
+  (`fpi-accounting.mjs`): page-image manifests carry **30–100× write
+  amplification** vs real delta WAL across hot-row, append, and
+  spread-update workloads — on-ramp decision settled: real WAL bytes as
+  the stream payload from day one. Strict CAS server extension —
+  **deferred by decision** (compatibility with unmodified Durable
+  Streams; see §2.3's dual-header posture; store-layer WIP parked on a
+  local `durable-streams` branch). **M0 is closed.**
 - **M1 — single-host vertical slice.** Framed era streams; quiesced
   checkpoint objects + manifest; cold start via the synthesized
   clean-at-head control view (§6.5) — attach, never recover; head lease; one-shot CAS
@@ -2068,11 +2081,14 @@ milestone whose work answers it. Two closed, one demoted to a cheap
 experiment, nine parked-with-owners — none blocks the M0 remainders or M1.
 
 1. ~~Strict `Stream-Expected-Offset` upstreamed vs deployment-specific?~~
-   **DECIDED: upstream it** — Durable Streams is ElectricSQL's own
-   protocol, so the extension (append-iff-tail, plus `Stream-Next-Offset`
-   on seq-conflict 409s, plus documenting per-stream `Stream-Seq` scope)
-   goes to the spec and both servers. Cooperative Stream-Seq remains the
-   interim for trusted cells. (M0 remainder / upstream PR.)
+   **DECIDED, then DEFERRED**: it will be upstreamed (Durable Streams is
+   ElectricSQL's own protocol) but not now — the project stays compatible
+   with unmodified servers via the dual-header posture (§2.3): send both
+   headers, `Stream-Seq` enforced today, `Stream-Expected-Offset`
+   advisory until the extension lands. Store-layer WIP is parked on a
+   local `durable-streams` branch (`optimistic-physical-replication` @
+   32955c81, unpushed). Upstream at M4 alongside `Stream-Next-Offset` on
+   seq-conflict 409s and documented per-stream `Stream-Seq` scope.
 2. ~~Fuzzy checkpoints forcing the backup-path implementation?~~ **LARGELY
    RESOLVED by the M0 materializer discovery** (§6.1): checkpoints are
    produced *offline* by a worker replaying the stream through a
