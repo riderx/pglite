@@ -1560,6 +1560,11 @@ eventual review diff):**
 - path-derived `InvalidationEntry` mapping (WAL block refs and commit-record
   inval payloads replace it, §6.3).
 
+Salvage targets map onto the §14.7 packages: the lazy FS / page cache /
+resolvers, dirty tracker, and journal land in `pglite-cell`; the pageserver
+serving skeleton lands in `pglite-gateway`; the tailer/gate shapes, SAB
+bridge, and pglite-socket land in `pglite-cell-server`.
+
 One caution from the earlier misadventure: the extension repos inside the
 fork carry local-only `codex/pglite-extension-build-state` branches holding
 generated build artifacts (`.defs.txt`/`.undef.txt`/`.so`). Those are not
@@ -1789,6 +1794,42 @@ Failure-independence rules (strict, testable):
 
 The M6 GUI is simply a control-plane client with a stream tailer attached.
 
+### 14.7 Package decomposition
+
+Three packages, one dependency rule: **cells and servers speak only to the
+gateway; nothing touches storage or streams directly.**
+
+```text
+@electric-sql/pglite-cell           (library — "the cell")
+    the VFS + wrapper implementing one cell end-to-end: lazy attach
+    (page-version index, synthesized pg_control), dirty overlay, slice
+    capture, CAS commit client + pending journal + §3.8 recovery,
+    tail apply, reset/recycle, taint tracking.
+    SINGLE-CELL-COMPLETE: drives a database against a gateway with no
+    server around it — embeddable in Supabase-lite, usable directly in
+    scripts and tests, hosted by pglite-cell-server. Running solo, it
+    is its own trivial sequencer and tailer.
+
+@electric-sql/pglite-gateway        (service + embeddable module)
+    the §14.5 component in all three deployments (in-process sandbox,
+    fs-backed dev, fleet pool); capability tokens; frame validation;
+    stateless by hard invariant.
+
+@electric-sql/pglite-cell-server    (multi-tenant host)
+    embeds many pglite-cell instances: worker-per-cell, shared
+    content-addressed page cache, one tailer per database fanning out
+    to resident cells, host commit sequencer + sequence cursor,
+    watermark gate, session proxy (buffering / spool / taints),
+    hibernation, gc-pin management.
+```
+
+The boundary rule this fixes in place: everything *host-level* in
+§14.3/§14.4 belongs to `pglite-cell-server`; `pglite-cell` never assumes a
+host exists. Supabase-lite embeds cell + gateway in one process; the fleet
+runs cell-server + gateway pools; both speak the identical gateway API,
+which is what makes sandbox → fleet promotion an upload (§14.5). Package
+names provisional; the boundaries are not.
+
 ## 15. Milestones
 
 Each is independently demoable; the conflict path starts trivial and hardens.
@@ -1813,8 +1854,9 @@ Each is independently demoable; the conflict path starts trivial and hardens.
   sequencer + **sequence cursor** (§5.3, §14.4), the watermark gate (§7),
   and `gc-pin` leases for pinned sessions (§3.3); storage/stream gateway
   v0 (fs backend, embedded DS server) and control-plane schema v0
-  (§14.5–§14.6; PGlite as the dev control plane). Scale-to-zero works
-  here.
+  (§14.5–§14.6; PGlite as the dev control plane). Deliverables are the
+  three §14.7 packages from the start — cell, gateway, cell-server.
+  Scale-to-zero works here.
 - **M2 — storage lifecycle.** Hardened era rotation (unique per-attempt
   URLs, `O`/`S` mirror frames, repair-walk, orphan sweep — §2.4, §6.1)
   with the host sequencer as the quiesce point; fork manifests over stream
