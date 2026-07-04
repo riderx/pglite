@@ -108,11 +108,18 @@ optimization layered on top, not an ownership mechanism.
 Each database (branch/timeline) consists of:
 
 - one **era chain** of Durable Streams carrying framed WAL and control records;
-- a **manifest** in object storage: latest checkpoint ref, current era stream
-  URL + start offset, era history, fork lineage, allocator high-water marks;
+- a **manifest**: latest checkpoint ref, current era stream URL + start
+  offset, era history, fork lineage, allocator high-water marks — held as
+  rows in the control-plane Postgres (§14.6), cached by gateways;
 - **checkpoint objects**: immutable snapshots of the full recovery state (§6.1);
 - zero or more active **compute cells**, each an isolated WASM instance with a
   capability-scoped host API (§11).
+
+Two platform services complete the picture: a thin, stateless
+**storage/stream gateway** that fronts object storage and the stream service
+and enforces tenant capabilities (§14.5), and a **control-plane Postgres** —
+one boring real Postgres indexing the existence, lineage, eras, and auth of
+every database on the platform (§14.6). Neither is ever in the commit path.
 
 An idle database is manifest + stream + checkpoints. No compute. Activation is:
 read manifest → open cell attached at head → serve. **No page bytes move at
@@ -227,7 +234,8 @@ Rotation protocol:
    GET, so a long-lived database would pay per-era recursion forever. Fresh
    streams also release old eras for deletion once no fork or pin references
    them.
-4. The manifest is CAS-updated to point at era `N+1`.
+4. The manifest is CAS-updated to point at era `N+1` — a guarded
+   transactional update in the control plane (§14.6).
 
 **The central operational dial:** checkpoint cadence = era length = worst-case
 join tail = worst-case rebase distance. One knob governs recovery time,
@@ -275,9 +283,10 @@ envelope, not an ops detail. Required of the production stream service:
 - offsets stable across server restart and failover.
 
 Required of the object store: immutable checkpoint objects with
-read-after-write visibility, and an atomic conditional update (ETag /
-if-match / versioned put) for the manifest — the manifest CAS is what makes
-checkpoint publication and era rotation race-safe (§6.1).
+read-after-write visibility — nothing more. The manifest, which needs an
+atomic conditional update to make checkpoint publication and era rotation
+race-safe (§6.1), lives in the control plane (§14.6) where that guard is an
+ordinary transaction rather than an object-store conditional PUT.
 
 ## 3. Commit protocol
 
@@ -788,7 +797,8 @@ idempotent and any worker can resume after a crash at any point:
 Joiner tolerance rules make partial progress harmless: a `K` frame with no
 seal ⇒ keep tailing era N; an era N+1 that exists but is unreferenced ⇒
 ignore it until the manifest or an `S` frame says otherwise; a sealed era ⇒
-follow the `S` pointer even if the manifest lags behind.
+follow the `S` pointer even if the manifest lags behind. The manifest in
+step 6 is control-plane rows (§14.6); the guard is `UPDATE … WHERE era = N`.
 
 ### 6.2 The follower invariant (corrected)
 
@@ -1240,6 +1250,9 @@ eventual review diff):**
 - tailer, apply journal, and query gate → the follower applier's *shape*
   survives (journal idempotency, apply/query gating, offset resume);
   internals change from manifest events to frames + WAL records (§2, §6.2);
+- the pageserver's Hono app, disk store, and object store → the serving
+  skeleton of the storage/stream gateway (§14.5) — only its commit-promotion
+  protocol is superseded;
 - the native fork branch's exports — WAL-LSN getters,
   `PgliteDropRelationBuffersRange` / `FindAndDrop…Range`, the `__PGLITE__`
   hunks in clog/subtrans/transam/multixact — are re-landed on a fresh fork
@@ -1373,6 +1386,88 @@ multi-session PGlite lands, this flips back to being the natural default —
 one cell hosting real concurrent sessions, topology shifting from
 cells-per-connection to cells-per-database.
 
+### 14.5 The storage/stream gateway
+
+A thin, stateless data-plane server that fronts both storage and streams.
+Cell hosts speak only to it; it holds the real credentials. One binary,
+three deployments — and the same API surface in all of them is what makes
+sandbox → fleet promotion an upload, not a migration:
+
+```text
+embedded    in-process inside a Supalite sandbox (fs backend, no network)
+dev         single node, fs backend, embedded DS test server
+fleet       horizontal pool in front of object storage + DS service
+```
+
+Responsibilities:
+
+- **serve checkpoint objects and spilled slices** — read-through cache;
+  content-addressed objects make caching trivial and CDN-friendly; backend
+  pluggable (local fs / object storage);
+- **proxy durable-stream operations** (CAS appends, catch-up, long-poll).
+  The DS server remains the append serializer; the gateway adds tenant
+  authorization, frame validation (well-formed frames, size caps, sanity of
+  `W.baseLsn` against the observed head), and is the natural deployment
+  point for the strict `Stream-Expected-Offset` check — closing §2.3's
+  "cooperative, not enforced" gap at the boundary instead of trusting cells;
+- **mint and validate tenant-scoped capability tokens** (backed by
+  control-plane auth, §14.6) — the concrete enforcement point for §11.2's
+  credential scoping: cells and hosts never see raw storage or stream
+  credentials.
+
+Discipline clause: **the gateway is a referee, not a coordinator.**
+Stateless or cache-only; any instance serves any tenant; killing one is
+harmless; it holds no serialization authority (the stream server does) and
+no topology authority (the control plane does).
+
+Salvage note: the old branch's pageserver — Hono app, disk store, object
+store — is the serving skeleton for exactly this component; only its
+commit-promotion protocol stays dead (§13.1).
+
+### 14.6 The control plane: a real Postgres
+
+The platform's catalog is an ordinary, boring Postgres database — in dev it
+can be PGlite itself, same SQL. It is authoritative for **topology and
+lifecycle, never data**: the stream stays the truth for every database's
+contents; the control plane records which databases exist and where their
+streams and checkpoints are.
+
+Schema, roughly:
+
+```text
+databases     tenant, name, status (idle|active|deleted), timestamps
+lineage       parent database, fork LSN            -- GC refcounts = joins
+eras          database → current era URL + offset; sealed era history
+checkpoints   database → LSN → checkpoint object manifest ref
+auth          API keys, token grants the gateway enforces
+usage         metering rollups
+```
+
+This *upgrades* two mechanisms the doc previously did with weaker tools:
+
+- **the manifest becomes rows, and manifest CAS becomes a transaction.**
+  Rotation step 6 (§6.1) is a guarded `UPDATE … WHERE era = N`; fork
+  creation is one transaction inserting the child row and pinning the
+  parent. The object store consequently only needs immutable objects with
+  read-after-write visibility — §2.6's conditional-update requirement moves
+  here, onto a tool actually built for it;
+- **fork-aware GC becomes SQL** — reverse-reference refcounting over
+  `lineage` and `checkpoints` instead of refcount files.
+
+Failure-independence rules (strict, testable):
+
+- the commit path is cell → gateway → stream — **never** the control plane;
+- control-plane writes are lifecycle-rate (create, fork, rotate, idle/wake
+  transitions), never commit-rate — one modest Postgres indexes millions of
+  databases;
+- active databases keep serving through a control-plane outage (gateways
+  cache era pointers and manifests with short TTLs); an outage degrades
+  create/fork/rotate and cold wakes only;
+- deliberate non-goal: hosting the control plane on this substrate itself —
+  the recovery story must have no circular dependency.
+
+The M7 GUI is simply a control-plane client with a stream tailer attached.
+
 ## 15. Milestones
 
 Each is independently demoable; the conflict path starts trivial and hardens.
@@ -1388,7 +1483,9 @@ Each is independently demoable; the conflict path starts trivial and hardens.
   content-addressed page cache, one tailer per database, host-local commit
   sequencer (§14.3); **proxy response buffering + session-state taint
   enforcing the §3.7 contract — the "client observed nothing" property is
-  M1, not polish**. Scale-to-zero works here.
+  M1, not polish**; storage/stream gateway v0 (fs backend, embedded DS
+  server) and control-plane schema v0 (§14.5–§14.6; PGlite as the dev
+  control plane). Scale-to-zero works here.
 - **M2 — eras, forks, GC.** Rotation via guarded seal; fork manifests over
   stream forks; GC horizon from lease pins + fork refcounts.
 - **M3 — followers.** Lazy tail apply (page-version index, base-required
@@ -1486,3 +1583,9 @@ Each is independently demoable; the conflict path starts trivial and hardens.
    pool sizing against the 80 MB active footprint.
 10. Where does the schema-epoch live — derived only, or also an `X` frame for
     cheap joiner access?
+11. Control-plane schema versioning and the multi-region story (the catalog
+    is read-mostly — replicas suffice for reads, but era-rotation guards
+    want a single writer region per database).
+12. Gateway manifest-cache TTLs: the wake path reads the manifest, so TTL
+    trades cold-wake latency against control-plane-outage tolerance —
+    measure before choosing defaults.
