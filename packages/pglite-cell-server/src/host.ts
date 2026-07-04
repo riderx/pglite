@@ -10,6 +10,7 @@ import { DatabaseRuntime, resolveRuntimeOpts } from './database-runtime'
 import type { ResolvedRuntimeOpts, RuntimeOpts } from './database-runtime'
 import type { HostSession } from './session'
 import type { CheckpointReport } from './checkpoint'
+import type { RotationReport } from './rotation'
 
 export interface CellHostOpts {
   /** The gateway: an in-process GatewayCore or `{ url }` for HTTP. */
@@ -86,6 +87,30 @@ export class CellHost {
     }
     await runtime.ensureActive()
     return runtime.checkpoint()
+  }
+
+  /**
+   * Rotate a database's era (M2, §6.1 steps 0–6): checkpoint, cut era N+1
+   * at a unique per-attempt URL, seal era N with the terminal S frame, and
+   * record the transition in the control plane. Idempotent / re-entrant —
+   * a re-run after any crash completes the pending transition. The runtime
+   * is created + activated lazily if not already resident.
+   */
+  async rotateDatabase(dbNameOrId: string): Promise<RotationReport> {
+    const databaseId = await this.gateway.resolveDatabaseId(dbNameOrId)
+    let runtime = this.runtimes.get(databaseId)
+    if (!runtime) {
+      runtime = new DatabaseRuntime({
+        databaseId,
+        hostId: this.hostId,
+        gateway: this.gateway,
+        dataRoot: this.dataRoot,
+        opts: this.opts,
+      })
+      this.runtimes.set(databaseId, runtime)
+    }
+    await runtime.ensureActive()
+    return runtime.rotate()
   }
 
   /**

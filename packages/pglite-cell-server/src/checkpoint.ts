@@ -102,13 +102,15 @@ export async function checkpointDatabase(
     // commit (or another worker) landed between the sync slice and here —
     // catch up and retry the whole loop (the canonical position may need to
     // re-advance; commits since snapEnd replay on top of the checkpoint).
-    const eraId = runtime.manifest.era.id
     const res = await runtime.committer.appendControl((expectedOffset) => {
       const frame: KFrame = {
         type: 'K',
         header: {
           v: 1,
-          eraId,
+          // The tailer's CURRENT era at build time: appendControl re-invokes
+          // this callback after an era hop (M2), and the manifest's era may
+          // be stale after a rotation.
+          eraId: runtime.tailer.currentEra.id,
           expectedOffset,
           lsn: lsnText,
           snapEnd: snapEndText,

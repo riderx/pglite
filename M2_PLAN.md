@@ -1,5 +1,16 @@
 # M2 implementation plan — storage lifecycle
 
+> **STATUS: M2 CLOSED (2026-07-04).** All waves shipped. Corrections
+> found by the chaos suite: (1) a raced seal + re-cut leaves the joiner
+> "checkpoint + current era" attach with a WAL gap — the rotator now cuts
+> a fresh checkpoint whenever `checkpoint.snapEnd < era.baseLsn`; (2) a
+> latent M1e race (worker catch-up ingesting the committer's own
+> in-flight append double-dispatched advanceLocal and desynced producer
+> seq) — ok-paths now advanceLocal only at the expected boundary; (3)
+> `Committer.sealEra(build, {ifHeadOffset})` added as the CAS seal path;
+> (4) rotation over the HTTP gateway mode needs era-row/pin routes —
+> deferred to M4 fleet (in-process mode is complete).
+
 Companion to `OPTIMISTIC_PHYSICAL_REPLICATION_DESIGN.md` §2.4/§2.5/§6.1/§6.4
 and `M1_PLAN.md` (whose formats and findings all still govern). M2 scope
 (§15): hardened era rotation, forks over stream forks + `F` frames, GC

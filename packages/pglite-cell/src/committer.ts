@@ -67,6 +67,17 @@ export type ControlAppendResult =
   | { landed: true; offset: string; nextOffset: string }
   | { landed: false }
 
+/**
+ * Result of a sealing append (`sealEra`). Unlike other appends the two 409
+ * shapes stay distinct — the rotator's state machine (§6.1 step 5) branches
+ * on them: `seq-conflict` ⇒ a commit raced in, RE-CUT; `closed` ⇒ another
+ * rotator won, ADOPT.
+ */
+export type SealEraResult =
+  | { result: 'sealed'; offset: string; nextOffset: string }
+  | { result: 'seq-conflict' }
+  | { result: 'closed' }
+
 /** Total POST attempts for one commit on network failure (W2: same bytes,
  *  same producer tuple — the server dedups replays of the winning POST). */
 const MAX_POST_ATTEMPTS = 3
@@ -245,9 +256,13 @@ export class Committer {
           // may sit between ours and it, so advancing locally would skip
           // frames. Re-download from the pre-append boundary instead.
           await this.tailer.catchUp()
-        } else {
+        } else if (this.tailer.head.offset === expectedOffset) {
           this.tailer.advanceLocal([frame], res.nextOffset)
         }
+        // else: a concurrent catch-up (checkpoint/rotation workers read the
+        // tailer outside the append mutex) already ingested our own bytes
+        // from the server while the POST was in flight — advancing locally
+        // now would double-dispatch at the wrong boundary. Nothing to do.
         this.seqByPath.set(era.path, producer.seq + 1)
         this.journal.resolve(input.commitId)
         return {
@@ -329,9 +344,11 @@ export class Committer {
           // Same skip hazard as commitSlice: re-download, never advance
           // locally past a tail we did not observe frame-by-frame.
           await this.tailer.catchUp()
-        } else {
+        } else if (this.tailer.head.offset === expectedOffset) {
           this.tailer.advanceLocal(frames, res.nextOffset)
         }
+        // else: a concurrent catch-up already ingested our append (see
+        // commitSlice) — never double-dispatch.
         this.seqByPath.set(era.path, producer.seq + 1)
         return {
           landed: true,
@@ -353,6 +370,87 @@ export class Committer {
   }
 
   /**
+   * Seal the CURRENT era (M2 rotation, §6.1 step 5): CAS append+close of the
+   * terminal S frame, serialized behind every other append this committer
+   * has issued (W1) — never close-only. `build` receives the append position
+   * (which becomes `S.finalOffset`); every returned frame must carry exactly
+   * that `expectedOffset`.
+   *
+   * `opts.ifHeadOffset` guards the rotator's O/S mirror: if the tailer head
+   * moved past the offset the next era's O frame was cut against (a commit
+   * of our own landed in between), the seal is NOT posted and reports
+   * `seq-conflict` — indistinguishable from the server-side race, and
+   * handled identically (re-cut).
+   *
+   * Outcomes: `sealed` (this call closed the era; the tailer holds the
+   * pending seal and hops on its next catch-up); `seq-conflict` (definitive
+   * reject, nothing mutated — catch up and re-cut); `closed` (another
+   * rotator sealed first — catch up to adopt their next era).
+   */
+  sealEra(
+    build: (expectedOffset: string) => Frame[],
+    opts: { ifHeadOffset?: string } = {},
+  ): Promise<SealEraResult> {
+    return this.run(async () => {
+      const era = this.tailer.currentEra
+      const expectedOffset = this.tailer.head.offset
+      if (
+        opts.ifHeadOffset !== undefined &&
+        opts.ifHeadOffset !== expectedOffset
+      ) {
+        return { result: 'seq-conflict' }
+      }
+      const frames = build(expectedOffset)
+      if (frames.some((f) => f.header.expectedOffset !== expectedOffset)) {
+        throw new Error(
+          'sealEra: built frames must carry the provided expectedOffset',
+        )
+      }
+      const body = encodeAppend(frames)
+      const producer = {
+        id: this.producerId,
+        epoch: this.epoch,
+        seq: this.seqByPath.get(era.path) ?? 0,
+      }
+      const res = await this.postWithRetry(era.path, body, {
+        seq: casToken(era.ordinal, expectedOffset),
+        expectedOffset,
+        producer,
+        close: true,
+      })
+      switch (res.kind) {
+        case 'ok':
+          if (res.deduped) {
+            // A network retry deduped — the seal landed on an earlier
+            // attempt. Re-download (which follows the S→O hop) rather than
+            // advancing locally past unobserved frames.
+            await this.tailer.catchUp()
+          } else if (this.tailer.head.offset === expectedOffset) {
+            // Dispatch the S locally: the tailer records the pending seal
+            // and hops on its next catch-up.
+            this.tailer.advanceLocal(frames, res.nextOffset)
+          }
+          // else: a concurrent catch-up already ingested the seal (and
+          // possibly hopped) — never double-dispatch.
+          this.seqByPath.set(era.path, producer.seq + 1)
+          return {
+            result: 'sealed',
+            offset: expectedOffset,
+            nextOffset: res.nextOffset,
+          }
+        case 'seq-conflict':
+          return { result: 'seq-conflict' }
+        case 'closed':
+          return { result: 'closed' }
+        case 'stale-epoch':
+          throw new FencedError(this.epoch, res.currentEpoch)
+        case 'producer-gap':
+          throw new ProducerGapError(res.expectedSeq, res.receivedSeq)
+      }
+    })
+  }
+
+  /**
    * POST with up-to-3 network-failure retries carrying byte-identical body
    * and producer tuple (W2): if an earlier attempt actually landed, the
    * server dedups the replay to a success. HTTP-level rejects (typed
@@ -365,6 +463,7 @@ export class Committer {
       seq: string
       expectedOffset: string
       producer: { id: string; epoch: number; seq: number }
+      close?: boolean
     },
   ) {
     let lastErr: unknown

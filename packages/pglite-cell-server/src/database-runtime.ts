@@ -27,6 +27,8 @@ import type { GatewayHandle } from './gateway'
 import { HostSession } from './session'
 import { checkpointDatabase } from './checkpoint'
 import type { CheckpointReport } from './checkpoint'
+import { rotateDatabase } from './rotation'
+import type { RotationReport } from './rotation'
 
 /** Runtime tuning knobs (host-wide defaults, applied per database). */
 export interface RuntimeOpts {
@@ -52,10 +54,18 @@ export interface RuntimeOpts {
   checkpointOnHibernateBytes?: number
   /**
    * Auto-cadence (§2.4 dial): after each landed commit, if bytes since the
-   * last checkpoint exceed this, fire-and-forget a checkpoint. Default 0 =
-   * disabled (any nonzero value arms it).
+   * last checkpoint exceed this, fire-and-forget a checkpoint. Undefined
+   * (default) = use the database's `checkpoint_every_bytes` manifest dial;
+   * an explicit value (including 0 = disabled) overrides the dial.
    */
   checkpointEveryBytes?: number
+  /**
+   * Era rotation trigger (M2 dial): after a checkpoint, if the era's byte
+   * length since its base exceeds this, fire-and-forget a rotation.
+   * Undefined (default) = use the database's `rotate_every_bytes` manifest
+   * dial; an explicit value (including 0 = never) overrides it.
+   */
+  rotateEveryBytes?: number
 }
 
 export interface ResolvedRuntimeOpts {
@@ -65,7 +75,10 @@ export interface ResolvedRuntimeOpts {
   attachAttempts: number
   hibernateAfterMs: number | undefined
   checkpointOnHibernateBytes: number
-  checkpointEveryBytes: number
+  /** Undefined = defer to the manifest dial. */
+  checkpointEveryBytes: number | undefined
+  /** Undefined = defer to the manifest dial. */
+  rotateEveryBytes: number | undefined
 }
 
 export function resolveRuntimeOpts(
@@ -78,7 +91,8 @@ export function resolveRuntimeOpts(
     attachAttempts: opts.attachAttempts ?? 10,
     hibernateAfterMs: opts.hibernateAfterMs,
     checkpointOnHibernateBytes: opts.checkpointOnHibernateBytes ?? 0,
-    checkpointEveryBytes: opts.checkpointEveryBytes ?? 0,
+    checkpointEveryBytes: opts.checkpointEveryBytes,
+    rotateEveryBytes: opts.rotateEveryBytes,
   }
 }
 
@@ -148,6 +162,14 @@ export class DatabaseRuntime {
   private lastCheckpointLsn = 0n
   /** Guards against concurrent / re-entrant checkpoint runs (in-flight). */
   private checkpointing: Promise<CheckpointReport> | null = null
+  /** Guards against concurrent / re-entrant rotations (in-flight). */
+  private rotating: Promise<RotationReport> | null = null
+  /** True while hibernate() runs (suppresses the auto-rotate trigger). */
+  private hibernating = false
+  /** The current era's base LSN (rotation trigger measures from here). */
+  private eraBaseLsn = 0n
+  /** Control-plane pin ids this host holds (mirror of L{gc-pin} frames). */
+  private readonly pinIds = new Set<string>()
 
   constructor(init: DatabaseRuntimeInit) {
     this.databaseId = init.databaseId
@@ -254,6 +276,7 @@ export class DatabaseRuntime {
     this.raiseWatermark({ offset: tailer.head.offset, lsn: tailer.head.lsn })
 
     this.lastCheckpointLsn = parseLsn(manifest.checkpoint.snapEnd)
+    this.eraBaseLsn = parseLsn(manifest.era.baseLsn)
     this._state = 'active'
     await this.appendHeadLease()
 
@@ -280,7 +303,9 @@ export class DatabaseRuntime {
           type: 'L',
           header: {
             v: 1,
-            eraId: this.manifest.era.id,
+            // The tailer's CURRENT era, not the (possibly stale) manifest —
+            // the era may have rotated since activation (M2).
+            eraId: this.tailer.currentEra.id,
             expectedOffset,
             kind: 'head',
             holder: this.hostId,
@@ -336,13 +361,37 @@ export class DatabaseRuntime {
   }
 
   /**
+   * The effective checkpoint-cadence threshold: the host option when set,
+   * else the database's `checkpoint_every_bytes` manifest dial (M2).
+   */
+  private effectiveCheckpointEveryBytes(): number {
+    if (this.opts.checkpointEveryBytes !== undefined) {
+      return this.opts.checkpointEveryBytes
+    }
+    return this._manifest
+      ? Number(this._manifest.dials.checkpointEveryBytes)
+      : 0
+  }
+
+  /**
+   * The effective rotation threshold: the host option when set, else the
+   * database's `rotate_every_bytes` manifest dial (M2; 0 = never).
+   */
+  private effectiveRotateEveryBytes(): number {
+    if (this.opts.rotateEveryBytes !== undefined) {
+      return this.opts.rotateEveryBytes
+    }
+    return this._manifest ? Number(this._manifest.dials.rotateEveryBytes) : 0
+  }
+
+  /**
    * Auto-cadence (§2.4 dial): once the tail past the last checkpoint exceeds
-   * `checkpointEveryBytes`, fire-and-forget a checkpoint. Guarded by the
+   * the effective threshold, fire-and-forget a checkpoint. Guarded by the
    * in-flight flag so a slow checkpoint never overlaps another. Disabled
-   * when the option is 0.
+   * when the effective threshold is 0.
    */
   private maybeAutoCheckpoint(): void {
-    const threshold = this.opts.checkpointEveryBytes
+    const threshold = this.effectiveCheckpointEveryBytes()
     if (threshold <= 0 || this.checkpointing !== null) return
     if (this.tailBytesSinceCheckpoint() < BigInt(threshold)) return
     void this.checkpoint().catch((err) => {
@@ -373,7 +422,62 @@ export class DatabaseRuntime {
       return await run
     } finally {
       this.checkpointing = null
+      // Rotation dial (M2): after a checkpoint, rotate when the era has
+      // grown past `rotate_every_bytes`. No-op while a rotation is already
+      // in flight (including the one that ran THIS checkpoint).
+      this.maybeAutoRotate()
     }
+  }
+
+  /**
+   * Fire-and-forget rotation trigger (M2 dial): after a checkpoint, if the
+   * era's byte length since its base (LSN delta as a proxy) exceeds the
+   * effective `rotate_every_bytes`, rotate. Guarded by the in-flight flag.
+   */
+  private maybeAutoRotate(): void {
+    const threshold = this.effectiveRotateEveryBytes()
+    if (threshold <= 0 || this.rotating !== null || this.hibernating) return
+    if (this._state !== 'active' || this._tailer === null) return
+    const eraBytes = this._tailer.head.lsn - this.eraBaseLsn
+    if (eraBytes < BigInt(threshold)) return
+    void this.rotate().catch((err) => {
+      console.log(
+        `[pglite-cell-server] db ${this.databaseId}: auto-rotate failed: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      )
+    })
+  }
+
+  /**
+   * Rotate this database's era (M2, §6.1 steps 0–6). Serialized by the
+   * in-flight guard — concurrent callers share the same run. Idempotent /
+   * re-entrant: a re-run after any crash completes the pending transition.
+   */
+  async rotate(): Promise<RotationReport> {
+    if (this.rotating !== null) return this.rotating
+    const run = (async (): Promise<RotationReport> => {
+      await this.ensureActive()
+      return rotateDatabase(this)
+    })()
+    this.rotating = run
+    try {
+      return await run
+    } finally {
+      this.rotating = null
+    }
+  }
+
+  /**
+   * Re-read the manifest (rotation finished — the era moved). Refreshes the
+   * era-base LSN the rotation dial measures from and the latest-checkpoint
+   * LSN. The tailer/committer are NOT rebuilt: they already hopped in place.
+   */
+  async refreshManifest(): Promise<void> {
+    const manifest = await this._gateway.getManifest(this.databaseId)
+    this._manifest = manifest
+    this.eraBaseLsn = parseLsn(manifest.era.baseLsn)
+    const ckptLsn = parseLsn(manifest.checkpoint.snapEnd)
+    if (ckptLsn > this.lastCheckpointLsn) this.lastCheckpointLsn = ckptLsn
   }
 
   /**
@@ -465,6 +569,27 @@ export class DatabaseRuntime {
     sessionId: string,
     base: { offset: string; lsn: bigint },
   ): Promise<void> {
+    // Mirror the pin into the control-plane `pins` table (§6.4: the stream
+    // stays the in-band truth, the table is the queryable index GC honors).
+    // Best-effort: a mirror failure never blocks the session.
+    const pinId = randomUUID()
+    try {
+      await this._gateway.upsertPin(this.databaseId, {
+        id: pinId,
+        kind: 'gc-pin',
+        holder: sessionId,
+        pinnedOffset: base.offset,
+        pinnedLsn: formatLsn(base.lsn),
+        expiresAt: new Date(Date.now() + this.opts.pinTtlMs),
+      })
+      this.pinIds.add(pinId)
+    } catch (err) {
+      console.log(
+        `[pglite-cell-server] db ${this.databaseId}: control-plane pin ` +
+          `mirror failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+
     const committer = this.committer
     for (let i = 0; i < 3; i++) {
       const res = await committer.appendControl((expectedOffset) => {
@@ -472,7 +597,7 @@ export class DatabaseRuntime {
           type: 'L',
           header: {
             v: 1,
-            eraId: this.manifest.era.id,
+            eraId: this.tailer.currentEra.id,
             expectedOffset,
             kind: 'gc-pin',
             holder: sessionId,
@@ -517,6 +642,7 @@ export class DatabaseRuntime {
   async hibernate(): Promise<void> {
     if (this._state !== 'active') return
     this.clearHibernateTimer()
+    this.hibernating = true
 
     // Checkpoint FIRST when the tail past the last checkpoint exceeds the
     // threshold (default 0 = always). This is what makes wake cheap (zero
@@ -539,12 +665,27 @@ export class DatabaseRuntime {
     for (const session of [...this.sessions]) {
       await session._hibernateCell()
     }
+
+    // Release this host's control-plane pins: hibernation fatally reset any
+    // pinned (tainted) session, so its pins protect nothing anymore. The
+    // in-band L{gc-pin} frames expire by TTL; the table mirror is dropped
+    // eagerly. Best-effort.
+    for (const pinId of [...this.pinIds]) {
+      try {
+        await this._gateway.deletePin(pinId)
+      } catch {
+        // TTL expiry sweeps it eventually.
+      }
+      this.pinIds.delete(pinId)
+    }
+
     this._baseDirs?.destroy()
     this._baseDirs = null
     this._tailer = null
     this._committer = null
     this._manifest = null
     this._state = 'hibernated'
+    this.hibernating = false
 
     console.log(`[pglite-cell-server] db ${this.databaseId} hibernated`)
   }
