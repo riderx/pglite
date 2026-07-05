@@ -54,6 +54,14 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: pnpm install
 
+      # H6: bound the native (__PGLITE__-guarded) hunk budget in the
+      # postgres-pglite submodule + assert the gitlink is remote-reachable on
+      # the matching branch. Runs here — the only job that checks out the
+      # submodule (recursive, above).
+      - name: Native hunk budget check
+        working-directory: ${{ github.workspace }}
+        run: node scripts/native-budget-check.mjs
+
       - name: Get postgres-pglite submodule hash
         id: postgres-pglite-commit-id
         run: echo "hash=$(git rev-parse HEAD:postgres-pglite)" >> "$GITHUB_OUTPUT"

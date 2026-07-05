@@ -160,9 +160,24 @@ export class Janitor {
     if (this.opts.gcIntervalMs > 0) await this.runGc()
   }
 
-  /** Force a single vacuum cycle now (TEST HOOK). */
+  /**
+   * Force a real vacuum now (TEST HOOK). Unlike the background tick this
+   * ignores the interval guard and does not silently skip when a background
+   * tick holds `busy` — it waits the in-flight tick out (bounded), then runs
+   * a genuine vacuum. A "run now" hook that no-ops under a fast auto-interval
+   * (whose slow-under-load vacuum keeps `busy` set) is useless for tests.
+   */
   async runVacuumNow(): Promise<void> {
-    await this.tick('vacuum')
+    for (let i = 0; this.busy && i < 2000; i++) {
+      await new Promise((r) => setTimeout(r, 5))
+    }
+    if (this.stopped || this.runtime.state !== 'active') return
+    this.busy = true
+    try {
+      await this.maybeVacuum({ force: true })
+    } finally {
+      this.busy = false
+    }
   }
 
   /** Force a single freeze check now (TEST HOOK). */
@@ -188,9 +203,11 @@ export class Janitor {
    * commit rides the normal CAS path (an ordinary W frame), so no separate
    * marker is needed — a duplicate vacuum across hosts is harmless.
    */
-  private async maybeVacuum(): Promise<void> {
+  private async maybeVacuum({
+    force = false,
+  }: { force?: boolean } = {}): Promise<void> {
     const now = Date.now()
-    if (now - this.lastVacuumAt < this.opts.vacuumIntervalMs) return
+    if (!force && now - this.lastVacuumAt < this.opts.vacuumIntervalMs) return
     this.lastVacuumAt = now
     const session = this.runtime.connectSession()
     try {

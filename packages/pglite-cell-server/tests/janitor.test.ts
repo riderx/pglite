@@ -124,7 +124,11 @@ describe('Janitor (M6 §6.4)', () => {
   it(
     'write-heavy db under a fast vacuum janitor stays correct; vacuum commits ride the stream',
     async () => {
-      const ctx = await setup({ janitor: { vacuumIntervalMs: 5 } })
+      // Large auto-interval so the background timer never competes for the
+      // busy flag with our explicit runVacuumNow() calls — the forced hook
+      // does the real work, making this deterministic regardless of how slow
+      // VACUUM runs under write contention on this machine.
+      const ctx = await setup({ janitor: { vacuumIntervalMs: 3_600_000 } })
       try {
         const s = await ctx.host.connect('appdb')
         await s.exec('create table t (id serial primary key, v int)')

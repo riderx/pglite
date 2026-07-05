@@ -141,6 +141,7 @@ export type NativeFn =
   | 'commit_gate_pending'
   | 'commit_gate_run'
   | 'commit_gate_discard'
+  | 'set_suppress_read_wal' // (on) — H2 read-cell WAL suppression
   | 'set_sequence_lease' // (oid, leaseEnd: bigint)
   | 'clear_sequence_leases'
   | 'reset_sequence_caches'

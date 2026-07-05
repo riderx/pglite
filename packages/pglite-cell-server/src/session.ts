@@ -47,6 +47,7 @@ import type { CapturedSlice, WalRecord } from '@electric-sql/pglite-cell'
 import {
   lazyAttach,
   LazyAttachFallbackError,
+  WorkerCell,
 } from '@electric-sql/pglite-cell/worker-cell'
 import { rmSync } from 'node:fs'
 import type { SessionCell } from './cell-kind'
@@ -68,6 +69,7 @@ import {
   ReadOnlyCaptureError,
   SerializationConflictError,
   SessionClosedError,
+  SessionWatchdogError,
   SessionPinnedExpiredError,
 } from './errors'
 import {
@@ -954,6 +956,48 @@ export class HostSession {
    * abort/discard, taint probe, transparent re-execution of one-shots
    * (bounded), fatal reset for tainted losses.
    */
+  /**
+   * W4 watchdog second line (§11.2): run `fn` under a JS deadline. If it
+   * outlasts ~4× `statementTimeoutMs` — i.e. the statement ignored the
+   * `statement_timeout` cancel (a tight non-interruptible C loop) — terminate
+   * the worker (lazy-worker mode only; nodefs cells have no worker to kill and
+   * rely solely on statement_timeout) and fatally reset this session, then
+   * throw `SessionWatchdogError`. The host stays healthy. No timeout configured
+   * ⇒ `fn` runs unwrapped.
+   */
+  private async runWatchdogged<T>(cell: SessionCell, fn: () => Promise<T>): Promise<T> {
+    const stMs = this.runtime.opts.statementTimeoutMs
+    if (stMs === undefined || stMs <= 0 || !(cell instanceof WorkerCell)) {
+      return fn()
+    }
+    // 4× the clean-cancel budget (plus a small floor) before the hard kill —
+    // statement_timeout should always win first for a well-behaved statement.
+    const deadlineMs = Math.max(Math.floor(stMs) * 4, 250)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let tripped = false
+    const trip = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        tripped = true
+        this.dead = 'statement watchdog terminated the worker'
+        // Fire-and-forget the hard kill; failAll() rejects fn's in-flight
+        // request so the race below settles.
+        void (cell as WorkerCell).terminate().catch(() => undefined)
+        reject(new SessionWatchdogError(deadlineMs))
+      }, deadlineMs)
+    })
+    try {
+      return await Promise.race([fn(), trip])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      if (tripped) {
+        // Drop the dead cell + session from the runtime (mirrors gc-pin
+        // expiry): the connection is reset, a reconnect gets a fresh cell.
+        await this.destroyCell().catch(() => undefined)
+        this.runtime.removeSession(this)
+      }
+    }
+  }
+
   private async drive<T>(
     runner: (cell: SessionCell) => Promise<AttemptOutcome<T>>,
   ): Promise<DriveResult<T>> {
@@ -1011,7 +1055,8 @@ export class HostSession {
       // commitSlice; a lost attempt's harvest dies with the attempt.
       this.notifBuffer = []
 
-      const { payload, threw, aborted, leaseExhausted } = await runner(cell)
+      const { payload, threw, aborted, leaseExhausted } =
+        await this.runWatchdogged(cell, () => runner(cell))
       const notifications = this.notifBuffer
 
       if (cell.db.isInTransaction()) {
@@ -1421,7 +1466,7 @@ export class HostSession {
     // LazyCellFS at the checkpoint skeleton, advanced to head via the
     // live-apply pipeline — canonical position, no sync slice. Any gap
     // falls through to the existing materialize paths below.
-    if (this.runtime.opts.cellMode === 'lazy-worker') {
+    if (this.runtime.cellMode === 'lazy-worker') {
       const skipLazy = this.forceMaterializeAttach && this.mode === 'write'
       this.forceMaterializeAttach = false
       if (!skipLazy && (await this.tryLazyAttach())) return
@@ -1437,6 +1482,9 @@ export class HostSession {
         // records); its capture cursor tracks local position.
         expectedHeadLsn: lease.base.localHeadLsn,
         commitGate: this.runtime.opts.commitGate,
+        // H2 (§14.8): a read-attached cell must emit no WAL — suppress the
+        // one everyday source, opportunistic HOT pruning during seqscans.
+        suppressReadWal: true,
       })
       // Leases apply to read cells too (M5a): a discarded/aborted draw on
       // a read cell must still stay inside this incarnation's grants.
@@ -1541,6 +1589,8 @@ export class HostSession {
         slices,
         readChunk: ctx.readChunk,
         commitGate: this.runtime.opts.commitGate,
+        // H2 (§14.8): a read-mode lazy cell suppresses opportunistic pruning.
+        suppressReadWal: this.mode === 'read',
       })
       cell = attached.cell
       headLsn = attached.headLsn
@@ -1920,6 +1970,13 @@ export class HostSession {
     cell.db.onNotification((channel, payload) => {
       this.notifBuffer.push({ channel, payload })
     })
+    // W4 watchdog first line (§11.2): statement_timeout cancels a long
+    // statement cleanly. Backend-local GUC (no WAL — read cells stay
+    // publish-clean). Re-applied on every (re)attach so recycled cells keep it.
+    const stMs = this.runtime.opts.statementTimeoutMs
+    if (stMs !== undefined && stMs > 0) {
+      await cell.db.exec(`set statement_timeout = ${Math.floor(stMs)}`)
+    }
     await this.replaySessionState(cell)
     await this.applyListenUnion(cell)
   }

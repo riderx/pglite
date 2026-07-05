@@ -257,9 +257,17 @@ export class WorkerCell {
   ): Promise<WorkerCell> {
     const buffers = createBridgeBuffers(opts.dataSabBytes)
     const entry = opts.workerUrl ?? resolveWorkerEntry()
+    // §11.2 basics: bound the worker's heap + stack by default so a runaway
+    // query cannot exhaust host memory before the watchdog fires. Caller
+    // overrides win per-field.
+    const resourceLimits = {
+      maxOldGenerationSizeMb: 512,
+      stackSizeMb: 8,
+      ...opts.resourceLimits,
+    }
     const worker = new Worker(entry, {
       workerData: { control: buffers.control, data: buffers.data },
-      resourceLimits: opts.resourceLimits,
+      resourceLimits,
     })
     const cell = new WorkerCell(
       dir,
@@ -313,6 +321,10 @@ export class WorkerCell {
       }
       if (opts.commitGate !== false) {
         await cell.native('commit_gate_set', [1])
+      }
+      // H2 (§14.8): suppress read-cell WAL (opportunistic pruning) at open.
+      if (opts.suppressReadWal) {
+        await cell.native('set_suppress_read_wal', [1])
       }
       await cell.maybeSnapshotBase()
       return cell

@@ -71,9 +71,17 @@ the full corpus (core 269 / cell 80 / gateway 51 / cell-server 77+M6).
   moves O(eager-set) bytes and ZERO relation pages; a point query fetches
   exactly its chunks; repeat query fetches nothing; eviction recovers;
   wake-byte counter surfaced in the console.
-- **W4:** flip the default for read sessions first, then writers;
-  worker `resourceLimits` + terminate-on-watchdog (the §11.2 basics —
-  the rest of §11 stays post-goal); full corpus in both modes.
+- **W4 (DONE):** default `cellMode` → `'auto'` (resolves to `'lazy-worker'`
+  when the latest checkpoint is v3-capable AND the gateway supports ranged
+  reads, else `'nodefs'` for v1/v2 lineages); `GatewayCore.checkpointFormat`
+  default → 3. Worker `resourceLimits` defaults (maxOldGenerationSizeMb 512,
+  stackSizeMb 8, overridable) + the watchdog: `statementTimeoutMs` wires
+  `statement_timeout` (best-effort — see finding) as the first line and a JS
+  worker-terminate + session fatal-reset as the second. Full cell-server
+  corpus green in the new default mode; nodefs spot-run green.
+  FINDING: `statement_timeout` does NOT fire in the single-backend WASM build
+  (no interval-timer / signal delivery — pg_sleep(5) runs the full 5s under a
+  500ms timeout), so the JS watchdog is the ACTUAL line of defense in WASM.
 
 ## Explicitly post-goal (log, don't build)
 

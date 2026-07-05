@@ -21,7 +21,7 @@ import type {
   LFrame,
   NFrame,
 } from '@electric-sql/pglite-cell'
-import { extractCheckpoint } from '@electric-sql/pglite-gateway'
+import { checkpointIsV3, extractCheckpoint } from '@electric-sql/pglite-gateway'
 import type {
   CheckpointFileEntry,
   Manifest,
@@ -104,6 +104,25 @@ export interface RuntimeOpts {
   /** Host chunk-cache byte cap (lazy-worker mode). Default 1 GiB. */
   chunkCacheBytes?: number
   /**
+   * H3 slice-spill threshold (§2.2): a WAL slice larger than this many bytes
+   * is uploaded to the gateway object store and referenced by a spilled W
+   * frame instead of being sent inline (so a big single-commit bulk insert is
+   * not bounded by the gateway append cap). Default 4 MiB (committer default).
+   */
+  sliceSpillBytes?: number
+  /**
+   * W4 watchdog (§11.2 basics). When set (ms), every session:
+   *  1. sets `statement_timeout` to this value as the FIRST line of defense
+   *     (Postgres cancels the statement cleanly — the common case);
+   *  2. arms a JS watchdog timer at ~4× this value as the SECOND line: a
+   *     statement that ignores the cancel (a tight C-loop aggregate that
+   *     never checks interrupts) trips it, and the host `terminate()`s the
+   *     worker + fatally resets the session, keeping the host healthy.
+   * Undefined (default) disables both. Only the second line needs a worker
+   * (lazy-worker mode); the statement_timeout line applies in nodefs too.
+   */
+  statementTimeoutMs?: number
+  /**
    * Advisory-lock policy (M6, §4.6). `pg_advisory_*` locks are cell-local:
    * two hosts' locks do NOT exclude each other, so cross-cell mutual
    * exclusion is not provided.
@@ -147,6 +166,8 @@ export interface ResolvedRuntimeOpts {
   chunkCacheBytes: number | undefined
   bufferMemoryMax: number
   bufferSpoolMax: number
+  sliceSpillBytes: number | undefined
+  statementTimeoutMs: number | undefined
 }
 
 export function resolveRuntimeOpts(
@@ -169,10 +190,14 @@ export function resolveRuntimeOpts(
       opts.cellMode ??
       (process.env.PGLITE_CELL_MODE === 'lazy-worker'
         ? 'lazy-worker'
-        : 'nodefs'),
+        : process.env.PGLITE_CELL_MODE === 'nodefs'
+          ? 'nodefs'
+          : 'auto'), // W4: default auto-selects lazy-worker for v3 lineages
     chunkCacheBytes: opts.chunkCacheBytes,
     bufferMemoryMax: opts.bufferMemoryMax ?? 8 * 1024 * 1024,
     bufferSpoolMax: opts.bufferSpoolMax ?? 256 * 1024 * 1024,
+    sliceSpillBytes: opts.sliceSpillBytes,
+    statementTimeoutMs: opts.statementTimeoutMs,
   }
 }
 /** Bound on grant-take CAS retries (each loss re-reads the high-water). */
@@ -328,6 +353,21 @@ export class DatabaseRuntime {
   /** False while the canonical dir is missing its lazy relation files. */
   private canonicalHydrated = true
   private lazyCellGen = 0
+  /**
+   * The effective cell mode after the W4 `'auto'` decision is resolved at
+   * activate time (v3-capable checkpoint + ranged-read-capable gateway ⇒
+   * 'lazy-worker', else 'nodefs'). Concrete once `activate()` has run; before
+   * that it mirrors the configured mode with 'auto' still pending.
+   */
+  private effectiveCellMode: CellMode
+
+  /** The resolved cell mode ('auto' collapsed to a concrete value once
+   *  activate has decided). All mode-branching reads go through this. */
+  get cellMode(): 'nodefs' | 'lazy-worker' {
+    // 'auto' before activate resolves it: fall back to nodefs (no lazy state
+    // exists yet, so every lazy-gated path is a correct no-op).
+    return this.effectiveCellMode === 'lazy-worker' ? 'lazy-worker' : 'nodefs'
+  }
 
   constructor(init: DatabaseRuntimeInit) {
     this.databaseId = init.databaseId
@@ -336,6 +376,7 @@ export class DatabaseRuntime {
     this.opts = init.opts
     this.chunkCache = init.chunkCache
     this.root = join(init.dataRoot, init.databaseId)
+    this.effectiveCellMode = init.opts.cellMode
   }
 
   get state(): RuntimeState {
@@ -405,7 +446,24 @@ export class DatabaseRuntime {
       get: (ref: string) => this._gateway.getObject(ref),
       put: (bytes: Uint8Array) => this._gateway.putObject(bytes),
     }
-    const lazyMode = this.opts.cellMode === 'lazy-worker'
+    // W4: resolve 'auto' now that the manifest + gateway are known. Lazy-worker
+    // needs a v3-capable checkpoint AND a ranged-read-capable gateway; a v1/v2
+    // lineage (or a gateway without ranged reads) stays nodefs.
+    if (this.opts.cellMode === 'auto') {
+      const gatewaySupportsRanges =
+        typeof this._gateway.getObjectRange === 'function'
+      const v3 =
+        gatewaySupportsRanges &&
+        (await checkpointIsV3(manifest.checkpoint.ref, store))
+      this.effectiveCellMode = v3 ? 'lazy-worker' : 'nodefs'
+      console.log(
+        `[pglite-cell-server] db ${this.databaseId}: cellMode auto -> ` +
+          `${this.effectiveCellMode} (v3=${v3}, ranged=${gatewaySupportsRanges})`,
+      )
+    } else {
+      this.effectiveCellMode = this.opts.cellMode
+    }
+    const lazyMode = this.cellMode === 'lazy-worker'
     if (lazyMode) {
       // M7 W3: materialize the EAGER skeleton only (a v3 checkpoint's lazy
       // relation files fault in per-chunk; v1/v2 objects extract fully and
@@ -441,6 +499,7 @@ export class DatabaseRuntime {
       ordinal: manifest.era.ordinal,
       baseOffset: manifest.era.baseOffset,
       baseLsn: parseLsn(manifest.era.baseLsn),
+      store, // H3: resolve spilled W slices via the gateway object store
     })
     await tailer.catchUp()
 
@@ -469,6 +528,8 @@ export class DatabaseRuntime {
       },
       tailer,
       journalDir: join(this.root, 'journal'), // persists across hibernation
+      spillStore: store, // H3: upload slices over the spill threshold
+      sliceSpillBytes: this.opts.sliceSpillBytes,
     })
 
     // Uniform notification delivery (M3, §10.2 step 4): EVERY N frame this
@@ -1152,7 +1213,7 @@ export class DatabaseRuntime {
     ) => Promise<Uint8Array>
   } | null {
     if (
-      this.opts.cellMode !== 'lazy-worker' ||
+      this.cellMode !== 'lazy-worker' ||
       this.skeletonDir === null ||
       this.lazyBase === null
     ) {

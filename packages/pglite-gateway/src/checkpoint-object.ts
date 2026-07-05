@@ -316,6 +316,23 @@ function parseManifest(bytes: Uint8Array): CheckpointManifestV3 {
   return m
 }
 
+/**
+ * True iff the checkpoint at `ref` is v3 (per-file content-addressed +
+ * manifest) — the W4 lazy-worker capability probe. Resolves the object via
+ * `store` and sniffs its format (v3 JSON manifest vs v1/v2 archive). A fetch
+ * failure returns false (treat as non-lazy-capable rather than throwing).
+ */
+export async function checkpointIsV3(
+  ref: string,
+  store: ObjectGetStore,
+): Promise<boolean> {
+  try {
+    return isV3Manifest(await store.get(ref))
+  } catch {
+    return false
+  }
+}
+
 /** True iff `bytes` is a JSON v3 manifest body (cheap sniff before full parse). */
 function isV3Manifest(bytes: Uint8Array): boolean {
   // Skip leading whitespace; a manifest is a JSON object starting with `{`.

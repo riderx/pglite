@@ -42,8 +42,11 @@ export class CellHost {
     this.hostId = opts.hostId ?? `host-${randomUUID().slice(0, 8)}`
     this.opts = resolveRuntimeOpts(opts.opts)
     mkdirSync(this.dataRoot, { recursive: true })
+    // Build the fleet-wide chunk cache whenever lazy-worker is possible: an
+    // explicit 'lazy-worker' OR the W4 'auto' default (which resolves to
+    // lazy-worker per-database at activate). Only an explicit 'nodefs' skips it.
     this.chunkCache =
-      this.opts.cellMode === 'lazy-worker'
+      this.opts.cellMode !== 'nodefs'
         ? new ChunkCache({
             dir: join(this.dataRoot, 'chunks'),
             maxBytes: this.opts.chunkCacheBytes,

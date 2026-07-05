@@ -40,13 +40,39 @@ export interface CommitterEra {
   ordinal: number
 }
 
+/**
+ * Out-of-band slice store (H3, §2.2). The committer has no gateway handle,
+ * so cell-server wires this from the GatewayHandle's object store: `put`
+ * uploads spilled WAL bytes and returns a content-address ref; `get`
+ * resolves one back (used on the recovery-DECIDE path). The tailer resolves
+ * spilled frames through its own copy of the same handle.
+ */
+export interface SpillStore {
+  put(bytes: Uint8Array): Promise<{ ref: string }>
+  get(ref: string): Promise<Uint8Array>
+}
+
 export interface CommitterOpts {
   client: DsStreamClient
   era: CommitterEra
   tailer: EraTailer
   /** Journal directory for this (host, database) pair. */
   journalDir: string
+  /**
+   * Out-of-band store for slice spill (H3). Optional: without it the
+   * committer never spills (and a slice larger than the gateway append cap
+   * fails the POST, as before). Wired by cell-server from the GatewayHandle.
+   */
+  spillStore?: SpillStore
+  /**
+   * Spill any slice whose WAL bytes exceed this many bytes to `spillStore`
+   * (H3, §2.2). Default 4 MiB. Ignored when `spillStore` is absent.
+   */
+  sliceSpillBytes?: number
 }
+
+/** Default slice-spill threshold (H3): 4 MiB. */
+const DEFAULT_SLICE_SPILL_BYTES = 4 * 1024 * 1024
 
 /** A captured WAL slice submitted for commit. */
 export interface CommitSliceInput {
@@ -118,6 +144,8 @@ export class Committer {
    */
   private readonly seqByPath = new Map<string, number>()
   private chain: Promise<unknown> = Promise.resolve()
+  private readonly spillStore?: SpillStore
+  private readonly sliceSpillBytes: number
 
   private constructor(
     private readonly client: DsStreamClient,
@@ -126,7 +154,11 @@ export class Committer {
     producerId: string,
     epoch: number,
     recovery: RecoveryReport,
+    spillStore: SpillStore | undefined,
+    sliceSpillBytes: number,
   ) {
+    this.spillStore = spillStore
+    this.sliceSpillBytes = sliceSpillBytes
     this.journal = journal
     this.producerId = producerId
     this.epoch = epoch
@@ -157,6 +189,8 @@ export class Committer {
       meta.producerId,
       epoch,
       recovery,
+      opts.spillStore,
+      opts.sliceSpillBytes ?? DEFAULT_SLICE_SPILL_BYTES,
     )
   }
 
@@ -207,10 +241,25 @@ export class Committer {
   private async postSlice(
     input: CommitSliceInput,
     hopsLeft: number,
+    spill?: { objectRef: string; byteLength: number },
   ): Promise<CommitResult> {
     const era = this.tailer.currentEra
     const expectedOffset = this.tailer.head.offset
     const sliceHash = sha256Hex(input.bytes)
+    // H3 (§2.2): a slice over the spill threshold moves its WAL bytes out of
+    // band into the gateway object store, so the append body stays small (no
+    // gateway-cap limit on commit size). Spill once and reuse the ref across
+    // era-hop re-CASes (content-addressing makes re-upload idempotent anyway).
+    // sliceHash is always over the true WAL bytes — the tailer re-verifies it
+    // after fetching the spilled bytes back.
+    if (
+      spill === undefined &&
+      this.spillStore !== undefined &&
+      input.bytes.byteLength > this.sliceSpillBytes
+    ) {
+      const { ref } = await this.spillStore.put(input.bytes)
+      spill = { objectRef: ref, byteLength: input.bytes.byteLength }
+    }
     const frame: WFrame = {
       type: 'W',
       header: {
@@ -222,8 +271,12 @@ export class Committer {
         baseLsn: formatLsn(input.baseLsn),
         endLsn: formatLsn(input.endLsn),
         sliceHash,
+        ...(spill
+          ? { objectRef: spill.objectRef, byteLength: spill.byteLength }
+          : {}),
       },
-      wal: input.bytes,
+      // Spilled frames carry EMPTY inline wal (the bytes live in the store).
+      wal: spill ? new Uint8Array(0) : input.bytes,
     }
     // N frames ride the winning POST (M3, §10.2): same append body, same
     // expectedOffset as the W frame. Rebuilt fresh on every attempt (era
@@ -242,6 +295,12 @@ export class Committer {
     }))
     const frames: Frame[] = [frame, ...nFrames]
     const body = encodeAppend(frames)
+    // For the LOCAL tailer advance we hold the real bytes in hand, so hand the
+    // tailer a frame carrying them (keeping objectRef for provenance) — it
+    // hash-verifies against the true bytes and never round-trips the store.
+    const localFrames: Frame[] = spill
+      ? [{ ...frame, wal: input.bytes }, ...nFrames]
+      : frames
     const seqToken = casToken(era.ordinal, expectedOffset)
     const producer = {
       id: this.producerId,
@@ -280,7 +339,7 @@ export class Committer {
           // frames. Re-download from the pre-append boundary instead.
           await this.tailer.catchUp()
         } else if (this.tailer.head.offset === expectedOffset) {
-          this.tailer.advanceLocal(frames, res.nextOffset)
+          this.tailer.advanceLocal(localFrames, res.nextOffset)
         }
         // else: a concurrent catch-up (checkpoint/rotation workers read the
         // tailer outside the append mutex) already ingested our own bytes
@@ -312,7 +371,7 @@ export class Committer {
           // lost race — the caller rebases and re-executes.
           return { landed: false }
         }
-        return this.postSlice(input, hopsLeft - 1)
+        return this.postSlice(input, hopsLeft - 1, spill)
       }
       case 'stale-epoch':
         this.journal.resolve(input.commitId)

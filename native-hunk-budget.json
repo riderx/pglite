@@ -1,4 +1,5 @@
 {
+  "src/backend/access/heap/pruneheap.c": 2,
   "src/backend/access/transam/clog.c": 1,
   "src/backend/access/transam/multixact.c": 1,
   "src/backend/access/transam/slru.c": 3,

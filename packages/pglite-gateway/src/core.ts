@@ -109,7 +109,9 @@ export class GatewayCore {
 
   constructor(opts: GatewayCoreOpts) {
     this.dataRoot = opts.dataRoot
-    this.checkpointFormat = opts.checkpointFormat ?? 2
+    // W4: default to v3 (per-file content-addressed + manifest) so fresh
+    // lineages are lazy-worker-capable; explicit 1/2 still supported.
+    this.checkpointFormat = opts.checkpointFormat ?? 3
   }
 
   /** The embedded Durable Streams base URL (valid after `start()`). */

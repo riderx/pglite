@@ -61,6 +61,8 @@ export interface LazyAttachOpts {
   chunkBytes?: number
   workerUrl?: WorkerCellOpenOpts['workerUrl']
   commitGate?: boolean
+  /** H2: suppress read-cell WAL (opportunistic pruning) on this cell. */
+  suppressReadWal?: boolean
   dataSabBytes?: number
 }
 
@@ -128,6 +130,7 @@ export async function lazyAttach(
   const cell = await WorkerCell.open(opts.workDir, {
     expectedHeadLsn: opts.snapEnd,
     commitGate: opts.commitGate,
+    suppressReadWal: opts.suppressReadWal,
     workerUrl: opts.workerUrl,
     dataSabBytes: opts.dataSabBytes,
     lazy: {

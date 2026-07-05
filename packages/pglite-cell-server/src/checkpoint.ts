@@ -108,7 +108,7 @@ export async function checkpointDatabase(
     // NEXT wake/attach gets the lazy skeleton + ranged chunk faults.
     let checkpointRef: string
     let objectBytes: number
-    if (runtime.opts.cellMode === 'lazy-worker') {
+    if (runtime.cellMode === 'lazy-worker') {
       const v3 = await packDatadirV3(runtime.baseDirs.canonicalDir, {
         put: (bytes) => runtime.gateway.putObject(bytes),
       })

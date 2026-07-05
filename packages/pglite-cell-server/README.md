@@ -59,6 +59,45 @@ wake replays zero W slices), and `checkpointEveryBytes` (auto-cadence after
 landed commits). A hibernated database scales to zero; the next connect wakes it
 from checkpoint + tail.
 
+### Cell mode & the lazy-worker default (M7 W4)
+
+`opts.cellMode` selects how a cell attaches:
+
+| mode | behavior |
+| --- | --- |
+| `'auto'` (**default**) | picks `'lazy-worker'` when the database's latest checkpoint is v3-capable AND the gateway supports ranged object reads, else `'nodefs'` (v1/v2 lineages) |
+| `'lazy-worker'` | worker-hosted cell over `LazyCellFS`: eager skeleton hydrated at attach, relation chunks fault in on demand via the gateway's ranged reads (256 KiB, chunk-cached fleet-wide) |
+| `'nodefs'` | plain in-process cell from a full local datadir copy |
+
+`GatewayCore`'s `checkpointFormat` now defaults to **3** (per-file
+content-addressed + manifest), so fresh lineages are lazy-worker-capable.
+Override the mode with `PGLITE_CELL_MODE=nodefs|lazy-worker`.
+
+### Slice spill (H3, §2.2)
+
+A single commit whose WAL slice exceeds `opts.sliceSpillBytes` (**default
+4 MiB**) uploads its bytes to the gateway object store and rides the era stream
+as a spilled `W` frame (`objectRef` + `byteLength`, empty inline WAL). The
+tailer / materializer resolve the bytes via the store and re-verify `sliceHash`.
+This lifts the gateway append-cap limit on commit size — a multi-MiB bulk insert
+commits in one slice.
+
+### Watchdog (§11.2 basics)
+
+`opts.statementTimeoutMs` arms two lines of defense per session:
+
+1. **`statement_timeout`** (first line). NOTE: the single-backend WASM build has
+   no interval-timer / signal delivery, so `statement_timeout` does **not**
+   actually fire for CPU/sleep-bound statements — it is wired best-effort only.
+2. **JS watchdog** (second, real line, lazy-worker mode). A statement that
+   outlasts ~4× the timeout trips the host, which `terminate()`s the worker and
+   fatally resets that session. The host stays healthy — other sessions and a
+   fresh reconnect are unaffected.
+
+Worker `resourceLimits` default to `maxOldGenerationSizeMb: 512`,
+`stackSizeMb: 8` (overridable) so a runaway cannot exhaust host memory before
+the watchdog fires.
+
 ## The proxy (`CellProxyServer`)
 
 **Cell-per-connection** (§14.4): one TCP connection = one `HostSession` = one

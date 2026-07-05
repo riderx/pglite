@@ -50,6 +50,32 @@ const OCTET = 'application/octet-stream'
 
 export type FetchImpl = typeof fetch
 
+/**
+ * Transient socket errors (ECONNRESET / socket hang up) seen under heavy
+ * concurrent load — e.g. the rotation suite hammering one embedded DS server.
+ * A GET read carries no side effect, so a bounded retry is safe (W2: reads are
+ * idempotent) and closes a known flaky-test gap without masking real faults.
+ */
+function isTransientSocketError(err: unknown): boolean {
+  const code = (err as { code?: string })?.code
+  if (code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'EPIPE') {
+    return true
+  }
+  const msg = (
+    err instanceof Error ? err.message : String(err ?? '')
+  ).toLowerCase()
+  const cause = (err as { cause?: unknown })?.cause
+  return (
+    msg.includes('econnreset') ||
+    msg.includes('socket hang up') ||
+    msg.includes('other side closed') ||
+    (cause !== undefined && cause !== err && isTransientSocketError(cause))
+  )
+}
+
+/** Max GET attempts on a transient socket error before rethrowing. */
+const MAX_READ_ATTEMPTS = 3
+
 /** PUT create conflicted with an existing stream of different config (409). */
 export class StreamConfigConflictError extends Error {
   constructor(public readonly body: string) {
@@ -306,10 +332,22 @@ export class DsStreamClient {
   ): Promise<ReadResult> {
     const qs = new URLSearchParams({ [OFFSET_QUERY_PARAM]: opts.offset })
     if (opts.live) qs.set(LIVE_QUERY_PARAM, opts.live)
-    const res = await this.fetchImpl(this.url(path) + '?' + qs.toString(), {
-      method: 'GET',
-      headers: { 'Accept-Encoding': 'identity' },
-    })
+    const url = this.url(path) + '?' + qs.toString()
+    // Bounded retry on transient socket resets — GET is idempotent (W2-safe).
+    let res: Awaited<ReturnType<FetchImpl>>
+    for (let attempt = 1; ; attempt++) {
+      try {
+        res = await this.fetchImpl(url, {
+          method: 'GET',
+          headers: { 'Accept-Encoding': 'identity' },
+        })
+        break
+      } catch (err) {
+        if (attempt >= MAX_READ_ATTEMPTS || !isTransientSocketError(err)) {
+          throw err
+        }
+      }
+    }
     if (res.status !== 200 && res.status !== 204) {
       throw new StreamHttpError(res.status, await res.text())
     }

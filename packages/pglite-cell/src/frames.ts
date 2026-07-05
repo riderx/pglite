@@ -41,6 +41,18 @@ export interface WFrameHeader extends BaseHeader {
   baseLsn: string
   endLsn: string
   sliceHash: string
+  /**
+   * Slice-spill (H3, §2.2): when the WAL slice exceeds the committer's
+   * `sliceSpillBytes` threshold its bytes move out of band — uploaded to
+   * the gateway object store and referenced here — and the frame's inline
+   * `wal` is EMPTY. `objectRef` is the store ref, `byteLength` the spilled
+   * slice length (a resolve sanity check). Tailer/materializer/live-apply
+   * resolve the bytes via the store and verify `sliceHash` after fetch.
+   * Both fields absent ⇒ an ordinary inline W frame (no wire-type change:
+   * this stays uppercase 'W').
+   */
+  objectRef?: string
+  byteLength?: number
 }
 
 export interface WFrame {

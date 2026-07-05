@@ -60,6 +60,14 @@ export interface CellOpenOpts {
    * verdict and `commitGateDiscard()` on loss. Default true.
    */
   commitGate?: boolean
+  /**
+   * H2 (§14.8): suppress read-cell WAL by disabling opportunistic HOT
+   * pruning (`heap_page_prune_opt` early-returns natively). Set on cells
+   * opened in a READ role so a hot-page read loop never emits a prune
+   * record. Default false (write cells prune as vanilla). Toggle at
+   * runtime with `setSuppressReadWal()` on a write-upgrade.
+   */
+  suppressReadWal?: boolean
 }
 
 /** §9 configuration pins asserted at every open. */
@@ -175,6 +183,9 @@ export class Cell {
       // M5e commit gate (§3.6): armed by default — vanilla behavior
       // returns only when explicitly disabled.
       if (opts.commitGate !== false) pg.Module._pgl_commit_gate_set(1)
+      // H2 (§14.8): a read-role cell suppresses opportunistic pruning so it
+      // never writes WAL of its own. Default off ⇒ vanilla pruning.
+      if (opts.suppressReadWal) pg.Module._pgl_set_suppress_read_wal(1)
       const cell = new Cell(dir, pg, opts.expectedHeadLsn)
       cell.maybeSnapshotBase()
       return cell
@@ -187,6 +198,16 @@ export class Cell {
   /** The current WAL insert LSN (a commit-time bookmark). */
   async bookmark(): Promise<bigint> {
     return currentInsertLsn(this.pg)
+  }
+
+  /**
+   * H2: toggle read-cell WAL suppression at runtime. The host clears it on
+   * a read→write upgrade (so the upgraded cell prunes and captures as a
+   * normal write cell) and may set it when parking a cell back into a read
+   * role. `on=false` restores vanilla pruning.
+   */
+  setSuppressReadWal(on: boolean): void {
+    this.pg.Module._pgl_set_suppress_read_wal(on ? 1 : 0)
   }
 
   /**

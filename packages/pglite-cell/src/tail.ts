@@ -38,7 +38,30 @@ export interface TailSlice {
   endLsn: bigint
   kind: 'commit' | 'sync' | 'floors'
   commitId: string
+  /**
+   * The WAL bytes. Populated for inline W frames immediately; for spilled
+   * frames (H3) it is empty until `resolveSpilled()` fetches and hash-verifies
+   * the bytes from the store — the tailer's async entry points run that pass
+   * before returning, so consumers always observe resolved bytes.
+   */
   bytes: Uint8Array
+}
+
+/**
+ * Out-of-band slice store the tailer resolves spilled W frames through (H3,
+ * §2.2). Cell-server passes the GatewayHandle's object store here.
+ */
+export interface TailSpillStore {
+  get(ref: string): Promise<Uint8Array>
+}
+
+/** Internal: a spilled slice awaiting resolution from the store. */
+interface PendingSpill {
+  slice: TailSlice
+  objectRef: string
+  byteLength: number
+  sliceHash: string
+  commitId: string
 }
 
 /** The era the tailer is currently reading (moves forward on each hop). */
@@ -59,6 +82,12 @@ export interface EraTailerOpts {
   baseOffset: string
   /** WAL head LSN at `baseOffset` (the era's snapEnd for full tails). */
   baseLsn: bigint
+  /**
+   * Out-of-band store for resolving spilled W frames (H3). Optional: without
+   * it, encountering a spilled frame throws (the tail cannot be read). Every
+   * lineage that may carry spilled commits must supply it.
+   */
+  store?: TailSpillStore
 }
 
 function sha256Hex(bytes: Uint8Array): string {
@@ -85,6 +114,9 @@ export class EraTailer {
   private catchUpChain: Promise<unknown> = Promise.resolve()
   /** Terminal S seen in the current era, pending an era hop. */
   private pendingSeal: SFrameHeader | null = null
+  /** Spilled W slices (H3) awaiting store resolution, in dispatch order. */
+  private readonly pendingSpills: PendingSpill[] = []
+  private readonly store?: TailSpillStore
 
   /** Ordered, verified W slices (oldest first). */
   readonly slices: TailSlice[] = []
@@ -135,6 +167,41 @@ export class EraTailer {
     this.reader = new PositionCheckedReader(opts.baseOffset)
     this.headOffset = opts.baseOffset
     this.headLsn = opts.baseLsn
+    this.store = opts.store
+  }
+
+  /**
+   * Resolve every spilled W slice queued during the last sync feed (H3):
+   * fetch its bytes from the store, verify `byteLength` and `sliceHash`, and
+   * fill the slice's `bytes` in place. Called by the async entry points after
+   * their sync ingest so consumers of `slices` never see an empty spilled
+   * slice. Idempotent (drains the queue).
+   */
+  private async resolveSpilled(): Promise<void> {
+    while (this.pendingSpills.length > 0) {
+      const p = this.pendingSpills.shift()!
+      if (!this.store) {
+        throw new ProtocolError(
+          `W slice ${p.commitId} is spilled (objectRef ${p.objectRef}) but ` +
+            `this tailer has no spill store configured`,
+        )
+      }
+      const bytes = await this.store.get(p.objectRef)
+      if (bytes.byteLength !== p.byteLength) {
+        throw new ProtocolError(
+          `spilled W slice ${p.commitId}: store returned ` +
+            `${bytes.byteLength} bytes, header declared ${p.byteLength}`,
+        )
+      }
+      const hash = sha256Hex(bytes)
+      if (hash !== p.sliceHash) {
+        throw new ProtocolError(
+          `spilled W slice ${p.commitId} sliceHash mismatch after fetch: ` +
+            `header ${p.sliceHash}, computed ${hash}`,
+        )
+      }
+      p.slice.bytes = bytes
+    }
   }
 
   /** The era the tailer is currently reading (advances on era hops). */
@@ -213,6 +280,7 @@ export class EraTailer {
       }
       if (atTail) break
     }
+    await this.resolveSpilled() // H3: fill any spilled slices' bytes
     return this.slices.length - before
   }
 
@@ -242,6 +310,7 @@ export class EraTailer {
       this._closed = true
       throw new WedgedEraError(this.era.id, this.reader.boundary)
     }
+    await this.resolveSpilled() // H3: fill any spilled slices' bytes
     return this.slices.length - before
   }
 
@@ -375,6 +444,33 @@ export class EraTailer {
                 `${this.headLsn} — contiguity broken`,
             )
           }
+          const spilled =
+            frame.header.objectRef !== undefined && frame.wal.length === 0
+          if (spilled) {
+            // H3: the WAL bytes live in the object store. Record the slice
+            // with empty bytes and queue it for async resolution + hash
+            // verification (an async entry point runs resolveSpilled before
+            // returning). LSN chaining stays strict here from the header.
+            const slice: TailSlice = {
+              baseLsn,
+              endLsn,
+              kind: frame.header.kind,
+              commitId: frame.header.commitId,
+              bytes: new Uint8Array(0),
+            }
+            this.slices.push(slice)
+            this.pendingSpills.push({
+              slice,
+              objectRef: frame.header.objectRef!,
+              byteLength: frame.header.byteLength ?? 0,
+              sliceHash: frame.header.sliceHash,
+              commitId: frame.header.commitId,
+            })
+            this.headLsn = endLsn
+            break
+          }
+          // Inline (incl. the committer's local advance of a spilled frame,
+          // which carries the real bytes): verify the hash immediately.
           const hash = sha256Hex(frame.wal)
           if (hash !== frame.header.sliceHash) {
             throw new ProtocolError(

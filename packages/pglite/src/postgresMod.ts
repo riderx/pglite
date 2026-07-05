@@ -127,6 +127,9 @@ export interface PostgresMod
   ) => number
   // M5e commit gate (pgl_commit_gate.c, design §3.6/§14.2): deferred
   // ON COMMIT DELETE ROWS truncates, executed post-CAS-verdict.
+  // H2 (pgl_read_wal.c, design §14.8): read-cell WAL suppression —
+  // disables opportunistic HOT pruning so a read cell writes no WAL.
+  _pgl_set_suppress_read_wal: (on: number) => void
   _pgl_commit_gate_set: (on: number) => void
   _pgl_commit_gate_pending: () => number
   _pgl_commit_gate_run: () => number

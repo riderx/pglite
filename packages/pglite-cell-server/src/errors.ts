@@ -42,6 +42,23 @@ export class FatalSessionResetError extends Error {
 }
 
 /**
+ * W4 watchdog second line (§11.2): a statement ran past the JS watchdog
+ * deadline (ignoring `statement_timeout` — a tight non-interruptible loop).
+ * The host terminated the worker and fatally reset the session; the host
+ * itself stays healthy. Reconnect and retry.
+ */
+export class SessionWatchdogError extends Error {
+  constructor(public readonly deadlineMs: number) {
+    super(
+      `session watchdog: a statement ran past ${deadlineMs}ms without ` +
+        `yielding to statement_timeout; the worker was terminated and the ` +
+        `session reset — reconnect and retry`,
+    )
+    this.name = 'SessionWatchdogError'
+  }
+}
+
+/**
  * A tainted (pinned) session outlived its gc-pin TTL. Its pinned base can no
  * longer be protected from GC, so the session gets the same fatal reset a
  * backend crash would produce (§3.3 pinned-session rules).

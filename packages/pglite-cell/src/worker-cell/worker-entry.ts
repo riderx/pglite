@@ -150,6 +150,8 @@ function callNative(fn: NativeFn, args: (number | bigint)[]): unknown {
       return mod._pgl_commit_gate_run()
     case 'commit_gate_discard':
       return mod._pgl_commit_gate_discard()
+    case 'set_suppress_read_wal':
+      return mod._pgl_set_suppress_read_wal(n(0))
     case 'set_sequence_lease':
       return mod._pgl_set_sequence_lease(n(0), b(1))
     case 'clear_sequence_leases':
