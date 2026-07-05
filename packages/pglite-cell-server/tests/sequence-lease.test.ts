@@ -112,9 +112,9 @@ describe('M5a native sequence-lease clamp (§5.3)', () => {
           `insert into t (v) select 'b-' || g from generate_series(1, 20) g`,
         )
 
-        const rows = (
-          await c.query(`select id from t order by id`)
-        ).rows.map((r: { id: string }) => BigInt(r.id))
+        const rows = (await c.query(`select id from t order by id`)).rows.map(
+          (r: { id: string }) => BigInt(r.id),
+        )
         expect(rows.length).toBe(21)
         expect(new Set(rows.map(String)).size).toBe(21) // all distinct
 
@@ -143,9 +143,9 @@ describe('M5a native sequence-lease clamp (§5.3)', () => {
           BigInt(a.start) < BigInt(b.start) ? -1 : 1,
         )
         for (let i = 1; i < sorted.length; i++) {
-          expect(
-            BigInt(sorted[i].start) >= BigInt(sorted[i - 1].end),
-          ).toBe(true)
+          expect(BigInt(sorted[i].start) >= BigInt(sorted[i - 1].end)).toBe(
+            true,
+          )
         }
       } finally {
         await ctx.teardown()

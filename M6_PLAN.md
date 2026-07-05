@@ -52,10 +52,16 @@ future work (needs product signal first).
 - `graduateDatabase(db)`: logical export via `pglite-tools`' pg_dump on
   a linearizable-fresh cell → SQL artifact + manifest snapshot (the
   documented migration path);
-- **OQ7 experiment** (one afternoon, now cheap): materialize a datadir
-  from the stream, boot it under the local `postgres:18` docker image,
-  `pg_dumpall` both sides, diff — physical graduation feasibility
-  report recorded in the plan file.
+- **OQ7 experiment — RUN, ANSWER: NO (definitive).** A cleanly-closed
+  PGlite 18.3 (wasm32) datadir booted under stock native `postgres:18`
+  fails at the pg_control compatibility gate: *"initialized without
+  USE_FLOAT8_BYVAL but the server was compiled with USE_FLOAT8_BYVAL"*.
+  Inherent to 32-bit wasm vs 64-bit native Datum passing — not a
+  configuration issue, and no hosted target runs 32-bit Postgres.
+  **Physical graduation to stock Postgres is closed; logical
+  dump/restore is THE graduation path** (as the design already treats
+  as primary). Design doc §12 "ecosystem risks" and OQ7 updated at M6
+  close.
 
 ## Exit criteria
 

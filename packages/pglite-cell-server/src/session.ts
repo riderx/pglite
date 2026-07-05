@@ -21,7 +21,12 @@
 // runners over it.
 
 import { randomUUID } from 'node:crypto'
-import { Cell, formatLsn } from '@electric-sql/pglite-cell'
+import {
+  Cell,
+  applyLiveTail,
+  formatLsn,
+  writeWalRange,
+} from '@electric-sql/pglite-cell'
 import type { Results } from '@electric-sql/pglite'
 import { serialize } from '@electric-sql/pg-protocol'
 import type { CellDirLease } from './base-dir'
@@ -804,7 +809,23 @@ export class HostSession {
   private async ensureCell(): Promise<void> {
     if (this.cell !== null) {
       const inTxn = this.cell.db.isInTransaction()
-      if (inTxn || this._tainted) return
+      if (inTxn) return
+      if (this._tainted) {
+        // M5b live tail apply: a tainted (pinned) READ session may still
+        // advance IN PLACE when the new tail is live-appliable — its temp
+        // state survives because the cell is never recycled. When the
+        // gate rejects (fallback would need a recycle), the session
+        // simply STAYS PINNED at its base — the M1 contract unchanged.
+        if (
+          this.mode === 'read' &&
+          this.freshness.mode !== 'local' &&
+          this.freshness.mode !== 'pinned' &&
+          this.streamPos.lsn < this.runtime.watermark.lsn
+        ) {
+          await this.tryLiveAdvance()
+        }
+        return
+      }
       if (this.freshness.mode === 'linearizable') {
         // §7 linearizable: confirm the TRUE head (catch-up past the
         // observed tail) before the watermark gate — the only mode that
@@ -812,6 +833,10 @@ export class HostSession {
         await this.runtime.linearizableSync()
       }
       if (!this.shouldAdvance()) return
+      // M5b live tail apply: prefer advancing the LIVE cell (eager set via
+      // pgl_* primitives + FPI restore) over recycle+re-materialize. Falls
+      // through to the recycle path when the batch is not live-appliable.
+      if (this.mode === 'read' && (await this.tryLiveAdvance())) return
       await this.destroyCell()
     } else if (this.freshness.mode === 'linearizable' && !this._tainted) {
       await this.runtime.linearizableSync()
@@ -877,6 +902,78 @@ export class HostSession {
    * `local` and `pinned` never advance; `bounded-stale` gates only when
    * the base's wall-clock age exceeds Δ.
    */
+  /**
+   * M5b live tail apply v1: advance the LIVE read-attached cell past the
+   * foreign tail without recycling it. The slice bytes land in the cell's
+   * own pg_wal (scratch space for a read cell — never captured), get
+   * classified by pgl_walscan inside the cell's own WASM, and — iff every
+   * touched block carries a restorable full-page image (the v1 gate) —
+   * the §6.3 eager set is applied through the pgl_* primitives. Session
+   * temp state survives the advance. Returns false (cell untouched, no
+   * stream position change) whenever the gate rejects, the slices do not
+   * chain from this session's base, or anything at all looks off — the
+   * caller then uses the existing recycle-advance (or stays pinned).
+   */
+  private async tryLiveAdvance(): Promise<boolean> {
+    const cell = this.cell
+    if (cell === null || this.mode !== 'read') return false
+    try {
+      await this.runtime.tailer.catchUp()
+      const head = this.runtime.tailer.head
+      if (head.lsn <= this.streamPos.lsn) return false
+      const slices = this.runtime.tailer.slicesSince(this.streamPos.lsn)
+      if (slices.length === 0) return false
+      // The batch must chain contiguously from this session's exact base.
+      let expect = this.streamPos.lsn
+      for (const s of slices) {
+        if (s.baseLsn !== expect) return false
+        expect = s.endLsn
+      }
+      if (expect !== head.lsn) return false
+      // Transplant the bytes into the live cell's pg_wal (NODEFS
+      // passthrough — probed by the M5b live-apply suite), then classify
+      // and apply. Read cells never publish, so overwriting their local
+      // (unpublished boot) WAL range with foreign bytes is safe: pg_wal
+      // past the cell's own insert position is scratch.
+      for (const s of slices) {
+        writeWalRange(cell.dir, s.baseLsn, s.bytes)
+      }
+      if (process.env.PGLITE_LIVE_APPLY_DEBUG === '1') {
+        console.log(
+          '[live-adv]',
+          this.id,
+          'pos',
+          this.streamPos.lsn,
+          'head',
+          head.lsn,
+          'slices',
+          slices.map((x) => [x.baseLsn, x.endLsn, x.kind]),
+        )
+      }
+      const res = applyLiveTail(cell.db, cell.dir, this.streamPos.lsn, head.lsn)
+      if (!res.applied) return false
+      this.streamPos = { offset: head.offset, lsn: head.lsn }
+      this.lastAdvanceAt = Date.now()
+      return true
+    } catch (err) {
+      if (process.env.PGLITE_LIVE_APPLY_DEBUG === '1') {
+        console.log('[live-apply] mid-apply error:', err)
+      }
+      // The gate rejects BEFORE anything mutates, so an exception here
+      // means a mid-apply failure: the live cell can no longer be
+      // trusted. Untainted sessions recycle (the caller's fallback);
+      // tainted sessions cannot survive the recycle — fatal reset,
+      // never a silent continuation (§3.3).
+      await this.destroyCell()
+      if (this._tainted) {
+        this.dead = `live tail apply failed on a pinned session: ${String(err)}`
+        this.runtime.removeSession(this)
+        throw new FatalSessionResetError(this.taintNames())
+      }
+      return false
+    }
+  }
+
   private shouldAdvance(): boolean {
     switch (this.freshness.mode) {
       case 'local':

@@ -367,7 +367,8 @@ export function scanBackendOutput(output: Uint8Array): BackendScan {
       scan.hasError = true
       if (scan.errorCode === null) {
         scan.errorCode = (msg as unknown as { code?: string }).code ?? 'XX000'
-        scan.errorDetail = (msg as unknown as { detail?: string }).detail ?? null
+        scan.errorDetail =
+          (msg as unknown as { detail?: string }).detail ?? null
       }
     } else if (msg.name === 'commandComplete') {
       scan.lastCommandTag = (msg as unknown as { text: string }).text

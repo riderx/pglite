@@ -61,6 +61,60 @@ export interface PostgresMod
   _pgl_set_sequence_lease: (seqOid: number, leaseEnd: bigint) => void
   _pgl_clear_sequence_leases: () => void
   _pgl_reset_sequence_caches: () => void
+  // WAL-range scanner (postgres-pglite src/backend/pglite/pgl_walscan.c,
+  // design §14.2): per-record JSON classification of a [start, end) LSN
+  // range read straight from pg_wal segment files.
+  _pgl_walscan_begin: (start: bigint, end: bigint, tli: number) => number
+  _pgl_walscan_next: () => number
+  _pgl_walscan_block_image: (blockId: number, dst: number) => number
+  _pgl_walscan_end_scan: () => void
+  // Live tail-apply primitives (pgl_apply.c, design §6.3/§5.1).
+  _pgl_current_insert_lsn: () => bigint
+  _pgl_process_invals: (
+    msgsPtr: number,
+    nmsgs: number,
+    relcacheInitFileInval: boolean,
+    dbId: number,
+    tsId: number,
+  ) => void
+  _pgl_advance_identity: (
+    nextFullXid: bigint,
+    nextOid: number,
+    nextMulti: number,
+    nextOffset: number,
+  ) => void
+  _pgl_advance_xid_past: (xid: number) => void
+  _pgl_clog_set: (xid: number, status: number) => void
+  _pgl_clog_zero_page: (pageno: bigint) => void
+  _pgl_multixact_zero_off_page: (pageno: bigint) => void
+  _pgl_multixact_zero_mem_page: (pageno: bigint) => void
+  _pgl_multixact_record: (
+    mid: number,
+    moff: number,
+    nmembers: number,
+    membersPtr: number,
+  ) => void
+  _pgl_invalidate_xact_caches: () => void
+  _pgl_drop_relation_buffers_range: (
+    spcOid: number,
+    dbOid: number,
+    relNumber: number,
+    forkNum: number,
+    firstBlock: number,
+    blockCount: number,
+  ) => void
+  _pgl_smgr_release: (spcOid: number, dbOid: number, relNumber: number) => void
+  _pgl_smgr_destroy_all: () => void
+  // Read-set capture (pgl_readset.c, design §4.1) — machinery for the M5d
+  // rebase validator. Entries are packed uint32 x5.
+  _pgl_readset_enable: (on: number) => void
+  _pgl_readset_reset: () => void
+  _pgl_readset_count: () => number
+  _pgl_readset_overflowed: () => number
+  _pgl_readset_snapshot: () => number
+  _malloc: (size: number) => number
+  _free: (ptr: number) => void
+  HEAPU8: Uint8Array
   _pgl_startPGlite: () => void
   _pgl_getMyProcPort: () => number
   _pgl_sendConnData: () => void
