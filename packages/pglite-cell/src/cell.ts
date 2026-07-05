@@ -10,6 +10,31 @@ import { readControl, readWalRange } from './datadir'
 import { shutdownCheckpointEnd } from './lsn'
 import { ConfigPinError, ZeroBootWalError } from './errors'
 
+/** One captured page pin (read-set ring entry, kind 0 — design §4.1). */
+export interface ReadSetPage {
+  spc: number
+  db: number
+  rel: number
+  fork: number
+  blk: number
+}
+
+/** One captured nblocks probe (read-set ring entry, kind 1). */
+export interface ReadSetNblocks {
+  spc: number
+  db: number
+  rel: number
+  fork: number
+  nblocks: number
+}
+
+/** The harvested read set of one transaction (M5d rebase validation). */
+export interface ReadSetSnapshot {
+  pins: ReadSetPage[]
+  nblocks: ReadSetNblocks[]
+  overflowed: boolean
+}
+
 /** A captured WAL byte range `(baseLsn, endLsn]`, ready to commit. */
 export interface CapturedSlice {
   baseLsn: bigint
@@ -124,6 +149,13 @@ export class Cell {
         }
       }
       if (mismatches.length > 0) throw new ConfigPinError(mismatches)
+
+      // M5d v1 escape hatch (design §4.2 alternative): index-only scans
+      // consume VM-bit CONTENT that page-LSN validation cannot see
+      // (visibilitymap_clear does not stamp LSNs). Rather than build VM-bit
+      // content checks, cells simply never plan IOS. Session-level GUC on a
+      // single-backend instance; writes no WAL.
+      await pg.exec('set enable_indexonlyscan = off')
 
       const insertLsn = await currentInsertLsn(pg)
       if (insertLsn !== opts.expectedHeadLsn) {
@@ -339,6 +371,84 @@ export class Cell {
    */
   resetSequenceCaches(): void {
     this.pg.Module._pgl_reset_sequence_caches()
+  }
+
+  /**
+   * Enable read-set capture (design §4.1, M5d): resets the native ring
+   * and records every shared-buffer page pin + nblocks probe until
+   * disabled. Call at transaction start; harvest with readSetSnapshot()
+   * BEFORE anything else runs on the cell after a CAS loss.
+   */
+  readSetBegin(): void {
+    this.pg.Module._pgl_readset_enable(1)
+  }
+
+  /** Disable read-set capture (ring content stays readable). */
+  readSetEnd(): void {
+    this.pg.Module._pgl_readset_enable(0)
+  }
+
+  /**
+   * Copy the captured read set out of WASM memory. `overflowed` means the
+   * ring dropped entries — the validator must treat the transaction as
+   * unrebaseable (40001).
+   */
+  readSetSnapshot(): ReadSetSnapshot {
+    const mod = this.pg.Module
+    const n = mod._pgl_readset_count()
+    const ptr = mod._pgl_readset_snapshot()
+    const words = new Uint32Array(mod.HEAPU8.buffer, ptr, n * 5)
+    const pins: ReadSetPage[] = []
+    const nblocks: ReadSetNblocks[] = []
+    for (let i = 0; i < n; i++) {
+      const o = i * 5
+      const kindFork = words[o + 3]
+      const kind = kindFork >>> 24
+      const fork = kindFork & 0xffffff
+      if (kind === 0) {
+        pins.push({
+          spc: words[o],
+          db: words[o + 1],
+          rel: words[o + 2],
+          fork,
+          blk: words[o + 4],
+        })
+      } else {
+        nblocks.push({
+          spc: words[o],
+          db: words[o + 1],
+          rel: words[o + 2],
+          fork,
+          nblocks: words[o + 4],
+        })
+      }
+    }
+    return {
+      pins,
+      nblocks,
+      overflowed: mod._pgl_readset_overflowed() === 1,
+    }
+  }
+
+  /**
+   * Page LSN of one block at the current local state (rebase validation,
+   * §4.2): pinned-buffer BufferGetLSNAtomic — never an executor path.
+   * Returns 0n when the page is missing/truncated (caller 40001s).
+   */
+  pageLsn(
+    spc: number,
+    db: number,
+    rel: number,
+    fork: number,
+    blk: number,
+  ): bigint {
+    return this.pg.Module._pgl_page_lsn(spc, db, rel, fork, blk)
+  }
+
+  /** Current nblocks of a relation fork (fresh smgr lseek); 0xFFFFFFFF =
+   *  missing fork. */
+  relationNblocks(spc: number, db: number, rel: number, fork: number): number {
+    return this.pg.Module._pgl_relation_nblocks(spc, db, rel, fork)
   }
 
   /**

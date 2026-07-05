@@ -47,6 +47,10 @@ export interface WalRecord {
     | 'smgr_truncate'
     | 'dbase_create'
     | 'dbase_drop'
+    | 'heap_insert'
+    | 'heap_delete'
+    | 'heap_update'
+    | 'heap_multi_insert'
   // commit/abort
   subxids?: number[]
   /** Relfilelocator drops: [spc, db, rel][] */
@@ -79,6 +83,14 @@ export interface WalRecord {
   fork?: number
   blkno?: number
   flags?: number
+  // heap DML enumeration (M5d harvest, design §4.4): tuple offsets; block
+  // mapping is blocks[0] for insert/delete and update's NEW tuple,
+  // blocks[1] (when present, else blocks[0]) for update's OLD tuple.
+  offnum?: number
+  newOffnum?: number
+  oldOffnum?: number
+  ntuples?: number
+  offsets?: number[]
 }
 
 export class WalScanError extends Error {

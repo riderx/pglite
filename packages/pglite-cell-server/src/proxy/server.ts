@@ -485,7 +485,8 @@ export class CellProxyServer {
         this.teardown(conn)
         return
       }
-      if (process.env.PGL_DEBUG_ERR === '1') console.error('[proxy] fatal:', err)
+      if (process.env.PGL_DEBUG_ERR === '1')
+        console.error('[proxy] fatal:', err)
       this.write(
         conn,
         errorResponse({

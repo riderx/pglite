@@ -81,17 +81,57 @@ moved out of M5c — it follows the M5d rebase work. M5c as shipped:
   (temp-truncate after CAS) and mid-COMMIT loss handling without
   recycle.
 
-## M5d — logical re-apply + the full rebase ladder
+## M5d — logical re-apply + the full rebase ladder (SHIPPED)
 
-- Harvest → net-effect filter (local clog/subtrans) → re-apply through
-  heapam/index-AM/TOAST with one fresh XID at K (§4.4, C files);
-  deferred-trigger ctid remap; rebase taints (§4.5) incl. temp-write;
-  bounded loop (§4.7); `40001` only past the bounds. Session-state
-  taint lift (§3.3) via the in-place reset.
-- §16 rebase soundness suite: every verified failure mode as a test
-  (VM-bit deletes, extension phantoms, own-WAL masking, inval fencing ×3
-  carriers, aborted-subxact filtering, TOAST re-chunking, trigger
-  remap, sequence reset rules).
+As-built (2026-07-05) — the C-level re-apply was NOT needed; the shipped
+design is JS-orchestrated over three small native additions:
+
+- **Harvest = walscan enumeration + local heap re-read.** pgl_walscan's
+  heap DML records now carry tuple offsets (submodule commit), so the
+  host enumerates (rel, op, ctid, oldCtid) from the session's own WAL
+  range (B, localEnd]. Net-effect filtering (aborted subxacts dropped,
+  update chains collapsed) falls out of SAME-SESSION VISIBILITY: the
+  txn committed locally before capture (M1 architecture), so one
+  post-commit read by ctid returns exactly the committed net effect —
+  detoasted for free. No WAL tuple extraction (§12 class 2 closed by
+  construction).
+- **Validation (§4.2)**: `pgl_page_lsn` (pin + BufferGetLSNAtomic +
+  unpin — never executor paths) asserts pageLSN(K) <= B per captured
+  page; `pgl_relation_nblocks` (fresh smgr lseek) asserts the seqscan
+  freeze (min captured probe == nblocks(K)); the schema-epoch fence
+  intersects winner-tail invals (3 carriers, from the classified
+  walscan) with the txn's relation footprint. The read-set ring
+  (M5b) is armed per transaction in drive(); overflow ⇒ 40001.
+- **Re-apply = parameterized DML under
+  `session_replication_role = replica`** in ONE fresh txn at K
+  (triggers/RI suppressed — B-time effects are harvested data;
+  volatile fns never re-run — values ride as parameters; fresh XID
+  intrinsic). Pre-existing rows addressed by B-time ctid — sound
+  because validation proved their pages untouched. 23505 ⇒ 40001
+  (§4.0). Bounded: 2 rebase rounds, then 40001 (§4.7).
+- **v1 escape hatches** (documented approximations):
+  `enable_indexonlyscan = off` set at Cell.open (skips VM-bit content
+  machinery entirely); ctid/xmin/cmin/cmax/txid taints via
+  statement-text scan; identity/generated columns handled
+  (OVERRIDING SYSTEM VALUE / recompute).
+- §16 rebase soundness suite: tests/rebase.test.ts (12 modes — happy
+  path w/ stable serial+now(), winner-touched page, extension phantom
+  via nblocks, own-WAL masking, catalog fence (commit-record carrier;
+  VACUUM-inplace carrier shares the decode path, not separately
+  constructible in-suite), aborted-subxact filtering, TOAST 100KB,
+  uniqueness ⇒ 40001-never-23505, ctid taint, temp-write taint,
+  bounds exhaustion, proxy-level transparent success). Deferred-trigger
+  ctid remap is MOOT in the shipped design (replica role suppresses
+  the queues; harvested data already embodies their B-time effects).
+- Session-state taint contract unchanged: tainted sessions never enter
+  the ladder (fatal reset on loss, §3.3).
+- Submodule commits (paired branch, pushed): 5dd6592255 (pgl_page_lsn /
+  pgl_relation_nblocks / heap DML walscan decode — zero hunks in
+  existing files) and 9ef93a3b04 (two one-hunk gap fixes the suite
+  found: the M5b nblocks hook missed the table-AM branch, so seqscan
+  freezes were never captured; the M5c reset gate missed
+  smgrzeroextend, so bulk-extended file space survived in-place
+  resets).
 
 ## Sequencing note
 

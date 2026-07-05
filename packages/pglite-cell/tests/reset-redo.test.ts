@@ -139,10 +139,7 @@ let committerB: Committer
 let cellB: Cell
 let posB: bigint
 
-async function landCommit(
-  cell: Cell,
-  committer: Committer,
-): Promise<bigint> {
+async function landCommit(cell: Cell, committer: Committer): Promise<bigint> {
   const slice = await cell.captureSlice()
   expect(slice).not.toBeNull()
   const res = await committer.commitSlice({
@@ -283,9 +280,10 @@ describe('M5c: single-record redo live apply + in-place reset', () => {
       // Counters are exactly at base: the identity snapshot reads back
       // the rewound nextXid (crash-recovery-grade scope, §5.1).
       const mod = cellA.db.Module
-      const ident = JSON.parse(
-        mod.UTF8ToString(mod._pgl_get_identity()),
-      ) as { nextXid: string; insertLsn: string }
+      const ident = JSON.parse(mod.UTF8ToString(mod._pgl_get_identity())) as {
+        nextXid: string
+        insertLsn: string
+      }
       expect(BigInt(ident.nextXid)).toBe(baseXid)
       expect(BigInt(ident.insertLsn)).toBe(posA)
 

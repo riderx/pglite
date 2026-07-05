@@ -130,6 +130,22 @@ export interface PostgresMod
   _pgl_readset_count: () => number
   _pgl_readset_overflowed: () => number
   _pgl_readset_snapshot: () => number
+  // Rebase validation reads (pgl_apply.c, design §4.2, M5d): pinned-buffer
+  // page-LSN peek (0 = missing/truncated page) and fresh smgr nblocks
+  // (0xFFFFFFFF = missing fork).
+  _pgl_page_lsn: (
+    spcOid: number,
+    dbOid: number,
+    relNumber: number,
+    forkNum: number,
+    blockNum: number,
+  ) => bigint
+  _pgl_relation_nblocks: (
+    spcOid: number,
+    dbOid: number,
+    relNumber: number,
+    forkNum: number,
+  ) => number
   _malloc: (size: number) => number
   _free: (ptr: number) => void
   HEAPU8: Uint8Array

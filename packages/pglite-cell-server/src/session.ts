@@ -7,7 +7,15 @@
 //   read-attached cell captures a write       -> discard + write-upgrade +
 //                                                re-execute (one-shots) or
 //                                                40001 (interactive COMMIT)
-//   interactive txn loses at COMMIT           -> 40001, session survives
+//   interactive txn loses at COMMIT           -> M5d: transparent REBASE
+//                                                (harvest → advance to K →
+//                                                validate §4.2 → re-apply
+//                                                §4.4 → CAS, ≤2 rounds);
+//                                                any gate failure -> 40001,
+//                                                session survives
+//   interactive loss w/ rebase taint (§4.5)   -> 40001 (ctid/xmin/... scan,
+//                                                temp-write-during-attempt,
+//                                                ring overflow, DDL in txn)
 //   tainted session loses                     -> fatal session reset
 //   read-only (empty slice)                   -> never CAS'd
 //
@@ -25,8 +33,16 @@ import {
   Cell,
   applyLiveTail,
   formatLsn,
+  walscanRange,
   writeWalRange,
 } from '@electric-sql/pglite-cell'
+import type { CapturedSlice, WalRecord } from '@electric-sql/pglite-cell'
+import {
+  harvestRebasePlan,
+  reapplyPlan,
+  scanRebaseTaint,
+  validateAtK,
+} from './rebase'
 import type { Results } from '@electric-sql/pglite'
 import { serialize } from '@electric-sql/pg-protocol'
 import type { CellDirLease } from './base-dir'
@@ -239,6 +255,16 @@ export class HostSession {
   private notifBuffer: { channel: string; payload: string }[] = []
   /** The runtime listen-union version applied to the current cell. */
   private cellListenVersion = -1
+  /**
+   * M5d rebase taint (§4.5): set when any statement text of the CURRENT
+   * transaction observed ctid/xmin/cmin/cmax/txid (statement-text scan —
+   * documented v1 approximation). Cleared at every transaction start.
+   */
+  private rebaseTaint: string | null = null
+  /** Statement text of the unit currently driving (taint scan input). */
+  private currentUnitText: string | null = null
+  /** Cumulative rebase counters (TEST HOOK / diagnostics). */
+  readonly rebaseStats = { attempts: 0, landed: 0, failed: 0 }
 
   /** TEST HOOK (§16 client-observation property): unit execution events. */
   _unitObserver: ((ev: UnitObservation) => void) | null = null
@@ -322,6 +348,7 @@ export class HostSession {
   }
 
   private async execInner(sql: string): Promise<ExecResult> {
+    this.currentUnitText = sql
     const r = await this.drive<Results[]>(async (cell) => {
       let threw: unknown
       let results: Results[] = []
@@ -399,6 +426,11 @@ export class HostSession {
   }
 
   private async execUnitInner(unit: ProtocolUnit): Promise<UnitResult> {
+    // Taint-scan input (§4.5): simple-protocol SQL when known; extended
+    // protocol falls back to a raw byte decode (Parse messages carry the
+    // SQL text — the scan only needs substrings).
+    this.currentUnitText =
+      unit.sqlForReplay ?? Buffer.from(unit.bytes).toString('latin1')
     let attempt = 0
     const r = await this.drive<{ output: Uint8Array; scan: BackendScan }>(
       async (cell) => {
@@ -580,6 +612,20 @@ export class HostSession {
       // unit between transactions (cheap; keeps the last cursor-anchored
       // snapshot when unpublished local WAL is pending).
       if (!wasInTxn) cell.maybeSnapshotBase({ flush: this.mode === 'write' })
+
+      // M5d read-set capture (§4.1): (re)arm the native ring at every
+      // between-transactions unit start, so an interactive transaction's
+      // whole read set — BEGIN unit through COMMIT unit — is in the ring
+      // when a CAS loss reaches the rebase ladder. One flag write + ring
+      // reset; enabled for one-shots too (harmless, unused).
+      if (!wasInTxn) {
+        this.rebaseTaint = null
+        cell.readSetBegin()
+      }
+      // Rebase taint (§4.5): statement-text scan, accumulated per txn.
+      if (this.rebaseTaint === null && this.currentUnitText !== null) {
+        this.rebaseTaint = scanRebaseTaint(this.currentUnitText)
+      }
 
       // Cell auto-LISTEN delta (M3, §10.2 step 2): when the host LISTEN
       // union changed since this cell last synced, re-apply it between
@@ -769,6 +815,28 @@ export class HostSession {
       }
 
       // ---- CAS loss (§3.7 contract) ----
+      // M5d transparent rebase (§4): an ELIGIBLE interactive COMMIT loss
+      // (untainted session, no rebase taints, bounds available) runs the
+      // rebase ladder — harvest, advance to K, validate, re-apply, CAS.
+      // On success the unit LANDS: the client's buffered response (whose
+      // RETURNING/mid-txn values are the harvested data by construction)
+      // becomes true. Every failure inside the ladder degrades to the
+      // pre-M5d contract: 40001, session survives.
+      if (wasInTxn && !this._tainted) {
+        const reb = await this.tryTransparentRebase(cell, slice, notifications)
+        if (reb.landed) {
+          return {
+            kind: 'landed',
+            payload,
+            landedOffset: reb.offset,
+            landedLsn: reb.lsn,
+          }
+        }
+        return {
+          kind: 'conflict',
+          detail: `interactive transaction lost the commit race at COMMIT (rebase: ${reb.detail})`,
+        }
+      }
       // The lost transaction is an abort in disguise: its WAL (including
       // non-transactional sequence records whose values may have been
       // observed) dies with the recycled cell. Floor the sequences first.
@@ -1023,6 +1091,202 @@ export class HostSession {
       }
       return false
     }
+  }
+
+  /**
+   * THE M5d REBASE LADDER (§4.2/§4.4/§4.7). Runs on an interactive COMMIT
+   * unit's CAS loss, on an untainted session. Steps:
+   *
+   *  1. harvest FIRST (ring snapshot, then own-WAL enumeration + payload
+   *     re-reads — the transaction committed LOCALLY before capture, so
+   *     post-commit same-session reads see exactly its net effect);
+   *  2. eligibility gates (rebase taints, ring overflow, temp writes);
+   *  3. floors probe (observed sequence draws survive any outcome);
+   *  4. advance to K: in-place reset + live tail apply, falling back to
+   *     recycle-with-materialize (rebase proceeds either way — the
+   *     harvested data is already in JS memory);
+   *  5. validate at K (§4.2) — any failure => 40001, local txn already
+   *     discarded by the reset;
+   *  6. re-apply in ONE fresh transaction under
+   *     session_replication_role=replica; 23505 => 40001 (§4.0);
+   *  7. capture the NEW slice and CAS; a second loss loops once more
+   *     (max 2 rounds, §4.7), then 40001.
+   *
+   * The session survives every outcome.
+   */
+  private async tryTransparentRebase(
+    cell: Cell,
+    slice: CapturedSlice,
+    notifications: { channel: string; payload: string }[],
+  ): Promise<
+    | { landed: true; offset: string; lsn: bigint }
+    | { landed: false; detail: string }
+  > {
+    this.rebaseStats.attempts++
+    const B = slice.baseLsn
+
+    // Ring snapshot BEFORE anything else touches the cell.
+    const readSet = cell.readSetSnapshot()
+    cell.readSetEnd()
+
+    if (this.rebaseTaint !== null) {
+      return this.discardLostInteractive(
+        cell,
+        `taint '${this.rebaseTaint}' observed (§4.5)`,
+      )
+    }
+    if (readSet.overflowed) {
+      return this.discardLostInteractive(cell, 'read-set ring overflow')
+    }
+    // Temp-write-during-attempt (§4.5): a temp schema appearing during an
+    // untainted session's transaction means THIS attempt created temp
+    // state — its pages hold discarded xids the winner stream would later
+    // rebind. (Pre-existing temp state implies a tainted session, which
+    // never reaches this ladder.)
+    const temp = await cell.db.query<{ t: boolean }>(
+      'select pg_my_temp_schema()::oid <> 0 as t',
+    )
+    if (temp.rows[0].t) {
+      return this.discardLostInteractive(
+        cell,
+        'temp-table write during the attempt (§4.5)',
+      )
+    }
+
+    const harvest = await harvestRebasePlan(
+      cell,
+      B,
+      slice.endLsn,
+      readSet.pins.map((p) => ({ db: p.db, rel: p.rel })),
+    )
+    if (!harvest.ok) {
+      return this.discardLostInteractive(cell, harvest.reason)
+    }
+    const plan = harvest.plan
+
+    let detail = 'rebase bounds exhausted'
+    for (let round = 0; round < 2; round++) {
+      const active = this.cell
+      if (active === null) return { landed: false, detail: 'cell lost' }
+      // Observed draws must be floored before the local txn is discarded.
+      await this.runtime.probeFloors(active)
+      // Advance to K: reset + live apply, else recycle-with-materialize.
+      if (active.canResetInPlace()) {
+        try {
+          active.resetToBase()
+          if (!(await this.tryLiveAdvance())) await this.destroyCell()
+        } catch {
+          await this.destroyCell()
+        }
+      } else {
+        await this.destroyCell()
+      }
+      if (this.cell === null) {
+        try {
+          await this.ensureCell() // recycle at head (canonical for writers)
+        } catch (err) {
+          this.rebaseStats.failed++
+          return { landed: false, detail: `re-attach failed: ${String(err)}` }
+        }
+      }
+      const cellAtK = this.cell
+      if (cellAtK === null) {
+        this.rebaseStats.failed++
+        return { landed: false, detail: 'cell lost during advance' }
+      }
+      const K = this.streamPos.lsn
+
+      // Winner-tail records (B, K] for the schema-epoch fence: present in
+      // the live cell's pg_wal after a live advance, and in a recycled
+      // cell's materialized pg_wal (unless rotation trimmed it — fail
+      // loud then).
+      let winner: WalRecord[]
+      try {
+        winner = walscanRange(cellAtK.db, B, K)
+      } catch (err) {
+        this.rebaseStats.failed++
+        return {
+          landed: false,
+          detail: `winner tail not scannable: ${String(err)}`,
+        }
+      }
+
+      const v = validateAtK(cellAtK, B, readSet, plan, winner)
+      if (!v.ok) {
+        // Local txn already discarded by the reset; cell is clean at K.
+        this.rebaseStats.failed++
+        return { landed: false, detail: v.reason }
+      }
+
+      try {
+        await reapplyPlan(cellAtK, plan)
+      } catch (err) {
+        // Rolled back inside; swallow the abort-tail WAL exactly like the
+        // ordinary abort path (M4 torn-tail finding).
+        if (this.mode === 'write') {
+          await cellAtK.db.exec('checkpoint').catch(() => undefined)
+        }
+        this.rebaseStats.failed++
+        return { landed: false, detail: (err as Error).message }
+      }
+
+      const newSlice = await cellAtK.captureSlice()
+      if (newSlice === null) {
+        this.rebaseStats.failed++
+        return { landed: false, detail: 'empty re-apply slice' }
+      }
+      const res = await this.runtime.commitFromSession({
+        commitId: randomUUID(),
+        kind: 'commit',
+        baseLsn: newSlice.baseLsn,
+        endLsn: newSlice.endLsn,
+        bytes: newSlice.bytes,
+        // The original attempt's notifications ride the rebased commit —
+        // exactly-once by construction (lost attempts emit nothing).
+        notifications,
+      })
+      if (res.landed) {
+        cellAtK.confirmPublished(newSlice.endLsn)
+        this.streamPos = { offset: res.nextOffset, lsn: newSlice.endLsn }
+        await this.runtime.probeGrants(cellAtK)
+        await this.probeTaints(cellAtK)
+        this.rebaseStats.landed++
+        return { landed: true, offset: res.offset, lsn: newSlice.endLsn }
+      }
+      detail = 'rebase bounds exhausted (2 CAS losses)'
+      // Loop: the harvest and read set stay valid (B unchanged); the next
+      // round resets the re-applied txn and advances to the new head.
+    }
+    const active = this.cell
+    if (active !== null) {
+      return this.discardLostInteractive(active, detail)
+    }
+    this.rebaseStats.failed++
+    return { landed: false, detail }
+  }
+
+  /**
+   * Ineligible/exhausted interactive loss: the pre-M5d discard — floors
+   * probe, then in-place reset + advance (or recycle). Returns the
+   * conflict result for the ladder.
+   */
+  private async discardLostInteractive(
+    cell: Cell,
+    detail: string,
+  ): Promise<{ landed: false; detail: string }> {
+    this.rebaseStats.failed++
+    await this.runtime.probeFloors(cell)
+    if (cell.canResetInPlace()) {
+      try {
+        cell.resetToBase()
+        if (!(await this.tryLiveAdvance())) await this.destroyCell()
+      } catch {
+        await this.destroyCell()
+      }
+    } else {
+      await this.destroyCell()
+    }
+    return { landed: false, detail }
   }
 
   private shouldAdvance(): boolean {
