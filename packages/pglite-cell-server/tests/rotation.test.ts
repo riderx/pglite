@@ -19,7 +19,7 @@ import {
   parseLsn,
 } from '@electric-sql/pglite-cell'
 import type { Committer, SealEraResult, Frame } from '@electric-sql/pglite-cell'
-import { GatewayCore, extractDatadir } from '@electric-sql/pglite-gateway'
+import { GatewayCore, extractCheckpoint } from '@electric-sql/pglite-gateway'
 import { CellHost } from '../src/host'
 import { CellProxyServer } from '../src/proxy/server'
 
@@ -80,7 +80,12 @@ async function oracle<T>(ctx: Ctx, sql: string, dbId?: string): Promise<T[]> {
   const id = dbId ?? ctx.dbId
   const m = await ctx.core.getManifest(id)
   const dir = join(ctx.root, `oracle-${++oracleN}`)
-  await extractDatadir(await ctx.core.getObject(m.checkpoint.ref), dir)
+  await extractCheckpoint(m.checkpoint.ref, dir, {
+    store: {
+      get: (r: string) => ctx.core.getObject(r),
+      put: (b: Uint8Array) => ctx.core.putObject(b),
+    },
+  })
   const tailer = new EraTailer(ctx.core.streamClientFor(id), {
     path: m.era.path,
     eraId: m.era.id,

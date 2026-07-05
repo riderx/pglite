@@ -24,7 +24,7 @@ import {
   materializeAtHead,
   parseLsn,
 } from '@electric-sql/pglite-cell'
-import { GatewayCore, extractDatadir } from '@electric-sql/pglite-gateway'
+import { GatewayCore, extractCheckpoint } from '@electric-sql/pglite-gateway'
 import type { Manifest } from '@electric-sql/pglite-gateway'
 import { CellHost } from '../src/host'
 import { CellProxyServer } from '../src/proxy/server'
@@ -103,10 +103,12 @@ async function connect(ctx: Ctx): Promise<Client> {
 /** Convergence oracle: a fresh materialize of the FULL stream, queried. */
 async function oracle<T>(ctx: Ctx, sql: string): Promise<T[]> {
   const dir = join(ctx.root, `oracle-${++oracleN}`)
-  await extractDatadir(
-    await ctx.core.getObject(ctx.manifest.checkpoint.ref),
-    dir,
-  )
+  await extractCheckpoint(ctx.manifest.checkpoint.ref, dir, {
+    store: {
+      get: (r: string) => ctx.core.getObject(r),
+      put: (b: Uint8Array) => ctx.core.putObject(b),
+    },
+  })
   const tailer = new EraTailer(ctx.core.streamClientFor(ctx.dbId), {
     path: ctx.manifest.era.path,
     eraId: ctx.manifest.era.id,

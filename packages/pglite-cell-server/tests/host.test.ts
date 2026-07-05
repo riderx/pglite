@@ -18,7 +18,7 @@ import {
   materializeAtHead,
   parseLsn,
 } from '@electric-sql/pglite-cell'
-import { GatewayCore, extractDatadir } from '@electric-sql/pglite-gateway'
+import { GatewayCore, extractCheckpoint } from '@electric-sql/pglite-gateway'
 import type { Manifest } from '@electric-sql/pglite-gateway'
 import { CellHost } from '../src/host'
 import { SerializationConflictError } from '../src/errors'
@@ -84,10 +84,12 @@ async function streamHead(ctx: Ctx): Promise<string> {
  */
 async function oracle<T>(ctx: Ctx, sql: string): Promise<T[]> {
   const dir = join(ctx.root, `oracle-${++oracleN}`)
-  await extractDatadir(
-    await ctx.core.getObject(ctx.manifest.checkpoint.ref),
-    dir,
-  )
+  await extractCheckpoint(ctx.manifest.checkpoint.ref, dir, {
+    store: {
+      get: (r: string) => ctx.core.getObject(r),
+      put: (b: Uint8Array) => ctx.core.putObject(b),
+    },
+  })
   const tailer = newTailer(ctx)
   await tailer.catchUp()
   const mat = await materializeAtHead({

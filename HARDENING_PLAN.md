@@ -78,6 +78,47 @@ setval). Tests for each; §3.7/§9 README rows updated.
   CI-tolerable and mark the slowest files with a CI-skip env guard if
   >10 min, documented).
 
+## H7 — test-speed optimizations (Sam, 2026-07-05)
+
+The suites are integration-real by design (no mocks; every scenario
+boots genuine cells/gateways/streams) — keep that. Cut the harness
+waste instead:
+
+1. **File-level parallelism.** The `maxWorkers: 1, fileParallelism:
+   false` vitest config was inherited from pglite-socket's fixed-port
+   pattern, but nearly every test binds port 0. Audit each test file
+   for hidden shared state (fixed ports, shared scratch paths, global
+   env like PGL_* flags); enable `fileParallelism: true` with a
+   sensible `maxWorkers` (e.g. 4) in pglite-cell / pglite-gateway /
+   pglite-cell-server; keep any genuinely port-fixed or
+   resource-hungry files serialized via `describe.sequential` or a
+   `*.serial.test.ts` naming convention + config match. Expected win:
+   2–4×.
+2. **Template-datadir fixture.** A shared test helper (pglite-cell
+   `tests/` util or a small `src/testing.ts` export): lazily create ONE
+   settled datadir per (initdb-params) variant per vitest worker
+   (initdb + settling boot + clean close, ~3 s once), then every test
+   clones it with `cpSync` (~50 ms). Sweep all suites' inline initdb
+   fixtures onto it. This is ALSO the production
+   checkpoint-template-hydration seed (M0-3's finding: initdb 1.4 s vs
+   reopen 80 ms): follow-up = gateway `createDatabase` clones a cached
+   template datadir instead of running initdb per database — implement
+   if time allows, else leave the helper + a TODO wired for it.
+3. **Timeout hygiene.** Grep for fixed sleeps/awaits in tests; replace
+   with condition polling at 10–25 ms; drop long-poll fixture timeouts
+   to 250 ms where the test isn't measuring long-poll itself; lease-TTL
+   tests keep their real clocks (correctness) but run in the parallel
+   pool so they overlap other files.
+4. **Scratch-dir hygiene.** All mkdtemp scratch under one per-run root
+   so failures don't strand tens of MB; verify no test writes into the
+   repo tree.
+5. Record before/after wall-clock per package in the final report
+   (target: full three-package corpus under ~8 min on this machine;
+   CI markers from H6 then become mostly unnecessary — revisit H6's
+   skip-guards after measuring).
+
 Order: H2 first (needs a docker rebuild — batch with any other native
 work in flight), then H1/H3/H4 (JS, parallel-safe across packages),
-then H5/H6.
+then H5/H6/H7 (H7 last so it measures the finished suites; it may also
+run FIRST for its own wave if wall-clock is hurting wave turnaround —
+implementer's call, report which).

@@ -6,7 +6,12 @@
 
 import { parentPort, workerData } from 'node:worker_threads'
 import { PGlite } from '@electric-sql/pglite'
+import { LazyCellFS } from '../lazy-fs'
+import type { LazyCellFsStats } from '../lazy-fs'
+import { applyLiveTail } from '../live-apply'
+import { walscanRange } from '../walscan'
 import {
+  OP_FAULT_READ,
   CTL_STATE,
   CTL_REQ_SEQ,
   CTL_OP,
@@ -37,6 +42,14 @@ const ctl = new Int32Array(boot.control)
 const dataSab = new Uint8Array(boot.data)
 
 let pg: PGlite | null = null
+let lazyFs: LazyCellFS | null = null
+let dataDir: string | null = null
+const EMPTY = new Uint8Array(0)
+
+function dataDirOf(): string {
+  if (dataDir === null) throw new Error('worker: no open datadir')
+  return dataDir
+}
 
 function post(msg: WorkerToHost, transfer?: ArrayBuffer[]): void {
   port!.postMessage(msg, transfer)
@@ -243,8 +256,40 @@ async function handle(msg: HostToWorker): Promise<void> {
     switch (msg.t) {
       case 'open': {
         if (pg !== null) throw new Error('worker: already open')
-        pg = new PGlite(msg.dir)
+        dataDir = msg.dir
+        if (msg.lazy !== undefined) {
+          // W3 lazy mode: mount a LazyCellFS over the skeleton dir; chunk
+          // faults block THIS thread on the SAB bridge (the host serves
+          // them from its chunk cache / gateway ranged reads).
+          lazyFs = new LazyCellFS(msg.dir, {
+            lazyFiles: msg.lazy.files,
+            chunkBytes: msg.lazy.chunkBytes,
+            fault: (fileIdx, chunkIdx, length) => {
+              const res = hostcall(OP_FAULT_READ, EMPTY, [
+                fileIdx,
+                chunkIdx,
+                length,
+                0,
+              ])
+              if (res.status !== 0) {
+                throw new Error(
+                  `fault-read failed (status ${res.status}) for lazy file ` +
+                    `#${fileIdx} chunk ${chunkIdx}`,
+                )
+              }
+              return res.bytes
+            },
+          })
+          pg = new PGlite({ dataDir: msg.dir, fs: lazyFs })
+        } else {
+          pg = new PGlite(msg.dir)
+        }
         await pg.waitReady
+        // Notification relay (the W1 gap): worker-side onNotification ->
+        // postMessage -> WorkerCellDb.onNotification (session.ts harvest).
+        pg.onNotification((channel, payload) => {
+          post({ t: 'notify', channel, payload })
+        })
         done(null)
         return
       }
@@ -252,8 +297,7 @@ async function handle(msg: HostToWorker): Promise<void> {
         done(await db().query(msg.sql, msg.params))
         return
       case 'exec':
-        await db().exec(msg.sql)
-        done(null)
+        done(await db().exec(msg.sql))
         return
       case 'exec-unit': {
         await db().runExclusive(() =>
@@ -282,10 +326,40 @@ async function handle(msg: HostToWorker): Promise<void> {
       case 'hostcall-burst':
         done(runBurst(msg))
         return
+      case 'live-apply': {
+        // Hooks keep the LazyCellFS chunk overlay coherent with the direct
+        // file writes live-apply performs (FPI restore, drops).
+        const hooks =
+          lazyFs === null
+            ? undefined
+            : {
+                beforeFileWrite: (
+                  path: string,
+                  offset: number,
+                  length: number,
+                ) => lazyFs!.prepareExternalWrite(path, offset, length),
+                onRemove: (path: string) => lazyFs!.noteExternalRemove(path),
+              }
+        done(applyLiveTail(db(), dataDirOf(), msg.start, msg.end, hooks))
+        return
+      }
+      case 'walscan-range':
+        done(walscanRange(db(), msg.start, msg.end))
+        return
+      case 'lazy-stats': {
+        const zero: LazyCellFsStats = {
+          chunkFaults: 0,
+          bytesFaulted: 0,
+          overlayHits: 0,
+        }
+        done(lazyFs === null ? zero : lazyFs.stats())
+        return
+      }
       case 'close':
         if (pg !== null) {
           await pg.close()
           pg = null
+          lazyFs = null
         }
         done(null)
         return
@@ -295,10 +369,14 @@ async function handle(msg: HostToWorker): Promise<void> {
         return
     }
   } catch (err) {
+    const decorated = err as { detail?: string; code?: string }
     post({
       t: 'fail',
       id: msg.id,
       error: err instanceof Error ? (err.stack ?? err.message) : String(err),
+      detail:
+        typeof decorated?.detail === 'string' ? decorated.detail : undefined,
+      code: typeof decorated?.code === 'string' ? decorated.code : undefined,
     })
   }
 }

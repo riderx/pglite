@@ -15,15 +15,21 @@ import {
   formatLsn,
 } from '@electric-sql/pglite-cell'
 import type {
-  Cell,
   CommitResult,
   CommitSliceInput,
   GFrame,
   LFrame,
   NFrame,
 } from '@electric-sql/pglite-cell'
-import { extractDatadir } from '@electric-sql/pglite-gateway'
-import type { Manifest } from '@electric-sql/pglite-gateway'
+import { extractCheckpoint } from '@electric-sql/pglite-gateway'
+import type {
+  CheckpointFileEntry,
+  Manifest,
+} from '@electric-sql/pglite-gateway'
+import { existsSync, writeFileSync, cpSync } from 'node:fs'
+import { dirname } from 'node:path'
+import type { ChunkCache } from '@electric-sql/pglite-cell'
+import type { CellMode, SessionCell } from './cell-kind'
 import { BaseDirManager } from './base-dir'
 import type { GatewayHandle } from './gateway'
 import { HostSession } from './session'
@@ -88,6 +94,16 @@ export interface RuntimeOpts {
    */
   janitor?: JanitorOpts
   /**
+   * M7 W3 cell-attach mode dial: 'nodefs' (default) opens plain in-process
+   * cells from BaseDirManager copies; 'lazy-worker' attaches worker-hosted
+   * cells over LazyCellFS via the lazy attach recipe (v3 checkpoints fault
+   * relation chunks on demand; v1/v2 checkpoints degrade to a full local
+   * skeleton, still worker-hosted). Overridable via PGLITE_CELL_MODE.
+   */
+  cellMode?: CellMode
+  /** Host chunk-cache byte cap (lazy-worker mode). Default 1 GiB. */
+  chunkCacheBytes?: number
+  /**
    * Advisory-lock policy (M6, §4.6). `pg_advisory_*` locks are cell-local:
    * two hosts' locks do NOT exclude each other, so cross-cell mutual
    * exclusion is not provided.
@@ -116,6 +132,8 @@ export interface ResolvedRuntimeOpts {
   commitGate: boolean
   janitor: ResolvedJanitorOpts
   advisoryLocks: 'local-warn' | 'error'
+  cellMode: CellMode
+  chunkCacheBytes: number | undefined
 }
 
 export function resolveRuntimeOpts(
@@ -134,6 +152,12 @@ export function resolveRuntimeOpts(
     commitGate: opts.commitGate ?? true,
     janitor: resolveJanitorOpts(opts.janitor),
     advisoryLocks: opts.advisoryLocks ?? 'local-warn',
+    cellMode:
+      opts.cellMode ??
+      (process.env.PGLITE_CELL_MODE === 'lazy-worker'
+        ? 'lazy-worker'
+        : 'nodefs'),
+    chunkCacheBytes: opts.chunkCacheBytes,
   }
 }
 /** Bound on grant-take CAS retries (each loss re-reads the high-water). */
@@ -197,6 +221,8 @@ export interface DatabaseRuntimeInit {
   /** Host data root; this runtime owns `<dataRoot>/<databaseId>`. */
   dataRoot: string
   opts: ResolvedRuntimeOpts
+  /** The CellHost-wide chunk cache (lazy-worker mode; fleet-shared). */
+  chunkCache?: ChunkCache
 }
 
 export class DatabaseRuntime {
@@ -275,11 +301,25 @@ export class DatabaseRuntime {
   /** The background maintenance janitor (M6 §6.4); null when disabled. */
   private _janitor: Janitor | null = null
 
+  // ----- M7 W3 lazy-attach state -----
+  /** The CellHost-wide chunk cache (undefined -> direct gateway reads). */
+  private readonly chunkCache: ChunkCache | undefined
+  /** v3 manifest lazy file list (empty for v1/v2 checkpoints). */
+  private lazyFiles: CheckpointFileEntry[] = []
+  /** The eager skeleton dir (lazy-worker mode; null in nodefs mode). */
+  private skeletonDir: string | null = null
+  /** The checkpoint position the skeleton attaches at. */
+  private lazyBase: { snapEnd: bigint; offset: string } | null = null
+  /** False while the canonical dir is missing its lazy relation files. */
+  private canonicalHydrated = true
+  private lazyCellGen = 0
+
   constructor(init: DatabaseRuntimeInit) {
     this.databaseId = init.databaseId
     this.hostId = init.hostId
     this._gateway = init.gateway
     this.opts = init.opts
+    this.chunkCache = init.chunkCache
     this.root = join(init.dataRoot, init.databaseId)
   }
 
@@ -346,8 +386,38 @@ export class DatabaseRuntime {
     rmSync(dirsRoot, { recursive: true, force: true })
     mkdirSync(dirsRoot, { recursive: true })
     const canonicalDir = join(dirsRoot, 'canonical-0')
-    const ckptBytes = await this._gateway.getObject(manifest.checkpoint.ref)
-    await extractDatadir(ckptBytes, canonicalDir)
+    const store = {
+      get: (ref: string) => this._gateway.getObject(ref),
+      put: (bytes: Uint8Array) => this._gateway.putObject(bytes),
+    }
+    const lazyMode = this.opts.cellMode === 'lazy-worker'
+    if (lazyMode) {
+      // M7 W3: materialize the EAGER skeleton only (a v3 checkpoint's lazy
+      // relation files fault in per-chunk; v1/v2 objects extract fully and
+      // the lazy list stays empty). The canonical dir starts as a skeleton
+      // COPY and is hydrated on demand (fallback / checkpoint paths only).
+      const skeleton = join(this.root, 'skeleton')
+      rmSync(skeleton, { recursive: true, force: true })
+      const { lazyFiles } = await extractCheckpoint(
+        manifest.checkpoint.ref,
+        skeleton,
+        { store, lazySkip: true },
+      )
+      cpSync(skeleton, canonicalDir, { recursive: true })
+      this.skeletonDir = skeleton
+      this.lazyFiles = lazyFiles
+      this.lazyBase = {
+        snapEnd: parseLsn(manifest.checkpoint.snapEnd),
+        offset: manifest.checkpoint.streamOffset,
+      }
+      this.canonicalHydrated = lazyFiles.length === 0
+    } else {
+      await extractCheckpoint(manifest.checkpoint.ref, canonicalDir, { store })
+      this.skeletonDir = null
+      this.lazyFiles = []
+      this.lazyBase = null
+      this.canonicalHydrated = true
+    }
 
     const client = this._gateway.streamClientFor(this.databaseId)
     const tailer = new EraTailer(client, {
@@ -720,7 +790,7 @@ export class DatabaseRuntime {
    * surfaces `pg_sequence_last_value()`, null before the first draw), so
    * `isCalled` is always true here.
    */
-  async probeFloors(cell: Cell): Promise<void> {
+  async probeFloors(cell: SessionCell): Promise<void> {
     const rows = await this.querySequences(cell)
     for (const row of rows) {
       const key = `${row.s}.${row.n}`
@@ -738,7 +808,7 @@ export class DatabaseRuntime {
     // Grant maintenance rides the same probe (M4, §5.3): an abort-observed
     // draw is exactly the evidence a grant must cover.
     await this.ensureGrants(rows)
-    this.applyLeases(cell)
+    await this.applyLeases(cell)
   }
 
   /**
@@ -748,9 +818,9 @@ export class DatabaseRuntime {
    * floor map from observed values (committed draws are published — the
    * stream itself covers them).
    */
-  async probeGrants(cell: Cell): Promise<void> {
+  async probeGrants(cell: SessionCell): Promise<void> {
     await this.ensureGrants(await this.querySequences(cell))
-    this.applyLeases(cell)
+    await this.applyLeases(cell)
   }
 
   /**
@@ -762,11 +832,14 @@ export class DatabaseRuntime {
    * session it would wipe `currval` state, and cached prepaid values are
    * always within the lease that admitted them.
    */
-  applyLeases(cell: Cell, opts: { resetCaches?: boolean } = {}): void {
+  async applyLeases(
+    cell: SessionCell,
+    opts: { resetCaches?: boolean } = {},
+  ): Promise<void> {
     for (const g of this.grants.values()) {
-      cell.setSequenceLease(g.oid, g.end)
+      await cell.setSequenceLease(g.oid, g.end)
     }
-    if (opts.resetCaches) cell.resetSequenceCaches()
+    if (opts.resetCaches) await cell.resetSequenceCaches()
   }
 
   /**
@@ -777,7 +850,10 @@ export class DatabaseRuntime {
    * `2^escalation - 1` additional grants beyond the renewal so each retry
    * doubles the headroom, then re-register the leases on the cell.
    */
-  async extendGrantsForRetry(cell: Cell, escalation: number): Promise<void> {
+  async extendGrantsForRetry(
+    cell: SessionCell,
+    escalation: number,
+  ): Promise<void> {
     const rows = await this.querySequences(cell)
     await this.ensureGrants(rows)
     const extra = (1 << escalation) - 1
@@ -795,11 +871,11 @@ export class DatabaseRuntime {
         this.grants.set(key, g)
       }
     }
-    this.applyLeases(cell)
+    await this.applyLeases(cell)
   }
 
   private async querySequences(
-    cell: Cell,
+    cell: SessionCell,
   ): Promise<{ s: string; n: string; v: string; o: number }[]> {
     return (
       await cell.db.query<{ s: string; n: string; v: string; o: number }>(
@@ -945,7 +1021,7 @@ export class DatabaseRuntime {
    * by the in-memory floor map until some write-attach publishes them.
    */
   async applyFloors(
-    cell: Cell,
+    cell: SessionCell,
   ): Promise<{ lost: boolean; pos: { offset: string; lsn: bigint } | null }> {
     let applied = false
     for (const floor of this.floors.values()) {
@@ -1036,6 +1112,77 @@ export class DatabaseRuntime {
     console.log(
       `[pglite-cell-server] db ${this.databaseId}: gc-pin append for ` +
         `${sessionId} kept losing its CAS — pin tracked host-side only`,
+    )
+  }
+
+  // ----- M7 W3: lazy attach surface -----
+
+  /**
+   * Everything a session needs to lazy-attach a worker cell, or null when
+   * the mode is 'nodefs' (or the runtime is not active). v1/v2 checkpoints
+   * yield an empty lazy list — the skeleton is then a full datadir and the
+   * attach is worker-hosted but not lazy.
+   */
+  lazyAttachContext(): {
+    skeletonDir: string
+    lazyFiles: CheckpointFileEntry[]
+    snapEnd: bigint
+    offset: string
+    chunkBytes?: number
+    readChunk: (
+      ref: string,
+      chunkIdx: number,
+      offset: number,
+      length: number,
+    ) => Promise<Uint8Array>
+  } | null {
+    if (
+      this.opts.cellMode !== 'lazy-worker' ||
+      this.skeletonDir === null ||
+      this.lazyBase === null
+    ) {
+      return null
+    }
+    return {
+      skeletonDir: this.skeletonDir,
+      lazyFiles: this.lazyFiles.map((f) => ({ ...f })),
+      snapEnd: this.lazyBase.snapEnd,
+      offset: this.lazyBase.offset,
+      readChunk: (ref, chunkIdx, offset, length) =>
+        this.chunkCache !== undefined
+          ? this.chunkCache.get(ref, chunkIdx, offset, length)
+          : this._gateway.getObjectRange(ref, offset, length),
+    }
+  }
+
+  /** A fresh per-cell work dir for a lazy attach (owned by the session). */
+  newLazyCellDir(): string {
+    return join(
+      this.root,
+      'lazy-cells',
+      `cell-${++this.lazyCellGen}-${randomUUID().slice(0, 8)}`,
+    )
+  }
+
+  /**
+   * Hydrate the canonical dir's lazy relation files (full object fetches)
+   * so the BaseDirManager materialize path / checkpoint pack can run.
+   * No-op outside lazy mode or when already hydrated. MUST be called
+   * before any `baseDirs` staging in lazy-worker mode.
+   */
+  async ensureCanonicalHydrated(): Promise<void> {
+    if (this.canonicalHydrated || this._baseDirs === null) return
+    const dir = this._baseDirs.canonicalDir
+    for (const f of this.lazyFiles) {
+      const abs = join(dir, f.path)
+      if (existsSync(abs)) continue
+      mkdirSync(dirname(abs), { recursive: true })
+      writeFileSync(abs, await this._gateway.getObject(f.ref))
+    }
+    this.canonicalHydrated = true
+    console.log(
+      `[pglite-cell-server] db ${this.databaseId}: canonical dir hydrated ` +
+        `(${this.lazyFiles.length} lazy files — materialize fallback path)`,
     )
   }
 

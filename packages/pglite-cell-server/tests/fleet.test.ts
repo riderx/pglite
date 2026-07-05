@@ -18,7 +18,7 @@ import {
   readControl,
 } from '@electric-sql/pglite-cell'
 import type { GFrameHeader, LFrameHeader } from '@electric-sql/pglite-cell'
-import { GatewayCore, extractDatadir } from '@electric-sql/pglite-gateway'
+import { GatewayCore, extractCheckpoint } from '@electric-sql/pglite-gateway'
 import type { Manifest } from '@electric-sql/pglite-gateway'
 import { CellHost } from '../src/host'
 import type { RuntimeOpts } from '../src/database-runtime'
@@ -128,10 +128,12 @@ async function oracle<T>(
   sql: string,
 ): Promise<{ rows: T[]; nextXid: bigint; checkPoint: bigint }> {
   const dir = join(ctx.root, `oracle-${++oracleN}`)
-  await extractDatadir(
-    await ctx.core.getObject(ctx.manifest.checkpoint.ref),
-    dir,
-  )
+  await extractCheckpoint(ctx.manifest.checkpoint.ref, dir, {
+    store: {
+      get: (r: string) => ctx.core.getObject(r),
+      put: (b: Uint8Array) => ctx.core.putObject(b),
+    },
+  })
   const tailer = await fullTailer(ctx)
   const mat = await materializeAtHead({
     baseDir: dir,

@@ -32,8 +32,8 @@
 // Sequence pages are excluded (§4.1); index-only scans are disabled in
 // cells (§4.2 escape hatch), so VM-bit content checks are unnecessary.
 
-import type { Cell, WalRecord } from '@electric-sql/pglite-cell'
-import { walscanRange } from '@electric-sql/pglite-cell'
+import type { WalRecord } from '@electric-sql/pglite-cell'
+import type { SessionCell } from './cell-kind'
 
 const XLOG_HEAP_OPMASK = 0x70
 const OP_TRUNCATE = 0x30
@@ -126,14 +126,14 @@ function qname(meta: RelMeta): string {
  * fetch depends on post-commit same-session visibility.
  */
 export async function harvestRebasePlan(
-  cell: Cell,
+  cell: SessionCell,
   baseLsn: bigint,
   endLsn: bigint,
   readSetRelfilenodes: Iterable<{ db: number; rel: number }>,
 ): Promise<HarvestResult> {
   let records: WalRecord[]
   try {
-    records = walscanRange(cell.db, baseLsn, endLsn)
+    records = await cell.walscanRange(baseLsn, endLsn)
   } catch (err) {
     return { ok: false, reason: `own-WAL scan failed: ${String(err)}` }
   }
@@ -459,13 +459,13 @@ const SI_RELMAP = -58
  * classified records of `(B, K]` — the three inval carriers feed the
  * schema-epoch fence (§4.3).
  */
-export function validateAtK(
-  cell: Cell,
+export async function validateAtK(
+  cell: SessionCell,
   baseLsn: bigint,
   readSet: ReadSetForValidation,
   plan: RebasePlan,
   winnerRecords: WalRecord[],
-): ValidationResult {
+): Promise<ValidationResult> {
   if (readSet.overflowed) {
     return { ok: false, reason: 'read-set ring overflow' }
   }
@@ -511,7 +511,7 @@ export function validateAtK(
     const key = `${p.spc}/${p.db}/${p.rel}/${p.fork}/${p.blk}`
     if (seenPages.has(key)) continue
     seenPages.add(key)
-    const lsn = cell.pageLsn(p.spc, p.db, p.rel, p.fork, p.blk)
+    const lsn = await cell.pageLsn(p.spc, p.db, p.rel, p.fork, p.blk)
     if (lsn === MISSING_PAGE) continue
     if (lsn > baseLsn) {
       return {
@@ -536,7 +536,7 @@ export function validateAtK(
       minProbe.set(key, { p, n: p.nblocks })
   }
   for (const [key, { p, n }] of minProbe) {
-    const now = cell.relationNblocks(p.spc, p.db, p.rel, p.fork)
+    const now = await cell.relationNblocks(p.spc, p.db, p.rel, p.fork)
     if (now === MISSING_FORK) {
       return { ok: false, reason: `missing fork ${key}` }
     }
@@ -626,7 +626,10 @@ export class ReapplyConflictError extends Error {
  * are asserted: a 0-row UPDATE/DELETE means the addressing premise broke
  * and the transaction must not land.
  */
-export async function reapplyPlan(cell: Cell, plan: RebasePlan): Promise<void> {
+export async function reapplyPlan(
+  cell: SessionCell,
+  plan: RebasePlan,
+): Promise<void> {
   const db = cell.db
   await db.exec("begin; set local session_replication_role = 'replica'")
   try {

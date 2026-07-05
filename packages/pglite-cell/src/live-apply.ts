@@ -199,6 +199,21 @@ const CLOG_ABORTED = 2
 export interface LiveApplyResult {
   applied: boolean
   records: number
+  /** The gate's rejection reason when `applied` is false (diagnostics). */
+  reason?: string
+}
+
+/**
+ * M7 W3: file hooks for lazily-backed datadirs. applyLiveTail writes some
+ * relation files DIRECTLY via node fs (FPI restore, drops, smgr creates) —
+ * on a LazyCellFS-backed dir those writes bypass the chunk overlay, so the
+ * FS must be told: `beforeFileWrite` faults+marks the touched chunks
+ * (copy-on-write) BEFORE the direct write; `onRemove` drops the lazy entry
+ * so a removed relation never resurrects checkpoint bytes.
+ */
+export interface LiveApplyFileHooks {
+  beforeFileWrite(path: string, offset: number, length: number): void
+  onRemove(path: string): void
 }
 
 /**
@@ -216,6 +231,7 @@ export function applyLiveTail(
   dir: string,
   start: bigint,
   end: bigint,
+  hooks?: LiveApplyFileHooks,
 ): LiveApplyResult {
   liveApplyStats.attempts++
   const records = walscanRange(pg, start, end)
@@ -223,7 +239,11 @@ export function applyLiveTail(
     if (process.env.PGLITE_LIVE_APPLY_STATS === '1') {
       console.log(`[live-apply] MISS ${liveApplyStats.lastFallback}`)
     }
-    return { applied: false, records: records.length }
+    return {
+      applied: false,
+      records: records.length,
+      reason: liveApplyStats.lastFallback,
+    }
   }
   if (process.env.PGLITE_LIVE_APPLY_STATS === '1') {
     console.log('[live-apply] HIT')
@@ -239,7 +259,11 @@ export function applyLiveTail(
   // write-cell restriction.)
   const lastRec = records[records.length - 1].lsn
   if (mod._pgl_set_wal_position(end, lastRec) !== 1) {
-    return { applied: false, records: records.length }
+    return {
+      applied: false,
+      records: records.length,
+      reason: 'set-wal-position',
+    }
   }
 
   const touchedRels = new Map<string, [number, number, number]>()
@@ -302,7 +326,11 @@ export function applyLiveTail(
             b.fork,
             Math.floor(b.blk / BLOCKS_PER_SEG),
           )
-          if (path !== null) writeBlock(path, b.blk % BLOCKS_PER_SEG, page)
+          if (path !== null) {
+            const blkInSeg = b.blk % BLOCKS_PER_SEG
+            hooks?.beforeFileWrite(path, blkInSeg * 8192, 8192)
+            writeBlock(path, blkInSeg, page)
+          }
         }
         mod._pgl_drop_relation_buffers_range(
           b.rel[0],
@@ -334,7 +362,10 @@ export function applyLiveTail(
               0,
             )
             const p = relFilePath(dir, drop, fork, 0)
-            if (p !== null && existsSync(p)) rmSync(p, { force: true })
+            if (p !== null && existsSync(p)) {
+              rmSync(p, { force: true })
+              hooks?.onRemove(p)
+            }
           }
           mod._pgl_smgr_release(drop[0], drop[1], drop[2])
         }
@@ -368,7 +399,10 @@ export function applyLiveTail(
               0,
             )
             const p = relFilePath(dir, drop, fork, 0)
-            if (p !== null && existsSync(p)) rmSync(p, { force: true })
+            if (p !== null && existsSync(p)) {
+              rmSync(p, { force: true })
+              hooks?.onRemove(p)
+            }
           }
           mod._pgl_smgr_release(drop[0], drop[1], drop[2])
         }

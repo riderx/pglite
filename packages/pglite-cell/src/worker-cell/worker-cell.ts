@@ -13,8 +13,9 @@
 //    `confirmPublished`/`advanceTo` stay sync but re-snapshot the base in
 //    the background — `await cell.settled()` to observe it.
 //  - `db` is a facade (query/exec/execProtocolRawStream/runExclusive/
-//    isInTransaction/close), NOT a real PGlite. `onNotification`/`listen`
-//    are NOT supported in v1 (no protocol-level notification relay yet).
+//    isInTransaction/close/onNotification), NOT a real PGlite. W3 closed
+//    the W1 notification gap: worker-side onNotification relays over
+//    postMessage. `db.close()` also terminates the worker thread.
 
 import { Worker } from 'node:worker_threads'
 import { existsSync } from 'node:fs'
@@ -29,6 +30,10 @@ import type {
   CellOpenOpts,
   ReadSetSnapshot,
 } from '../cell'
+import type { LiveApplyResult } from '../live-apply'
+import type { WalRecord } from '../walscan'
+import type { LazyCellFsStats, LazyFileSpec } from '../lazy-fs'
+import { LAZY_CHUNK_BYTES } from '../lazy-fs'
 import {
   CTL_STATE,
   CTL_REQ_SEQ,
@@ -43,8 +48,10 @@ import {
   STATUS_UNKNOWN_OP,
   STATUS_TOO_LARGE,
   STATUS_HOST_ERROR,
+  STATUS_NOT_FOUND,
   OP_PING,
   OP_HOSTCALL,
+  OP_FAULT_READ,
   createBridgeBuffers,
 } from './protocol'
 import type {
@@ -63,6 +70,21 @@ const CONFIG_PINS: { name: string; expected: string }[] = [
   { name: 'data_checksums', expected: 'off' },
 ]
 
+/** W3 lazy boot: the manifest's lazy file list + the host-side chunk
+ *  reader that serves OP_FAULT_READ (chunk cache -> gateway ranged read). */
+export interface WorkerCellLazyOpts {
+  files: LazyFileSpec[]
+  /** Fault granularity; default 256 KiB (fixed decision 3). */
+  chunkBytes?: number
+  /** Serve `length` bytes at `offset` of object `ref` (chunk-aligned). */
+  readChunk: (
+    ref: string,
+    chunkIdx: number,
+    offset: number,
+    length: number,
+  ) => Promise<Uint8Array>
+}
+
 export interface WorkerCellOpenOpts extends CellOpenOpts {
   /** Override the worker entry (tests use a tsx bootstrap for .ts src). */
   workerUrl?: URL | string
@@ -75,6 +97,8 @@ export interface WorkerCellOpenOpts extends CellOpenOpts {
   }
   /** Data-SAB staging size override (default 4 MiB). */
   dataSabBytes?: number
+  /** W3: open with a LazyCellFS in the worker instead of plain NodeFS. */
+  lazy?: WorkerCellLazyOpts
 }
 
 /** A host-registered handler for OP_HOSTCALL bridge requests (v1: tests;
@@ -130,8 +154,11 @@ export class WorkerCellDb {
     }
   }
 
-  async exec(sql: string): Promise<void> {
-    await this.cell._request({ t: 'exec', sql })
+  /** Same shape as PGlite.exec: per-statement results. */
+  async exec(sql: string): Promise<{ rows: unknown[] }[]> {
+    return (await this.cell._request({ t: 'exec', sql })) as {
+      rows: unknown[]
+    }[]
   }
 
   /** One exec unit: bytes in, output chunks out via `onRawData`. */
@@ -156,14 +183,20 @@ export class WorkerCellDb {
     return this.cell._inTx
   }
 
+  /** Clean-close the instance AND tear down the worker thread — the
+   *  PGlite-shaped contract session code relies on (`db.close()` frees
+   *  everything; nothing else would ever terminate the worker). */
   async close(): Promise<void> {
     await this.cell._closeDb()
+    await this.cell.terminate()
   }
 
-  onNotification(): never {
-    throw new Error(
-      'WorkerCell.db.onNotification: not supported in worker mode v1',
-    )
+  /** W3 (the W1 relay gap): notifications fired inside the worker are
+   *  relayed by postMessage and fan out here — same shape as PGlite's. */
+  onNotification(
+    callback: (channel: string, payload: string) => void,
+  ): () => void {
+    return this.cell._onNotification(callback)
   }
 }
 
@@ -180,6 +213,14 @@ export class WorkerCell {
   _inTx = false
   private hostcallHandlers = new Map<number, HostcallHandler>()
   private bridgeStopped = false
+  private notifyListeners = new Set<
+    (channel: string, payload: string) => void
+  >()
+  private lazyOpts: WorkerCellLazyOpts | null = null
+  private lazyChunkBytes = LAZY_CHUNK_BYTES
+  /** Host-side fault counters (OP_FAULT_READ served over the bridge). */
+  private hostFaults = 0
+  private hostFaultBytes = 0
 
   private constructor(
     public readonly dir: string,
@@ -232,9 +273,23 @@ export class WorkerCell {
     worker.on('exit', (code) =>
       cell.failAll(new Error(`worker exited (code ${code})`)),
     )
+    if (opts.lazy !== undefined) {
+      cell.lazyOpts = opts.lazy
+      cell.lazyChunkBytes = opts.lazy.chunkBytes ?? LAZY_CHUNK_BYTES
+    }
     cell.serveBridge() // Atomics.waitAsync loop — alive before any exec
     try {
-      await cell._request({ t: 'open', dir })
+      await cell._request({
+        t: 'open',
+        dir,
+        lazy:
+          opts.lazy === undefined
+            ? undefined
+            : {
+                files: opts.lazy.files,
+                chunkBytes: opts.lazy.chunkBytes ?? LAZY_CHUNK_BYTES,
+              },
+      })
 
       const mismatches: { name: string; expected: string; actual: string }[] =
         []
@@ -337,6 +392,22 @@ export class WorkerCell {
     try {
       if (op === OP_PING) {
         response = payload
+      } else if (op === OP_FAULT_READ) {
+        const spec = this.lazyOpts?.files[params[0]]
+        if (spec === undefined) {
+          status = STATUS_NOT_FOUND
+        } else {
+          const chunkIdx = params[1]
+          const length = params[2]
+          response = await this.lazyOpts!.readChunk(
+            spec.ref,
+            chunkIdx,
+            chunkIdx * this.lazyChunkBytes,
+            length,
+          )
+          this.hostFaults++
+          this.hostFaultBytes += response.byteLength
+        }
       } else if (op === OP_HOSTCALL) {
         const handler = this.hostcallHandlers.get(params[0])
         if (handler === undefined) status = STATUS_UNKNOWN_OP
@@ -381,6 +452,16 @@ export class WorkerCell {
 
   private onMessage(msg: WorkerToHost): void {
     if (msg.t === 'ready') return
+    if (msg.t === 'notify') {
+      for (const cb of [...this.notifyListeners]) {
+        try {
+          cb(msg.channel, msg.payload)
+        } catch {
+          // listener failures never poison the message pump
+        }
+      }
+      return
+    }
     const p = this.pending.get(msg.id)
     if (p === undefined) return
     if (msg.t === 'chunk') {
@@ -392,7 +473,15 @@ export class WorkerCell {
       this._inTx = msg.inTx
       p.resolve({ value: msg.value, inTx: msg.inTx })
     } else {
-      p.reject(new Error(msg.error))
+      // Re-decorate: session code keys on `detail`/`code` (e.g. the
+      // sequence-lease renewal signal) — postMessage flattened them.
+      const err = new Error(msg.error) as Error & {
+        detail?: string
+        code?: string
+      }
+      if (msg.detail !== undefined) err.detail = msg.detail
+      if (msg.code !== undefined) err.code = msg.code
+      p.reject(err)
     }
   }
 
@@ -618,6 +707,49 @@ export class WorkerCell {
       rel,
       fork,
     ])) as number
+  }
+
+  /** @internal notification relay registration (W1 gap closed). */
+  _onNotification(cb: (channel: string, payload: string) => void): () => void {
+    this.notifyListeners.add(cb)
+    return () => this.notifyListeners.delete(cb)
+  }
+
+  /**
+   * W3: run the M5 live-apply pipeline INSIDE the worker (the Module and
+   * the LazyCellFS overlay hooks live there). The slice bytes must already
+   * sit in the datadir's pg_wal (host-side writeWalRange — pg_wal files
+   * are plain local files in both modes).
+   */
+  async applyLiveTail(start: bigint, end: bigint): Promise<LiveApplyResult> {
+    return (await this._request({
+      t: 'live-apply',
+      start,
+      end,
+    })) as LiveApplyResult
+  }
+
+  /** W3: classified WAL records of [start, end), scanned worker-side. */
+  async walscanRange(start: bigint, end: bigint): Promise<WalRecord[]> {
+    return (await this._request({
+      t: 'walscan-range',
+      start,
+      end,
+    })) as WalRecord[]
+  }
+
+  /** W3 byte counters: worker-side overlay stats + host-served faults. */
+  async lazyStats(): Promise<
+    LazyCellFsStats & { hostFaults: number; hostFaultBytes: number }
+  > {
+    const fsStats = (await this._request({
+      t: 'lazy-stats',
+    })) as LazyCellFsStats
+    return {
+      ...fsStats,
+      hostFaults: this.hostFaults,
+      hostFaultBytes: this.hostFaultBytes,
+    }
   }
 
   /** Same contract as Cell.closeClean: clean-close the instance in the

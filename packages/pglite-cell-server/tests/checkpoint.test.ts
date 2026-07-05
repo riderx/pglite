@@ -22,7 +22,7 @@ import {
   materializeAtHead,
   parseLsn,
 } from '@electric-sql/pglite-cell'
-import { GatewayCore, extractDatadir } from '@electric-sql/pglite-gateway'
+import { GatewayCore, extractCheckpoint } from '@electric-sql/pglite-gateway'
 import type { Manifest } from '@electric-sql/pglite-gateway'
 import { CellHost } from '../src/host'
 
@@ -89,7 +89,12 @@ async function wakeOracle<T>(
 ): Promise<{ rows: T[]; replayedSlices: number; snapEnd: bigint }> {
   const manifest = await ctx.core.getManifest(ctx.dbId)
   const dir = join(ctx.root, `wake-${Math.random().toString(16).slice(2)}`)
-  await extractDatadir(await ctx.core.getObject(manifest.checkpoint.ref), dir)
+  await extractCheckpoint(manifest.checkpoint.ref, dir, {
+    store: {
+      get: (r: string) => ctx.core.getObject(r),
+      put: (b: Uint8Array) => ctx.core.putObject(b),
+    },
+  })
   const tailer = await freshTailer(ctx)
   const snapEnd = parseLsn(manifest.checkpoint.snapEnd)
   const slices = tailer.slicesSince(snapEnd)

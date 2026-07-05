@@ -39,12 +39,17 @@
 import { randomUUID } from 'node:crypto'
 import {
   Cell,
-  applyLiveTail,
   formatLsn,
-  walscanRange,
+  liveApplyStats,
   writeWalRange,
 } from '@electric-sql/pglite-cell'
 import type { CapturedSlice, WalRecord } from '@electric-sql/pglite-cell'
+import {
+  lazyAttach,
+  LazyAttachFallbackError,
+} from '@electric-sql/pglite-cell/worker-cell'
+import { rmSync } from 'node:fs'
+import type { SessionCell } from './cell-kind'
 import {
   harvestRebasePlan,
   reapplyPlan,
@@ -241,8 +246,18 @@ function isReplayableSet(sql: string): boolean {
 export class HostSession {
   readonly id = `s-${randomUUID()}`
 
-  private cell: Cell | null = null
+  private cell: SessionCell | null = null
   private lease: CellDirLease | null = null
+  /** Work dir of a lazy-attached worker cell (owned; rm'd on destroy). */
+  private lazyWorkDir: string | null = null
+  /**
+   * M7 W3: after a repeat one-shot CAS loss the next WRITE attach takes
+   * the MATERIALIZE path once instead of a lazy attach — the canonical
+   * re-attach publishes a sync slice, restoring the M1 convergence
+   * pressure under hot cross-host contention (a lazy attach appends
+   * nothing and would livelock symmetric writers).
+   */
+  private forceMaterializeAttach = false
   private mode: 'read' | 'write' = 'read' // sessions start read-attached
   /** Stream position this session serves / last landed at. */
   private streamPos: { offset: string; lsn: bigint } = { offset: '', lsn: 0n }
@@ -301,6 +316,23 @@ export class HostSession {
 
   /** TEST HOOK (§16 client-observation property): unit execution events. */
   _unitObserver: ((ev: UnitObservation) => void) | null = null
+
+  /**
+   * M7 W3 laziness byte counters (§16 suite + console): the attached
+   * worker cell's fault/overlay stats, or null when the session has no
+   * lazy worker cell attached.
+   */
+  async lazyStats(): Promise<{
+    chunkFaults: number
+    bytesFaulted: number
+    overlayHits: number
+    hostFaults: number
+    hostFaultBytes: number
+  } | null> {
+    const cell = this.cell
+    if (cell === null || !('lazyStats' in cell)) return null
+    return cell.lazyStats()
+  }
 
   constructor(private readonly runtime: DatabaseRuntime) {}
 
@@ -396,7 +428,7 @@ export class HostSession {
       let threw: unknown
       let results: Results[] = []
       try {
-        results = await cell.db.exec(sql)
+        results = (await cell.db.exec(sql)) as Results[]
       } catch (err) {
         threw = err
       }
@@ -661,7 +693,7 @@ export class HostSession {
    * (bounded), fatal reset for tainted losses.
    */
   private async drive<T>(
-    runner: (cell: Cell) => Promise<AttemptOutcome<T>>,
+    runner: (cell: SessionCell) => Promise<AttemptOutcome<T>>,
   ): Promise<DriveResult<T>> {
     if (this.dead !== null) throw new SessionClosedError(this.dead)
     if (this._tainted && Date.now() > this.pinExpiresAt) {
@@ -684,7 +716,9 @@ export class HostSession {
       // M5c: refresh the in-place-reset base snapshot whenever we start a
       // unit between transactions (cheap; keeps the last cursor-anchored
       // snapshot when unpublished local WAL is pending).
-      if (!wasInTxn) cell.maybeSnapshotBase({ flush: this.mode === 'write' })
+      if (!wasInTxn) {
+        await cell.maybeSnapshotBase({ flush: this.mode === 'write' })
+      }
 
       // M5d read-set capture (§4.1): (re)arm the native ring at every
       // between-transactions unit start, so an interactive transaction's
@@ -693,7 +727,7 @@ export class HostSession {
       // reset; enabled for one-shots too (harmless, unused).
       if (!wasInTxn) {
         this.rebaseTaint = null
-        cell.readSetBegin()
+        await cell.readSetBegin()
       }
       // Rebase taint (§4.5): statement-text scan, accumulated per txn.
       if (this.rebaseTaint === null && this.currentUnitText !== null) {
@@ -799,7 +833,37 @@ export class HostSession {
         return { kind: 'aborted', payload, threw }
       }
 
-      const slice = await cell.captureSlice()
+      let slice = await cell.captureSlice()
+
+      // M7 W3: a cell at CANONICAL position (lazy attach / live advance)
+      // can emit pure maintenance WAL from a read-only unit — e.g. an
+      // opportunistic heap2 PRUNE of a catalog page during the first scan
+      // after redo (xid 0, no commit record). That is not a user write:
+      // never a write-upgrade trigger, never a 'committed' outcome. Read
+      // cells swallow it locally (they never publish; the local cursor
+      // diverges exactly like the nodefs read-attach divergence); write
+      // cells publish it as a `sync` slice to keep their canonical
+      // position (a lost CAS just leaves the bytes to ride the next
+      // capture — contiguity preserved).
+      if (slice !== null && (await this.isMaintenanceOnlySlice(cell, slice))) {
+        if (this.mode === 'read') {
+          cell.confirmPublished(slice.endLsn)
+          slice = null
+        } else {
+          const res = await this.runtime.commitFromSession({
+            commitId: randomUUID(),
+            kind: 'sync',
+            baseLsn: slice.baseLsn,
+            endLsn: slice.endLsn,
+            bytes: slice.bytes,
+          })
+          if (res.landed) {
+            cell.confirmPublished(slice.endLsn)
+            this.streamPos = { offset: res.nextOffset, lsn: slice.endLsn }
+          }
+          slice = null
+        }
+      }
 
       if (slice === null) {
         // Read-only: never CAS'd; response is immediately final. A pure
@@ -924,7 +988,7 @@ export class HostSession {
       await this.runtime.probeFloors(cell)
       // M5e commit gate: a reversed commit's deferred truncates must
       // never run (§3.6) — belt and braces, the native reset discards too.
-      cell.commitGateDiscard()
+      await cell.commitGateDiscard()
       if (this._tainted) {
         // M5e TAINT LIFT (§3.3, the §3.6 whole point): with the commit
         // gate deferring the temp truncate and pgl_flush_base covering
@@ -935,9 +999,9 @@ export class HostSession {
         // sound — the fatal reset remains ONLY for the recycle fallback
         // (which destroys exactly that state).
         let survived = false
-        if (cell.canResetInPlace()) {
+        if (await cell.canResetInPlace()) {
           try {
-            cell.resetToBase()
+            await cell.resetToBase()
             // Advance to head if live-appliable; a rejected advance
             // (returns false, cell untouched) leaves the session PINNED
             // at base — the M1 pinned contract, still alive.
@@ -987,9 +1051,9 @@ export class HostSession {
       // without recycling when the soundness gate passes (base snapshot at
       // cursor + zero storage writes since). Belt and braces: ANY error
       // falls back to the recycle path.
-      if (attempt === 0 && cell.canResetInPlace()) {
+      if (attempt === 0 && (await cell.canResetInPlace())) {
         try {
-          cell.resetToBase()
+          await cell.resetToBase()
           // Recycle semantics re-attach AT HEAD unconditionally; match
           // that by advancing the reset cell to the true head right away
           // (the watermark gate alone can lag non-commit winners like
@@ -1025,6 +1089,9 @@ export class HostSession {
           detail: `one-shot re-execution budget exhausted (${this.runtime.opts.maxRetries} retries)`,
         }
       }
+      // Repeat losses re-attach via the materialize path in lazy mode
+      // (sync-slice convergence pressure — see forceMaterializeAttach).
+      if (attempt > 1) this.forceMaterializeAttach = true
       // One-shot, untainted, nothing acked: transparent re-execute (§3.3).
     }
   }
@@ -1076,6 +1143,17 @@ export class HostSession {
       await this.runtime.linearizableSync()
     }
 
+    // M7 W3 lazy-worker attach (read AND write): worker cell over
+    // LazyCellFS at the checkpoint skeleton, advanced to head via the
+    // live-apply pipeline — canonical position, no sync slice. Any gap
+    // falls through to the existing materialize paths below.
+    if (this.runtime.opts.cellMode === 'lazy-worker') {
+      const skipLazy = this.forceMaterializeAttach && this.mode === 'write'
+      this.forceMaterializeAttach = false
+      if (!skipLazy && (await this.tryLazyAttach())) return
+      await this.runtime.ensureCanonicalHydrated()
+    }
+
     if (this.mode === 'read') {
       await this.runtime.baseDirs.ensureAtHeadLocal(this.runtime.tailer)
       const lease = await this.runtime.baseDirs.takeCellDir('read')
@@ -1088,7 +1166,7 @@ export class HostSession {
       })
       // Leases apply to read cells too (M5a): a discarded/aborted draw on
       // a read cell must still stay inside this incarnation's grants.
-      this.runtime.applyLeases(cell, { resetCaches: true })
+      await this.runtime.applyLeases(cell, { resetCaches: true })
       this.cell = cell
       this.lease = lease
       this.streamPos = { offset: lease.base.offset, lsn: lease.base.lsn }
@@ -1118,7 +1196,7 @@ export class HostSession {
       // rules 1+3): the fast path must never serve values replayed from a
       // foreign timeline, and every nextval clamps to this incarnation's
       // grants from the first draw.
-      this.runtime.applyLeases(cell, { resetCaches: true })
+      await this.runtime.applyLeases(cell, { resetCaches: true })
       this.cell = cell
       this.lease = lease
       this.streamPos = floors.pos ?? {
@@ -1129,6 +1207,99 @@ export class HostSession {
       return
     }
     throw new AdvanceRaceError(this.runtime.opts.attachAttempts)
+  }
+
+  /**
+   * True iff every record of the captured slice is buffer-maintenance
+   * noise a read-only unit can legitimately produce: heap2 PRUNE/VACUUM/
+   * VISIBLE with no xid and no eager-set classification. Conservative —
+   * any scan failure or unexpected record means "real write".
+   */
+  private async isMaintenanceOnlySlice(
+    cell: SessionCell,
+    slice: CapturedSlice,
+  ): Promise<boolean> {
+    try {
+      const recs = await cell.walscanRange(slice.baseLsn, slice.endLsn)
+      return (
+        recs.length > 0 &&
+        recs.every(
+          (r) => r.xid === 0 && r.kind === undefined && r.rmid === 9, // heap2
+        )
+      )
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * M7 W3: attach a lazy worker cell at the stream head. Returns false —
+   * leaving the session cell-less — when the mode/context is unavailable,
+   * the tail since the checkpoint is not live-appliable (the recipe's
+   * fallback), or the tail slices are not retrievable; the caller then
+   * uses the existing materialize paths.
+   */
+  private async tryLazyAttach(): Promise<boolean> {
+    const ctx = this.runtime.lazyAttachContext()
+    if (ctx === null) return false
+    const head = this.runtime.tailer.head
+    let slices: { baseLsn: bigint; endLsn: bigint; bytes: Uint8Array }[] = []
+    if (head.lsn > ctx.snapEnd) {
+      slices = this.runtime.tailer.slicesSince(ctx.snapEnd)
+      let expect = ctx.snapEnd
+      for (const sl of slices) {
+        if (sl.baseLsn !== expect) return false // gap: fallback
+        expect = sl.endLsn
+      }
+      if (expect !== head.lsn) return false
+    } else if (head.lsn < ctx.snapEnd) {
+      return false // checkpoint ahead of the tailer view: fallback
+    }
+    const workDir = this.runtime.newLazyCellDir()
+    let cell: SessionCell
+    let headLsn: bigint
+    try {
+      const attached = await lazyAttach({
+        skeletonDir: ctx.skeletonDir,
+        lazyFiles: ctx.lazyFiles,
+        workDir,
+        snapEnd: ctx.snapEnd,
+        slices,
+        readChunk: ctx.readChunk,
+        commitGate: this.runtime.opts.commitGate,
+      })
+      cell = attached.cell
+      headLsn = attached.headLsn
+    } catch (err) {
+      rmSync(workDir, { recursive: true, force: true })
+      if (err instanceof LazyAttachFallbackError) {
+        console.log(
+          `[pglite-cell-server] db ${this.runtime.databaseId}: lazy attach ` +
+            `fell back to materialize (${err.reason})`,
+        )
+        return false
+      }
+      throw err
+    }
+    this.cell = cell
+    this.lease = null
+    this.lazyWorkDir = workDir
+    this.streamPos = {
+      offset: head.lsn === headLsn ? head.offset : ctx.offset,
+      lsn: headLsn,
+    }
+    if (this.mode === 'write') {
+      // Floors BEFORE the session runs anything (write-attach parity).
+      const floors = await this.runtime.applyFloors(cell)
+      if (floors.lost) {
+        await this.destroyCell()
+        return false // re-attach via the caller's loop / fallback
+      }
+      if (floors.pos !== null) this.streamPos = floors.pos
+    }
+    await this.runtime.applyLeases(cell, { resetCaches: true })
+    await this.finishAttach(cell)
+    return true
   }
 
   /**
@@ -1173,7 +1344,7 @@ export class HostSession {
       // past the cell's own insert position is scratch.
       // Flush local WAL first: pending async-commit bytes or cached WAL
       // pages must never overwrite the transplanted foreign bytes later.
-      cell.flushWal()
+      await cell.flushWal()
       for (const s of slices) {
         writeWalRange(cell.dir, s.baseLsn, s.bytes)
       }
@@ -1189,7 +1360,21 @@ export class HostSession {
           slices.map((x) => [x.baseLsn, x.endLsn, x.kind]),
         )
       }
-      const res = applyLiveTail(cell.db, cell.dir, this.streamPos.lsn, head.lsn)
+      const res = await cell.applyLiveTail(this.streamPos.lsn, head.lsn)
+      // Worker cells run live-apply in their own thread (their OWN module
+      // instance of liveApplyStats) — mirror the counters into the host
+      // process instance so the M5b stats surface stays truthful.
+      if (!(cell instanceof Cell)) {
+        liveApplyStats.attempts++
+        if (res.applied) liveApplyStats.hits++
+        else if (res.reason !== undefined) {
+          liveApplyStats.fallbacks.set(
+            res.reason,
+            (liveApplyStats.fallbacks.get(res.reason) ?? 0) + 1,
+          )
+          liveApplyStats.lastFallback = res.reason
+        }
+      }
       if (!res.applied) return false
       // M5c: applyLiveTail set the WAL insert position to the new head —
       // move the capture cursor with it (write cells publish from here;
@@ -1207,7 +1392,7 @@ export class HostSession {
           await this.destroyCell()
           return false
         }
-        this.runtime.applyLeases(cell, { resetCaches: true })
+        await this.runtime.applyLeases(cell, { resetCaches: true })
         if (floors.pos !== null) {
           // applyFloors already confirmed the published floors slice
           // (cursor + base snapshot follow it inside confirmPublished).
@@ -1257,7 +1442,7 @@ export class HostSession {
    * The session survives every outcome.
    */
   private async tryTransparentRebase(
-    cell: Cell,
+    cell: SessionCell,
     slice: CapturedSlice,
     notifications: { channel: string; payload: string }[],
   ): Promise<
@@ -1268,8 +1453,8 @@ export class HostSession {
     const B = slice.baseLsn
 
     // Ring snapshot BEFORE anything else touches the cell.
-    const readSet = cell.readSetSnapshot()
-    cell.readSetEnd()
+    const readSet = await cell.readSetSnapshot()
+    await cell.readSetEnd()
 
     if (this.rebaseTaint !== null) {
       return this.discardLostInteractive(
@@ -1313,9 +1498,9 @@ export class HostSession {
       // Observed draws must be floored before the local txn is discarded.
       await this.runtime.probeFloors(active)
       // Advance to K: reset + live apply, else recycle-with-materialize.
-      if (active.canResetInPlace()) {
+      if (await active.canResetInPlace()) {
         try {
-          active.resetToBase()
+          await active.resetToBase()
           if (!(await this.tryLiveAdvance())) await this.destroyCell()
         } catch {
           await this.destroyCell()
@@ -1344,7 +1529,7 @@ export class HostSession {
       // loud then).
       let winner: WalRecord[]
       try {
-        winner = walscanRange(cellAtK.db, B, K)
+        winner = await cellAtK.walscanRange(B, K)
       } catch (err) {
         this.rebaseStats.failed++
         return {
@@ -1353,7 +1538,7 @@ export class HostSession {
         }
       }
 
-      const v = validateAtK(cellAtK, B, readSet, plan, winner)
+      const v = await validateAtK(cellAtK, B, readSet, plan, winner)
       if (!v.ok) {
         // Local txn already discarded by the reset; cell is clean at K.
         this.rebaseStats.failed++
@@ -1413,16 +1598,16 @@ export class HostSession {
    * conflict result for the ladder.
    */
   private async discardLostInteractive(
-    cell: Cell,
+    cell: SessionCell,
     detail: string,
   ): Promise<{ landed: false; detail: string }> {
     this.rebaseStats.failed++
     await this.runtime.probeFloors(cell)
     // M5e: the reversed commit's deferred truncates die with it (§3.6).
-    cell.commitGateDiscard()
-    if (cell.canResetInPlace()) {
+    await cell.commitGateDiscard()
+    if (await cell.canResetInPlace()) {
       try {
-        cell.resetToBase()
+        await cell.resetToBase()
         if (!(await this.tryLiveAdvance())) await this.destroyCell()
       } catch {
         await this.destroyCell()
@@ -1456,7 +1641,7 @@ export class HostSession {
    * commit, before capture), the bounded-stale clock, session-state
    * replay, and the cell auto-LISTEN of the host union.
    */
-  private async finishAttach(cell: Cell): Promise<void> {
+  private async finishAttach(cell: SessionCell): Promise<void> {
     this.lastAdvanceAt = Date.now()
     cell.db.onNotification((channel, payload) => {
       this.notifBuffer.push({ channel, payload })
@@ -1472,7 +1657,7 @@ export class HostSession {
    * backend-local (no WAL — probed in tests), so read cells stay
    * publish-clean. Output discarded.
    */
-  private async applyListenUnion(cell: Cell): Promise<void> {
+  private async applyListenUnion(cell: SessionCell): Promise<void> {
     const version = this.runtime.listenVersion
     const channels = this.runtime.listenUnion
     const fresh = this.cellListenVersion === -1
@@ -1492,7 +1677,7 @@ export class HostSession {
    * output. None of it writes WAL, so read cells stay publish-clean.
    * No-op for purely programmatic (SQL-level) sessions.
    */
-  private async replaySessionState(cell: Cell): Promise<void> {
+  private async replaySessionState(cell: SessionCell): Promise<void> {
     if (this.startupBytes === null && this.setStatements.length === 0) return
     const discard = { onRawData: () => {} }
     await cell.db.runExclusive(async () => {
@@ -1514,10 +1699,10 @@ export class HostSession {
    * recycle destroys their state, and the NEXT transaction's DELETE
    * ROWS contract would otherwise be silently broken).
    */
-  private async finishCommitGate(cell: Cell): Promise<boolean> {
-    if (cell.commitGatePending() === 0) return true
+  private async finishCommitGate(cell: SessionCell): Promise<boolean> {
+    if ((await cell.commitGatePending()) === 0) return true
     try {
-      cell.commitGateRun()
+      await cell.commitGateRun()
       if (this.mode === 'read') {
         const stray = await cell.captureSlice()
         if (stray !== null) cell.confirmPublished(stray.endLsn)
@@ -1567,7 +1752,7 @@ export class HostSession {
    * temp schema, holdable cursors, session advisory locks. Tainting
    * latches; the gc-pin L frame is appended once, at the transition.
    */
-  private async probeTaints(cell: Cell): Promise<void> {
+  private async probeTaints(cell: SessionCell): Promise<void> {
     const row = (
       await cell.db.query<{ temp: boolean; cur: string[]; adv: number }>(
         `select pg_my_temp_schema()::oid <> 0 as temp,
@@ -1621,12 +1806,15 @@ export class HostSession {
   private async destroyCell(): Promise<void> {
     const cell = this.cell
     const lease = this.lease
+    const lazyDir = this.lazyWorkDir
     this.cell = null
     this.lease = null
+    this.lazyWorkDir = null
     this.cellListenVersion = -1
     this.holdableNames = new Set() // cursors die with the instance
     if (cell) await cell.db.close().catch(() => undefined)
     if (lease) this.runtime.baseDirs.releaseCellDir(lease.dir)
+    if (lazyDir) rmSync(lazyDir, { recursive: true, force: true })
   }
 
   /**
@@ -1681,6 +1869,8 @@ export class HostSession {
     }
     this.cell = null
     this.lease = null
+    const lazyDir = this.lazyWorkDir
+    this.lazyWorkDir = null
     this.cellListenVersion = -1
     const { detachSlice } = await cell.closeClean()
     if (detachSlice !== null) {
@@ -1698,6 +1888,7 @@ export class HostSession {
       }
     }
     if (lease) this.runtime.baseDirs.releaseCellDir(lease.dir)
+    if (lazyDir) rmSync(lazyDir, { recursive: true, force: true })
   }
 }
 

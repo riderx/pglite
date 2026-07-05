@@ -55,7 +55,9 @@ async function setup(opts: RuntimeOpts = {}): Promise<Ctx> {
   }
 }
 
-/** The session's live cell (test hook via structural cast). */
+/** The session's live cell (test hook via structural cast). M7 W3: the
+ *  cell may be a WorkerCell whose gate members are async — call sites
+ *  await (an awaited sync value is a no-op). */
 function cellOf(s: HostSession): Cell {
   const cell = (s as unknown as { cell: Cell | null }).cell
   if (cell === null) throw new Error('session has no attached cell')
@@ -90,7 +92,7 @@ function forceLosses(s: HostSession, n: number) {
       return original(input)
     }
     try {
-      state.pendingAtCas.push(cellOf(s).commitGatePending())
+      state.pendingAtCas.push(await cellOf(s).commitGatePending())
     } catch {
       state.pendingAtCas.push(-1)
     }
@@ -151,7 +153,7 @@ describe('M5e commit gate + taint lift', () => {
         expect(probe.state.pendingAtCas.length).toBe(1)
         expect(probe.state.pendingAtCas[0]).toBeGreaterThanOrEqual(1)
         // After the landed verdict the pendings were executed.
-        expect(cellOf(s).commitGatePending()).toBe(0)
+        expect(await cellOf(s).commitGatePending()).toBe(0)
 
         // Vanilla ON COMMIT DELETE ROWS semantics preserved end-to-end.
         expect(
@@ -307,7 +309,7 @@ describe('M5e commit gate + taint lift', () => {
         // WITHOUT having run (the reset discarded it natively).
         expect(probe.state.pendingAtCas[0]).toBeGreaterThanOrEqual(1)
         expect(a.closed).toBe(false)
-        expect(cellOf(a).commitGatePending()).toBe(0)
+        expect(await cellOf(a).commitGatePending()).toBe(0)
 
         // Session continues; the next gated commit works end-to-end.
         expect(

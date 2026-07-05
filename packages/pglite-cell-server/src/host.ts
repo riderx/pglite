@@ -3,7 +3,9 @@
 // mounts on top of `connect()`; at M1c the session API is programmatic.
 
 import { mkdirSync } from 'node:fs'
+import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { ChunkCache } from '@electric-sql/pglite-cell'
 import { gatewayHandle } from './gateway'
 import type { GatewayHandle, GatewayTarget } from './gateway'
 import { DatabaseRuntime, resolveRuntimeOpts } from './database-runtime'
@@ -30,6 +32,9 @@ export class CellHost {
   private readonly dataRoot: string
   private readonly opts: ResolvedRuntimeOpts
   private readonly runtimes = new Map<string, DatabaseRuntime>()
+  /** M7 W3: the host-wide disk-backed chunk cache (lazy-worker mode) —
+   *  content-addressed, so it is shared fleet-wide across databases. */
+  readonly chunkCache: ChunkCache | undefined
 
   constructor(opts: CellHostOpts) {
     this.gateway = gatewayHandle(opts.gateway)
@@ -37,6 +42,15 @@ export class CellHost {
     this.hostId = opts.hostId ?? `host-${randomUUID().slice(0, 8)}`
     this.opts = resolveRuntimeOpts(opts.opts)
     mkdirSync(this.dataRoot, { recursive: true })
+    this.chunkCache =
+      this.opts.cellMode === 'lazy-worker'
+        ? new ChunkCache({
+            dir: join(this.dataRoot, 'chunks'),
+            maxBytes: this.opts.chunkCacheBytes,
+            fetch: (ref, offset, length) =>
+              this.gateway.getObjectRange(ref, offset, length),
+          })
+        : undefined
   }
 
   /**
@@ -54,6 +68,7 @@ export class CellHost {
         gateway: this.gateway,
         dataRoot: this.dataRoot,
         opts: this.opts,
+        chunkCache: this.chunkCache,
       })
       this.runtimes.set(databaseId, runtime)
     }
@@ -84,6 +99,7 @@ export class CellHost {
         gateway: this.gateway,
         dataRoot: this.dataRoot,
         opts: this.opts,
+        chunkCache: this.chunkCache,
       })
       this.runtimes.set(databaseId, runtime)
     }
@@ -108,6 +124,7 @@ export class CellHost {
         gateway: this.gateway,
         dataRoot: this.dataRoot,
         opts: this.opts,
+        chunkCache: this.chunkCache,
       })
       this.runtimes.set(databaseId, runtime)
     }
@@ -132,6 +149,7 @@ export class CellHost {
         gateway: this.gateway,
         dataRoot: this.dataRoot,
         opts: this.opts,
+        chunkCache: this.chunkCache,
       })
       this.runtimes.set(databaseId, runtime)
     }

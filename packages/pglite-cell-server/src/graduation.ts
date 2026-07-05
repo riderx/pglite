@@ -44,7 +44,7 @@ import {
   materializeAtHead,
   parseLsn,
 } from '@electric-sql/pglite-cell'
-import { extractDatadir } from '@electric-sql/pglite-gateway'
+import { extractCheckpoint } from '@electric-sql/pglite-gateway'
 import type { DatabaseRuntime } from './database-runtime'
 
 // `@electric-sql/pglite-tools` pgDump returns its result as a `File`, which
@@ -100,8 +100,12 @@ export async function graduateDatabase(
     // (crash recovery replays the W slices; the clean close brings the dir
     // to a genuine head). Slices whose baseLsn >= snapEnd chain from the
     // checkpoint (materialize validates the contiguity).
-    const ckptBytes = await runtime.gateway.getObject(checkpointRef)
-    await extractDatadir(ckptBytes, dataDir)
+    await extractCheckpoint(checkpointRef, dataDir, {
+      store: {
+        get: (r: string) => runtime.gateway.getObject(r),
+        put: (b: Uint8Array) => runtime.gateway.putObject(b),
+      },
+    })
     const slices = tailer.slicesSince(snapEnd)
     await materializeAtHead({ baseDir: dataDir, slices })
 

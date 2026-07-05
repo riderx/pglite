@@ -17,7 +17,7 @@ import {
   materializeAtHead,
   parseLsn,
 } from '@electric-sql/pglite-cell'
-import { GatewayCore, extractDatadir } from '@electric-sql/pglite-gateway'
+import { GatewayCore, extractCheckpoint } from '@electric-sql/pglite-gateway'
 import type { Manifest } from '@electric-sql/pglite-gateway'
 import { CellHost } from '../src/host'
 import type { RuntimeOpts } from '../src/database-runtime'
@@ -65,7 +65,12 @@ async function setup(opts?: RuntimeOpts): Promise<Ctx> {
 async function oracle<T>(ctx: Ctx, sql: string): Promise<T[]> {
   const manifest = await ctx.core.getManifest(ctx.dbId)
   const dir = join(ctx.root, `oracle-${++oracleN}`)
-  await extractDatadir(await ctx.core.getObject(manifest.checkpoint.ref), dir)
+  await extractCheckpoint(manifest.checkpoint.ref, dir, {
+    store: {
+      get: (r: string) => ctx.core.getObject(r),
+      put: (b: Uint8Array) => ctx.core.putObject(b),
+    },
+  })
   const tailer = new EraTailer(ctx.core.streamClientFor(ctx.dbId), {
     path: manifest.era.path,
     eraId: manifest.era.id,

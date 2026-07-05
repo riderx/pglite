@@ -9,6 +9,10 @@ import { parseLsn } from './lsn'
 import { readControl, readWalRange } from './datadir'
 import { shutdownCheckpointEnd } from './lsn'
 import { ConfigPinError, ZeroBootWalError } from './errors'
+import { applyLiveTail } from './live-apply'
+import type { LiveApplyResult } from './live-apply'
+import { walscanRange } from './walscan'
+import type { WalRecord } from './walscan'
 
 /** One captured page pin (read-set ring entry, kind 0 — design §4.1). */
 export interface ReadSetPage {
@@ -489,6 +493,21 @@ export class Cell {
    *  missing fork. */
   relationNblocks(spc: number, db: number, rel: number, fork: number): number {
     return this.pg.Module._pgl_relation_nblocks(spc, db, rel, fork)
+  }
+
+  /**
+   * M7 W3: the live-apply pipeline as a cell METHOD, so session code is
+   * mode-agnostic (WorkerCell runs the same pipeline inside its worker).
+   * Async for surface parity; the work is synchronous here.
+   */
+  async applyLiveTail(start: bigint, end: bigint): Promise<LiveApplyResult> {
+    return applyLiveTail(this.pg, this.dir, start, end)
+  }
+
+  /** M7 W3: classified WAL records of [start, end) (mode-agnostic — see
+   *  applyLiveTail). */
+  async walscanRange(start: bigint, end: bigint): Promise<WalRecord[]> {
+    return walscanRange(this.pg, start, end)
   }
 
   /**

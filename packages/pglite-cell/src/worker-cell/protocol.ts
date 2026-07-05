@@ -59,8 +59,9 @@ export const OP_PING = 1
  *  handler keyed by CTL_PARAM0. Exercised by tests in v1 so the bridge is
  *  proven under load before any FS faults ride it. */
 export const OP_HOSTCALL = 2
-/** RESERVED (W3): LazyCellFS chunk fault. params = (refIdx, chunkIdx,
- *  offsetLo, offsetHi) — do not reuse. */
+/** W3: LazyCellFS chunk fault. params = (fileIdx, chunkIdx, length, 0)
+ *  where fileIdx indexes the lazy file list handed to the worker at open;
+ *  the response payload is exactly `length` bytes of that chunk. */
 export const OP_FAULT_READ = 3
 
 /** Default data-SAB staging size. 4 MiB per M7 fixed decision 1. The worker
@@ -97,8 +98,15 @@ export interface WorkerBoot {
  *  replies with exactly one `done`/`fail`, preceded by zero or more `chunk`
  *  messages for `exec-unit`. Requests are serviced STRICTLY sequentially
  *  (the worker's own runExclusive). */
+/** Lazy-FS boot payload (W3): the worker constructs a LazyCellFS over
+ *  these files; chunk faults ride OP_FAULT_READ with the file's index. */
+export interface WorkerLazyBoot {
+  files: { path: string; size: number; ref: string }[]
+  chunkBytes: number
+}
+
 export type HostToWorker =
-  | { t: 'open'; id: number; dir: string }
+  | { t: 'open'; id: number; dir: string; lazy?: WorkerLazyBoot }
   | { t: 'query'; id: number; sql: string; params?: unknown[] }
   | { t: 'exec'; id: number; sql: string }
   | { t: 'exec-unit'; id: number; bytes: Uint8Array; syncToFs?: boolean }
@@ -115,6 +123,13 @@ export type HostToWorker =
       payloadBytes: number
       count: number
     }
+  // W3: run applyLiveTail worker-side (the Module + LazyCellFS hooks live
+  // there); slice bytes are already in the datadir's pg_wal (host-written).
+  | { t: 'live-apply'; id: number; start: bigint; end: bigint }
+  // W3: collect classified WAL records [start, end) worker-side.
+  | { t: 'walscan-range'; id: number; start: bigint; end: bigint }
+  // W3: LazyCellFS overlay/fault counters (zeros in passthrough mode).
+  | { t: 'lazy-stats'; id: number }
   | { t: 'close'; id: number }
   | { t: 'crash-simulate'; id: number }
 
@@ -140,7 +155,12 @@ export type WorkerToHost =
   | { t: 'ready' }
   | { t: 'chunk'; id: number; bytes: Uint8Array }
   | { t: 'done'; id: number; value: unknown; inTx: boolean }
-  | { t: 'fail'; id: number; error: string }
+  // `detail`/`code` relay PGlite error decorations (e.g. the native
+  // `sequence lease exhausted` errdetail the session renewal path keys on).
+  | { t: 'fail'; id: number; error: string; detail?: string; code?: string }
+  // W3 (the W1 notification-relay gap): the worker's PGlite fired a
+  // NOTIFY — relayed so WorkerCellDb.onNotification matches PGlite's.
+  | { t: 'notify'; channel: string; payload: string }
 
 /** Identity snapshot as returned by the worker (parsed pgl_get_identity). */
 export interface WorkerIdentity {

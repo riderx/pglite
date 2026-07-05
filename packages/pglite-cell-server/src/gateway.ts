@@ -5,6 +5,7 @@
 // DS server and object store stay behind it.
 
 import { DsStreamClient } from '@electric-sql/pglite-cell'
+import { fetchObjectRange } from '@electric-sql/pglite-gateway'
 import type { GatewayCore, Manifest } from '@electric-sql/pglite-gateway'
 
 /** Constructor target: an embedded core or a remote gateway base URL. */
@@ -70,6 +71,13 @@ export interface GatewayHandle {
   resolveDatabaseId(nameOrId: string): Promise<string>
   getManifest(databaseId: string): Promise<Manifest>
   getObject(ref: string): Promise<Uint8Array>
+  /** Ranged object read (M7 W3): `length` bytes at `offset` of `ref` —
+   *  the lazy-VFS chunk fetch (256 KiB aligned chunks). */
+  getObjectRange(
+    ref: string,
+    offset: number,
+    length: number,
+  ): Promise<Uint8Array>
   /** Store bytes; returns the content-address ref (M1e checkpoint object). */
   putObject(bytes: Uint8Array): Promise<{ ref: string }>
   /** The latest (highest-LSN) checkpoint row for a database, or null. */
@@ -130,6 +138,14 @@ class InProcessGatewayHandle implements GatewayHandle {
 
   getObject(ref: string): Promise<Uint8Array> {
     return this.core.getObject(ref)
+  }
+
+  getObjectRange(
+    ref: string,
+    offset: number,
+    length: number,
+  ): Promise<Uint8Array> {
+    return this.core.getObjectRange(ref, offset, length)
   }
 
   putObject(bytes: Uint8Array): Promise<{ ref: string }> {
@@ -237,6 +253,14 @@ class HttpGatewayHandle implements GatewayHandle {
       )
     }
     return new Uint8Array(await res.arrayBuffer())
+  }
+
+  getObjectRange(
+    ref: string,
+    offset: number,
+    length: number,
+  ): Promise<Uint8Array> {
+    return fetchObjectRange(this.base, ref, offset, length)
   }
 
   async putObject(bytes: Uint8Array): Promise<{ ref: string }> {

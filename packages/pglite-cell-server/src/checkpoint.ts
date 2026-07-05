@@ -27,7 +27,7 @@
 import { formatLsn, parseLsn } from '@electric-sql/pglite-cell'
 import type { KFrame } from '@electric-sql/pglite-cell'
 import { shutdownCheckpointStart } from '@electric-sql/pglite-cell'
-import { packDatadir } from '@electric-sql/pglite-gateway'
+import { packDatadir, packDatadirV3 } from '@electric-sql/pglite-gateway'
 import type { DatabaseRuntime } from './database-runtime'
 import { AdvanceRaceError } from './errors'
 
@@ -62,6 +62,11 @@ export async function checkpointDatabase(
   // whose fresh SYNC slice moves the head and defeats the OTHER host's
   // in-flight K. Double the solo bound and jitter the retries (below) so
   // one side wins quickly instead of strict alternation to exhaustion.
+  // M7 W3: packing (and the canonical ensure's materialize boot) reads
+  // every datadir file — in lazy-worker mode the canonical dir must be
+  // hydrated first (no-op in nodefs mode / when already hydrated).
+  await runtime.ensureCanonicalHydrated()
+
   const maxAttempts = runtime.opts.attachAttempts * 2
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     // (1) Bring the shared base to a genuine stream position (write-attach):
@@ -98,9 +103,22 @@ export async function checkpointDatabase(
     }
 
     // (2) Pack the canonical dir -> content-addressed object. The ref
-    // encodes the sha256; reuse it rather than re-hashing.
-    const packed = await packDatadir(runtime.baseDirs.canonicalDir)
-    const { ref: checkpointRef } = await runtime.gateway.putObject(packed)
+    // encodes the sha256; reuse it rather than re-hashing. In lazy-worker
+    // mode pack format v3 (per-file content-addressed + manifest) so the
+    // NEXT wake/attach gets the lazy skeleton + ranged chunk faults.
+    let checkpointRef: string
+    let objectBytes: number
+    if (runtime.opts.cellMode === 'lazy-worker') {
+      const v3 = await packDatadirV3(runtime.baseDirs.canonicalDir, {
+        put: (bytes) => runtime.gateway.putObject(bytes),
+      })
+      checkpointRef = v3.manifestRef
+      objectBytes = v3.eagerBytes + v3.lazyBytes
+    } else {
+      const packed = await packDatadir(runtime.baseDirs.canonicalDir)
+      checkpointRef = (await runtime.gateway.putObject(packed)).ref
+      objectBytes = packed.length
+    }
     const sha256 = checkpointRef // sha256:<hex>
 
     // (3) CAS-append the K frame at the era head. A seq-conflict means a
@@ -153,7 +171,7 @@ export async function checkpointDatabase(
       snapEnd: snapEndText,
       streamOffset,
       checkpointRef,
-      objectBytes: packed.length,
+      objectBytes,
     }
   }
   throw new AdvanceRaceError(maxAttempts)
