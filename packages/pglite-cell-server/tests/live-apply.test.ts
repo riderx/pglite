@@ -6,14 +6,11 @@
 // state that a recycle destroys) survives advances whenever live apply
 // succeeds; the pin/fatal contract is unchanged whenever it does not.
 //
-// SCOPE NOTE (deviation from the M5b brief, reported loudly): a
-// temp-TABLE-tainted session is WRITE-attached in this architecture (temp
-// DDL writes catalog WAL → nonempty capture → write-upgrade), and a write
-// cell can never live-advance in v1 — its WAL insert position IS its CAS
-// base, and moving the base without moving the insert position (M5c's
-// rewind) would publish slices that do not chain. The lifted-pin test
-// therefore uses the read-attached taints (advisory locks + WITH HOLD
-// cursors); the temp-table test asserts the M1 contract is PRESERVED.
+// M5c UPDATE: the WAL insert-position set (pgl_set_wal_position) lifted
+// the write-cell restriction — a write-attached (incl. temp-table-tainted)
+// session now live-advances in place when the tail passes the v2 gate
+// (semantic eager set + rm_redo-whitelisted rmgrs + FPI leftovers), and
+// test 3 below is the flipped M5b-deferred temp-table test.
 
 import { describe, it, expect } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -238,7 +235,7 @@ describe('live tail apply v1 (M5b)', () => {
   )
 
   it(
-    '3. temp-table sessions (write-attached by construction) keep the M1 contract: pinned, and a lost race is still a fatal reset (live apply never touches write cells)',
+    '3. temp-table sessions (write-attached by construction) live-advance IN PLACE (M5c lifts the write-cell restriction): temp state survives, and a post-advance write LANDS instead of the M1 fatal reset',
     async () => {
       const ctx = await setup()
       try {
@@ -254,22 +251,30 @@ describe('live tail apply v1 (M5b)', () => {
         // A foreign commit races past the pinned base.
         await w.query(`insert into lw values ('foreign')`)
 
-        // Reads on the pinned session still serve its base (no advance —
-        // write cells cannot live-advance in v1) and its temp state.
+        // M5c: the pinned WRITE session advances in place — the redo
+        // harness applies the foreign heap insert and the WAL insert
+        // position moves to the new head. Temp state survives (the cell
+        // is never recycled) and the foreign row becomes visible.
+        const hitsBefore = liveApplyStats.hits
+        expect((await t.query(`select v from stash`)).rows).toEqual([
+          { v: 'mine' },
+        ])
+        expect(liveApplyStats.hits).toBeGreaterThan(hitsBefore)
+        expect((await t.query(`select v from lw`)).rows).toEqual([
+          { v: 'foreign' },
+        ])
+
+        // The M5b-deferred flip: a write from the ADVANCED head now lands
+        // instead of losing the race and fatally resetting the session.
+        await t.query(`insert into lw values ('mine-2')`)
         expect((await t.query(`select v from stash`)).rows).toEqual([
           { v: 'mine' },
         ])
 
-        // A write from the pinned base loses the race → the M1 fatal
-        // reset contract, unchanged.
-        let err: unknown
-        try {
-          await t.query(`insert into lw values ('doomed')`)
-        } catch (e) {
-          err = e
-        }
-        expect(err).toBeDefined()
-        expect(String((err as Error).message)).toMatch(/session|reset|fatal/i)
+        expect(await oracle(ctx, `select v from lw order by v`)).toEqual([
+          { v: 'foreign' },
+          { v: 'mine-2' },
+        ])
       } finally {
         await ctx.teardown()
       }

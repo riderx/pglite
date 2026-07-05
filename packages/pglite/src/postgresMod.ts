@@ -107,6 +107,24 @@ export interface PostgresMod
   _pgl_smgr_destroy_all: () => void
   // Read-set capture (pgl_readset.c, design §4.1) — machinery for the M5d
   // rebase validator. Entries are packed uint32 x5.
+  // In-place reset + single-record redo (pgl_reset.c / pgl_walscan.c,
+  // design §3.4/§5.1/§14.2, M5c).
+  _pgl_walscan_redo_current: () => number
+  _pgl_redo_whitelisted: (rmid: number, info: number) => number
+  _pgl_get_identity: () => number
+  _pgl_get_prev_record_lsn: () => bigint
+  _pgl_storage_write_count: () => bigint
+  _pgl_flush_base: () => number
+  _pgl_flush_wal: () => number
+  _pgl_set_wal_position: (endOfLog: bigint, lastRec: bigint) => number
+  _pgl_reset_to_base: (
+    baseLsn: bigint,
+    prevRecLsn: bigint,
+    baseNextFullXid: bigint,
+    baseNextOid: number,
+    baseNextMulti: number,
+    baseNextOffset: number,
+  ) => number
   _pgl_readset_enable: (on: number) => void
   _pgl_readset_reset: () => void
   _pgl_readset_count: () => number

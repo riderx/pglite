@@ -317,15 +317,21 @@ describe('CellProxyServer (M1d exit)', () => {
         await a.query(`create temp table tt (x int)`)
         expect(ctx.sessions[1].tainted).toBe(true)
 
+        // M5c NOTE: a one-shot write on a stale pinned base no longer
+        // loses when the foreign tail is live-appliable (write cells
+        // advance in place now — see live-apply test 3). The fatal-reset
+        // contract still governs losses with no advance window: race the
+        // foreign commit INSIDE A's interactive transaction, so the CAS
+        // loss happens at COMMIT with the taint intact.
+        await a.query(`begin`)
+        await a.query(`insert into t4 values (2)`)
+
         const b = await connect(ctx)
         await b.query(`insert into t4 values (1)`)
 
-        // A is pinned at its stale base; its next publish loses and the
-        // taint routes the loss to a FATAL session reset (§3.3), never a
-        // silent continuation against vanished temp state.
         let err: unknown
         try {
-          await a.query(`insert into t4 values (2)`)
+          await a.query(`commit`)
         } catch (e) {
           err = e
         }

@@ -78,7 +78,7 @@ async function setup(): Promise<Ctx> {
       await proxy.stop().catch(() => undefined)
       await host.shutdown().catch(() => undefined)
       await core.stop()
-      rmSync(root, { recursive: true, force: true })
+      if (!process.env.PGL_KEEP) rmSync(root, { recursive: true, force: true })
     },
   }
 }

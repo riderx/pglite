@@ -55,19 +55,31 @@ vanilla-behaving when unconfigured).
   + single-page redo can follow). Lifts the diverged-base re-materialize
   cost and the no-restart-DDL claim.
 
-## M5c — in-place reset + commit gate
+## M5c — in-place reset + single-page redo (SHIPPED; commit gate moved out)
+
+SCOPE TRIM (2026-07): the commit gate (SAB/Atomics bridge, §3.6 reorder)
+moved out of M5c — it follows the M5d rebase work. M5c as shipped:
 
 - **In-place reset at crash-recovery-grade scope** (§3.4/§5.1):
-  counters (`TransamVariables`, `MultiXactState`), ALL SLRU buffers,
+  counters (`TransamVariables`, `MultiXactState`), SLRU state,
   sequence caches, relcache/syscache/plancache flush, losing-attempt
   temp storage, WAL insert position rewind — over the existing
   `__PGLITE__` anchors in clog/subtrans/transam/multixact. Replaces
-  recycle for CAS-loss reset; recycle remains the fallback.
-- **Commit gate**: block inside `CommitTransaction` awaiting the CAS
-  verdict via a synchronous JS import (the SAB/Atomics bridge — Tier-1
-  salvage of the shared-memory build variant), enabling the §3.6
-  commit-sequence reorder (temp-truncate after CAS) and mid-COMMIT
-  loss handling without recycle.
+  recycle for CAS-loss reset; recycle remains the fallback (gated on
+  the storage-write counter — see pgl_reset.c's scope notes for why
+  SLRU handling is speculative-range clears, not dirty discard).
+- **Single-record redo** (`pgl_walscan_redo_current`, §14.2): the
+  resident rm_redo driven against the LIVE buffer manager for the
+  buffer-only rmgrs, plus `pgl_set_wal_position` (advance + rewind of
+  the single-backend insert state). Lifts live-apply's FPI-only gate
+  AND the write-cell restriction; temp-table pinned sessions now
+  live-advance (the M5b deferred test, flipped).
+- **Commit gate** (moved to follow M5d): block inside
+  `CommitTransaction` awaiting the CAS verdict via a synchronous JS
+  import (the SAB/Atomics bridge — Tier-1 salvage of the shared-memory
+  build variant), enabling the §3.6 commit-sequence reorder
+  (temp-truncate after CAS) and mid-COMMIT loss handling without
+  recycle.
 
 ## M5d — logical re-apply + the full rebase ladder
 

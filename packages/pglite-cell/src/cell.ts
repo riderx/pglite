@@ -34,6 +34,45 @@ const CONFIG_PINS: { name: string; expected: string }[] = [
 ]
 
 /**
+ * Base snapshot for in-place reset (M5c, design §3.4/§5.1): the identity
+ * counters + WAL chain position + storage-write counter captured at a
+ * moment when the WAL insert position sat exactly at the capture cursor.
+ */
+export interface BaseSnapshot {
+  /** The base LSN this snapshot was taken at (== captureCursor then). */
+  lsn: bigint
+  /** Start LSN of the last record before base (xl_prev restore). */
+  prevRecLsn: bigint
+  nextXid: bigint
+  nextOid: number
+  nextMulti: number
+  nextOffset: number
+  /** pgl_storage_writes at snapshot time (reset soundness gate). */
+  writes: bigint
+}
+
+/** Cumulative in-place reset counters (per process). */
+export const resetStats = {
+  inPlace: 0,
+  fallbackRecycle: 0,
+  /** reason -> count for reset fallbacks. */
+  reasons: new Map<string, number>(),
+}
+
+if (process.env.PGLITE_LIVE_APPLY_STATS === '1') {
+  process.on('exit', () => {
+    console.log(
+      `[reset] inPlace=${resetStats.inPlace} fallbackRecycle=${resetStats.fallbackRecycle} reasons=${JSON.stringify(Object.fromEntries(resetStats.reasons))}`,
+    )
+  })
+}
+
+function resetFallback(reason: string): void {
+  resetStats.fallbackRecycle++
+  resetStats.reasons.set(reason, (resetStats.reasons.get(reason) ?? 0) + 1)
+}
+
+/**
  * A solo cell: plain-opens a materialized datadir (no recovery, no
  * synthesis, zero boot WAL), asserts the §9 config pins and the
  * zero-boot-WAL invariant, and manages the capture cursor across
@@ -90,7 +129,9 @@ export class Cell {
       if (insertLsn !== opts.expectedHeadLsn) {
         throw new ZeroBootWalError(opts.expectedHeadLsn, insertLsn)
       }
-      return new Cell(dir, pg, opts.expectedHeadLsn)
+      const cell = new Cell(dir, pg, opts.expectedHeadLsn)
+      cell.maybeSnapshotBase()
+      return cell
     } catch (err) {
       await pg.close().catch(() => undefined)
       throw err
@@ -111,6 +152,40 @@ export class Cell {
   async captureSlice(): Promise<CapturedSlice | null> {
     const end = await this.bookmark()
     if (end === this.cursor) return null
+    // Temp-only transactions commit through the ASYNC path (no XLogFlush,
+    // and no walwriter exists to catch up) — flush explicitly so the
+    // captured bytes are never a torn tail (M5c finding; generalizes the
+    // M4 abort-tail finding).
+    this.flushWal()
+    if (process.env.PGL_VALIDATE_SLICES === '1') {
+      // Debug oracle: the captured range must parse end-to-end with the
+      // native reader BEFORE it can be published.
+      const mod = this.pg.Module
+      if (mod._pgl_walscan_begin(this.cursor, end, 1) === 0) {
+        let last = this.cursor
+        for (;;) {
+          const ptr = mod._pgl_walscan_next()
+          if (ptr === 0) break
+          const rec = JSON.parse(mod.UTF8ToString(ptr)) as {
+            error?: string
+            end?: string
+          }
+          if (rec.error !== undefined) {
+            console.error(
+              `[cell] TORN SLICE CAPTURED [${this.cursor}, ${end}): ${rec.error} (last good ${last})`,
+            )
+            break
+          }
+          last = BigInt(rec.end!)
+        }
+        mod._pgl_walscan_end_scan()
+        if (last !== end) {
+          console.error(
+            `[cell] slice scan stopped at ${last}, expected ${end} (base ${this.cursor})`,
+          )
+        }
+      }
+    }
     return {
       baseLsn: this.cursor,
       endLsn: end,
@@ -118,12 +193,126 @@ export class Cell {
     }
   }
 
+  /** Flush local WAL through the insert position (pgl_flush_wal). */
+  flushWal(): void {
+    this.pg.Module._pgl_flush_wal()
+  }
+
   /**
    * Advance the capture cursor to `endLsn`. Call ONLY after the slice
    * ending there landed on the stream (a landed CAS append).
    */
-  confirmPublished(endLsn: bigint): void {
+  confirmPublished(endLsn: bigint, opts: { flush?: boolean } = {}): void {
     this.cursor = endLsn
+    this.maybeSnapshotBase(opts)
+  }
+
+  private base: BaseSnapshot | null = null
+
+  /** The last successfully captured base snapshot (null before first). */
+  get baseSnapshot(): BaseSnapshot | null {
+    return this.base
+  }
+
+  /**
+   * Capture a base snapshot IF the WAL insert position currently sits at
+   * the capture cursor (i.e. nothing unpublished is pending). Cheap: one
+   * synchronous WASM call, no SQL. Call between transactions — after
+   * open, after every `confirmPublished`, after `advanceTo`. When the
+   * insert position is past the cursor (e.g. locally-aborted WAL not yet
+   * swept into a slice), the previous snapshot — still anchored at the
+   * cursor — is deliberately kept.
+   */
+  maybeSnapshotBase(opts: { flush?: boolean } = {}): void {
+    const mod = this.pg.Module
+    let ptr = mod._pgl_get_identity()
+    if (ptr === 0) return
+    let raw = JSON.parse(mod.UTF8ToString(ptr)) as {
+      nextXid: string
+      nextOid: number
+      nextMulti: number
+      nextOffset: number
+      prevRecLsn: string
+      insertLsn: string
+      writes: string
+    }
+    if (BigInt(raw.insertLsn) !== this.cursor) return
+    if (opts.flush !== false) {
+      // Make base a LOCAL DURABILITY POINT (see pgl_reset.c): flush all
+      // dirty pages + SLRUs so a later in-place reset's discard+reread
+      // lands exactly on base. Re-read the identity afterwards — the
+      // flush itself bumps the storage-write counter.
+      if (mod._pgl_flush_base() !== 0) return
+      ptr = mod._pgl_get_identity()
+      if (ptr === 0) return
+      raw = JSON.parse(mod.UTF8ToString(ptr)) as typeof raw
+    }
+    this.base = {
+      lsn: this.cursor,
+      prevRecLsn: BigInt(raw.prevRecLsn),
+      nextXid: BigInt(raw.nextXid),
+      nextOid: raw.nextOid,
+      nextMulti: raw.nextMulti,
+      nextOffset: raw.nextOffset,
+      writes: BigInt(raw.writes),
+    }
+  }
+
+  /**
+   * Is an in-place reset to the current base sound right now? Requires a
+   * snapshot anchored at the capture cursor and NO storage writes (data
+   * pages, SLRU pages, smgr extends) having escaped shared memory since —
+   * otherwise on-disk state may hold speculative bytes a reset cannot
+   * undo, and the caller must recycle.
+   */
+  canResetInPlace(): boolean {
+    if (this.base === null || this.base.lsn !== this.cursor) {
+      resetFallback('no-base-snapshot')
+      return false
+    }
+    if (this.pg.Module._pgl_storage_write_count() !== this.base.writes) {
+      resetFallback('storage-writes-since-base')
+      return false
+    }
+    return true
+  }
+
+  /**
+   * In-place reset to base (M5c, §3.4/§5.1 scope): discard speculative
+   * shared buffers / SLRU ranges / counters / caches / temp storage and
+   * rewind the WAL insert position to the capture cursor. Throws on any
+   * native failure — the caller MUST recycle then (state may be
+   * part-mutated). Only call between transactions after a CAS loss.
+   */
+  resetToBase(): void {
+    const base = this.base
+    if (base === null || base.lsn !== this.cursor) {
+      throw new Error('resetToBase: no base snapshot at cursor')
+    }
+    const rc = this.pg.Module._pgl_reset_to_base(
+      base.lsn,
+      base.prevRecLsn,
+      base.nextXid,
+      base.nextOid,
+      base.nextMulti,
+      base.nextOffset,
+    )
+    if (rc !== 0) {
+      resetFallback(`native-${rc}`)
+      throw new Error(`resetToBase: native reset failed (${rc})`)
+    }
+    resetStats.inPlace++
+    // The snapshot remains the valid base description post-reset.
+  }
+
+  /**
+   * Advance the capture cursor to `endLsn` after a successful LIVE tail
+   * apply (the local WAL now holds the foreign bytes and the insert
+   * position was set to `endLsn`), then re-snapshot the base.
+   */
+  advanceTo(endLsn: bigint, opts: { flush?: boolean } = {}): void {
+    this.cursor = endLsn
+    this.maybeSnapshotBase(opts)
   }
 
   /**

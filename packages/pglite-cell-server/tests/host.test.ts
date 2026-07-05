@@ -242,13 +242,28 @@ describe('CellHost (M1c exit)', () => {
           'committed',
         )
 
-        // A's next publish (the temp-table insert's commit record, or the
-        // real-table insert) loses; a tainted loss is a FATAL reset, never
-        // a silent continuation against vanished temp state.
+        // M5c: a one-shot publish from the stale pinned base no longer
+        // loses when the tail is live-appliable — the write cell advances
+        // in place, keeping temp state, and the publish LANDS. The fatal
+        // contract still governs losses with no advance window: race the
+        // foreign commit inside A's interactive transaction.
+        expect((await a.exec(`insert into tt values (1)`)).outcome).toBe(
+          'committed',
+        )
+        expect((await a.exec(`insert into t4 values (2)`)).outcome).toBe(
+          'committed',
+        )
+        expect((await a.exec(`select x from tt`)).rows).toEqual([{ x: 1 }])
+
+        await a.exec(`begin`)
+        await a.exec(`insert into t4 values (3)`)
+        const c = await ctx.host.connect('appdb')
+        expect((await c.exec(`insert into t4 values (4)`)).outcome).toBe(
+          'committed',
+        )
         let fatal: unknown
         try {
-          await a.exec(`insert into tt values (1)`)
-          await a.exec(`insert into t4 values (2)`)
+          await a.exec(`commit`)
         } catch (err) {
           fatal = err
         }
@@ -259,12 +274,13 @@ describe('CellHost (M1c exit)', () => {
           SessionClosedError,
         )
 
-        // Exactly-once: only B's row landed.
+        // Exactly-once: B's, A's landed one-shots and C's row — never the
+        // raced interactive insert.
         const rows = await oracle<{ x: number }>(
           ctx,
           `select x from t4 order by x`,
         )
-        expect(rows).toEqual([{ x: 1 }])
+        expect(rows).toEqual([{ x: 1 }, { x: 2 }, { x: 4 }])
       } finally {
         await ctx.teardown()
       }

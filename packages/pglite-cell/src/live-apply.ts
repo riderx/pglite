@@ -10,17 +10,19 @@
 //   processing + buffer eviction for touched blocks + smgr create handling
 //   + full-page-image restore to disk for has_image blocks.
 //
-// Page-content soundness (the gate): heap/index page CHANGES live in WAL
-// records this v1 does not redo, so a block whose record carries no
-// restorable image would be served STALE from disk after buffer eviction.
-// A batch is live-appliable iff every block ref of every W record carries
-// a full-page image (restored to the datadir here), except sequence pages
-// (§5.3: allocation authority is the lease, never the page — foreign
-// advancement is irrelevant locally and the local page must NOT be
-// clobbered or evicted). will_init-without-image blocks (fresh pages
-// rebuilt by redo from record data) are NOT appliable — that is the page
-// materialization follow-up. Everything else falls back to the existing
-// recycle-advance path.
+// Page-content soundness (the gate), v2 (M5c): records of buffer-only
+// rmgrs (heap/heap2/btree/hash/gin/gist/spgist/brin/generic + xlog FPI)
+// are applied through the native single-record redo harness
+// (pgl_walscan_redo_current → the resident rm_redo against the live
+// buffer manager), which handles images, record-data redo, init pages and
+// relation extension alike. Remaining records must either be in the
+// semantic eager set, be sequence records (§5.3: allocation authority is
+// the lease, never the page — the local page must NOT be clobbered or
+// evicted), or carry restorable full-page images for every block.
+// Everything else falls back to the recycle-advance path. The WAL insert
+// position is advanced to the applied head before redo (page LSNs set by
+// redo must be covered by local flush state) — which is also what makes
+// WRITE cells live-advanceable: they publish from the new head.
 
 import { closeSync, existsSync, openSync, rmSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
@@ -42,6 +44,43 @@ const FALLBACK_KINDS = new Set([
  *  skip silently: tablespace (5) and relmap (7) mutate files/state we do
  *  not handle. Standby (8) is metadata-noise and safe. */
 const FALLBACK_RMIDS = new Set([5, 7])
+
+/**
+ * M5c single-record redo (design §14.2): rmgrs whose redo routines are
+ * buffer-only, applied to the LIVE cell via the native rm_redo harness
+ * (pgl_walscan_redo_current). Mirror of pglws_redo_whitelisted in
+ * pgl_walscan.c: heap2 (9, except REWRITE 0x00 — writes mapping files),
+ * heap (10), btree (11), hash (12), gin (13), gist (14), spgist (16),
+ * brin (17), generic (20); xlog (0) FPI records are redoable too.
+ */
+const REDO_RMIDS = new Set([9, 10, 11, 12, 13, 14, 15, 16, 17, 20])
+const XLOG_HEAP_OPMASK = 0x70
+
+export function isRedoable(rec: WalRecord): boolean {
+  if (rec.rmid === 0) return rec.kind === 'fpi'
+  if (rec.rmid === 9) return (rec.info & XLOG_HEAP_OPMASK) !== 0x00
+  return REDO_RMIDS.has(rec.rmid)
+}
+
+// SEQUENCE NOTE (M5c revision of the M5b skip): XLOG_SEQ_LOG records ARE
+// redone (seq_redo, buffer-only page reinit from the logged tuple). The
+// M5b "never touch the local sequence page" skip left sequences CREATED
+// after base as zero-length files (their only page write is the seq_log
+// record), which broke any later page read (pg_sequences probes). §5.3
+// still holds: allocation AUTHORITY stays with leases/floors — after a
+// write-cell advance the session re-applies floors (covers local
+// abort-observed draws the foreign page state may sit below) and
+// re-clamps leases with caches flushed; read cells' local draws never
+// persist (a draw write-upgrades and recycles the cell).
+
+/** Thrown when a batch failed mid-apply: the cell is part-advanced and
+ *  MUST be recycled by the caller. */
+export class LiveApplyAbortError extends Error {
+  constructor(message: string) {
+    super(`live-apply aborted mid-batch: ${message}`)
+    this.name = 'LiveApplyAbortError'
+  }
+}
 
 /** Cumulative counters (per process) — honest hit-rate data for the
  *  page-materialization follow-up decision. */
@@ -83,7 +122,7 @@ export function isLiveAppliable(records: WalRecord[]): boolean {
       return fallback(rec.kind)
     }
     if (FALLBACK_RMIDS.has(rec.rmid)) return fallback(`rmid-${rec.rmid}`)
-    if (rec.kind === 'seq_log') continue // lease-governed; page untouched
+    if (isRedoable(rec)) continue // M5c: applied via native rm_redo (incl. seq)
     for (const b of rec.blocks) {
       if (!b.img) {
         if (process.env.PGLITE_LIVE_APPLY_DEBUG === '1') {
@@ -191,6 +230,18 @@ export function applyLiveTail(
   }
 
   const mod = pg.Module
+
+  // M5c: advance the WAL insert position to the applied head FIRST. Redo
+  // sets page LSNs up to `end`; a later FlushBuffer would XLogFlush those
+  // LSNs, which must already be covered by the local write/flush state.
+  // (The slice bytes are in pg_wal; read cells never publish, and write
+  // cells publish from the new head — this is what lifts the M5b
+  // write-cell restriction.)
+  const lastRec = records[records.length - 1].lsn
+  if (mod._pgl_set_wal_position(end, lastRec) !== 1) {
+    return { applied: false, records: records.length }
+  }
+
   const touchedRels = new Map<string, [number, number, number]>()
 
   walscan(pg, start, end, (rec, imageOf) => {
@@ -198,8 +249,49 @@ export function applyLiveTail(
     // record's xl_xid, plus payload xids below.
     if (rec.xid > 0) mod._pgl_advance_xid_past(rec.xid)
 
+    // M5c: buffer-only rmgrs go through the native rm_redo harness — the
+    // real redo routine against the live buffer manager (images restored,
+    // record data applied, pages extended, FSM/VM maintained). No eviction
+    // and no direct file writes for these (incl. seq_log — see the
+    // SEQUENCE NOTE above).
+    if (isRedoable(rec)) {
+      const r = mod._pgl_walscan_redo_current()
+      if (r === 1) {
+        for (const b of rec.blocks) touchedRels.set(b.rel.join('/'), b.rel)
+        // heap_inplace carries invals redo does not process outside hot
+        // standby — apply them exactly as the non-redo path does.
+        if (
+          rec.kind === 'heap_inplace' &&
+          (rec.nmsgs ?? 0) > 0 &&
+          rec.invals !== undefined
+        ) {
+          withHeapBytes(pg, rec.invals, (ptr) =>
+            mod._pgl_process_invals(
+              ptr,
+              rec.nmsgs!,
+              rec.relcacheInitFileInval ?? false,
+              rec.dbId ?? 0,
+              rec.tsId ?? 0,
+            ),
+          )
+        }
+        return
+      }
+      if (r < 0) {
+        throw new LiveApplyAbortError(
+          `rm_redo failed (${r}) at ${rec.lsn} rmid=${rec.rmid} info=${rec.info}`,
+        )
+      }
+      // r === 0 (native whitelist narrower than ours): fall through to the
+      // image path; the gate guaranteed images only for non-redoable
+      // records, so this is a mirror bug — fail loudly.
+      throw new LiveApplyAbortError(
+        `whitelist mirror mismatch at ${rec.lsn} rmid=${rec.rmid} info=${rec.info}`,
+      )
+    }
+
     // Page images + buffer eviction for every touched block.
-    if (rec.kind !== 'seq_log') {
+    {
       for (let i = 0; i < rec.blocks.length; i++) {
         const b = rec.blocks[i]
         const page = imageOf(i)

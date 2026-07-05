@@ -576,6 +576,11 @@ export class HostSession {
       if (cell === null) throw new SessionClosedError('cell attach failed')
       const wasInTxn = cell.db.isInTransaction()
 
+      // M5c: refresh the in-place-reset base snapshot whenever we start a
+      // unit between transactions (cheap; keeps the last cursor-anchored
+      // snapshot when unpublished local WAL is pending).
+      if (!wasInTxn) cell.maybeSnapshotBase({ flush: this.mode === 'write' })
+
       // Cell auto-LISTEN delta (M3, §10.2 step 2): when the host LISTEN
       // union changed since this cell last synced, re-apply it between
       // units (never mid-transaction). Rides the session's own unit queue
@@ -776,7 +781,27 @@ export class HostSession {
         this.runtime.removeSession(this)
         throw new FatalSessionResetError(this.taintNames())
       }
-      await this.destroyCell() // recycle-to-head happens on next attach
+      // M5c in-place reset (§3.4/§5.1): discard the speculative state
+      // without recycling when the soundness gate passes (base snapshot at
+      // cursor + zero storage writes since). Belt and braces: ANY error
+      // falls back to the recycle path.
+      if (attempt === 0 && cell.canResetInPlace()) {
+        try {
+          cell.resetToBase()
+          // Recycle semantics re-attach AT HEAD unconditionally; match
+          // that by advancing the reset cell to the true head right away
+          // (the watermark gate alone can lag non-commit winners like
+          // checkpoint sync/K appends). Falls back to recycle inside.
+          if (!(await this.tryLiveAdvance())) await this.destroyCell()
+          // Repeat losses fall through to the recycle path (attempt > 0
+          // above): the canonical re-attach publishes a sync slice, which
+          // restores the M1 convergence pressure under hot contention.
+        } catch {
+          await this.destroyCell()
+        }
+      } else {
+        await this.destroyCell() // recycle-to-head happens on next attach
+      }
       if (wasInTxn) {
         // Interactive COMMIT loss: 40001; the session survives and its
         // next statement attaches a fresh cell at head.
@@ -811,13 +836,14 @@ export class HostSession {
       const inTxn = this.cell.db.isInTransaction()
       if (inTxn) return
       if (this._tainted) {
-        // M5b live tail apply: a tainted (pinned) READ session may still
-        // advance IN PLACE when the new tail is live-appliable — its temp
-        // state survives because the cell is never recycled. When the
-        // gate rejects (fallback would need a recycle), the session
-        // simply STAYS PINNED at its base — the M1 contract unchanged.
+        // M5b/M5c live tail apply: a tainted (pinned) session — read OR
+        // write-attached (M5c lifts the write restriction via the WAL
+        // insert-position set) — may still advance IN PLACE when the new
+        // tail is live-appliable: its temp state survives because the
+        // cell is never recycled. When the gate rejects (fallback would
+        // need a recycle), the session simply STAYS PINNED at its base —
+        // the M1 contract unchanged.
         if (
-          this.mode === 'read' &&
           this.freshness.mode !== 'local' &&
           this.freshness.mode !== 'pinned' &&
           this.streamPos.lsn < this.runtime.watermark.lsn
@@ -836,7 +862,7 @@ export class HostSession {
       // M5b live tail apply: prefer advancing the LIVE cell (eager set via
       // pgl_* primitives + FPI restore) over recycle+re-materialize. Falls
       // through to the recycle path when the batch is not live-appliable.
-      if (this.mode === 'read' && (await this.tryLiveAdvance())) return
+      if (await this.tryLiveAdvance()) return
       await this.destroyCell()
     } else if (this.freshness.mode === 'linearizable' && !this._tainted) {
       await this.runtime.linearizableSync()
@@ -916,7 +942,7 @@ export class HostSession {
    */
   private async tryLiveAdvance(): Promise<boolean> {
     const cell = this.cell
-    if (cell === null || this.mode !== 'read') return false
+    if (cell === null) return false
     try {
       await this.runtime.tailer.catchUp()
       const head = this.runtime.tailer.head
@@ -935,6 +961,9 @@ export class HostSession {
       // and apply. Read cells never publish, so overwriting their local
       // (unpublished boot) WAL range with foreign bytes is safe: pg_wal
       // past the cell's own insert position is scratch.
+      // Flush local WAL first: pending async-commit bytes or cached WAL
+      // pages must never overwrite the transplanted foreign bytes later.
+      cell.flushWal()
       for (const s of slices) {
         writeWalRange(cell.dir, s.baseLsn, s.bytes)
       }
@@ -952,7 +981,29 @@ export class HostSession {
       }
       const res = applyLiveTail(cell.db, cell.dir, this.streamPos.lsn, head.lsn)
       if (!res.applied) return false
+      // M5c: applyLiveTail set the WAL insert position to the new head —
+      // move the capture cursor with it (write cells publish from here;
+      // read cells keep cursor == insert for the write-upgrade probe) and
+      // re-snapshot the reset base.
+      cell.advanceTo(head.lsn, { flush: this.mode === 'write' })
       this.streamPos = { offset: head.offset, lsn: head.lsn }
+      if (this.mode === 'write') {
+        // Sequence discipline after a write-cell advance (§5.3): the
+        // applied foreign page state may sit BELOW local abort-observed
+        // draws — re-floor (publishes a floors slice when needed) and
+        // re-clamp leases with the SeqTable cache flushed.
+        const floors = await this.runtime.applyFloors(cell)
+        if (floors.lost) {
+          await this.destroyCell()
+          return false
+        }
+        this.runtime.applyLeases(cell, { resetCaches: true })
+        if (floors.pos !== null) {
+          // applyFloors already confirmed the published floors slice
+          // (cursor + base snapshot follow it inside confirmPublished).
+          this.streamPos = floors.pos
+        }
+      }
       this.lastAdvanceAt = Date.now()
       return true
     } catch (err) {
