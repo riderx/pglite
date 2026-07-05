@@ -965,7 +965,10 @@ export class HostSession {
    * throw `SessionWatchdogError`. The host stays healthy. No timeout configured
    * ⇒ `fn` runs unwrapped.
    */
-  private async runWatchdogged<T>(cell: SessionCell, fn: () => Promise<T>): Promise<T> {
+  private async runWatchdogged<T>(
+    cell: SessionCell,
+    fn: () => Promise<T>,
+  ): Promise<T> {
     const stMs = this.runtime.opts.statementTimeoutMs
     if (stMs === undefined || stMs <= 0 || !(cell instanceof WorkerCell)) {
       return fn()

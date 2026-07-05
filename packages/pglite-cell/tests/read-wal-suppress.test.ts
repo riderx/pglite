@@ -27,7 +27,9 @@ beforeAll(async () => {
   template = join(root, 'template')
   // Churn a hot table so pages carry dead tuples (prune candidates), then
   // settle to a clean shutdown so a plain open writes zero boot WAL.
-  const db = new PGlite(template, { initDbStartParams: ['--no-data-checksums'] })
+  const db = new PGlite(template, {
+    initDbStartParams: ['--no-data-checksums'],
+  })
   await db.exec(`create table hot (id int primary key, v int)`)
   await db.exec(`insert into hot select g, 0 from generate_series(1, 200) g`)
   for (let i = 0; i < 40; i++) {

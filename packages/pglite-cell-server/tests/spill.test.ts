@@ -175,9 +175,7 @@ describe('H3 slice spill', () => {
         // Host B converges through the spilled frame (tailer resolves it).
         const b = await connect(ctx, 1)
         const countB = (
-          await b.query<{ n: string }>(
-            `select count(*)::text n from big`,
-          )
+          await b.query<{ n: string }>(`select count(*)::text n from big`)
         ).rows[0].n
         expect(countB).toBe('20000')
 

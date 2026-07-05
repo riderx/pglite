@@ -26,7 +26,10 @@ beforeAll(async () => {
   // Pinned to v2 (tar) checkpoints: this suite extracts the object bytes
   // directly via extractDatadir. The W4 default is v3 (manifest); v3 extract
   // is covered by the checkpoint-v3 suite.
-  core = new GatewayCore({ dataRoot: join(root, 'gateway'), checkpointFormat: 2 })
+  core = new GatewayCore({
+    dataRoot: join(root, 'gateway'),
+    checkpointFormat: 2,
+  })
   await core.start()
 }, TEST_TIMEOUT)
 
