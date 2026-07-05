@@ -46,7 +46,14 @@ async function setup(opts: RuntimeOpts): Promise<Ctx> {
     gateway: core,
     dataRoot: join(root, 'host1'),
     hostId: 'h1',
-    opts,
+    // The watchdog's real line of defense is worker.terminate(), which only
+    // exists when the cell runs in a worker — so force lazy-worker mode
+    // explicitly (it hosts the cell in a worker on any checkpoint format).
+    // The default reverted to 'nodefs' (see database-runtime cellMode note),
+    // where there is no worker to terminate and statement_timeout does not
+    // fire in WASM, so a runaway query is unkillable — a documented limit of
+    // main-thread cells, and the reason lazy-worker exists.
+    opts: { ...opts, cellMode: 'lazy-worker' },
   })
   const proxy = new CellProxyServer({ host, port: 0 })
   const port = await proxy.start()

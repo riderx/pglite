@@ -109,9 +109,14 @@ export class GatewayCore {
 
   constructor(opts: GatewayCoreOpts) {
     this.dataRoot = opts.dataRoot
-    // W4: default to v3 (per-file content-addressed + manifest) so fresh
-    // lineages are lazy-worker-capable; explicit 1/2 still supported.
-    this.checkpointFormat = opts.checkpointFormat ?? 3
+    // Default to v2 (the conservative, M6-proven checkpoint format). v3
+    // (per-file content-addressed + manifest) is the lazy-worker bundle:
+    // opt in with `checkpointFormat: 3` alongside `cellMode: 'auto' |
+    // 'lazy-worker'`. v3 is fully built + tested (GC is v3-aware) but is not
+    // the default until the rotation-quiesce fix lets lazy-worker be the
+    // default cell mode (see database-runtime cellMode note). All formats
+    // remain explicitly selectable and readable.
+    this.checkpointFormat = opts.checkpointFormat ?? 2
   }
 
   /** The embedded Durable Streams base URL (valid after `start()`). */

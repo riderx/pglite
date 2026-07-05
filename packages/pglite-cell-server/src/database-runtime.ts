@@ -190,9 +190,21 @@ export function resolveRuntimeOpts(
       opts.cellMode ??
       (process.env.PGLITE_CELL_MODE === 'lazy-worker'
         ? 'lazy-worker'
-        : process.env.PGLITE_CELL_MODE === 'nodefs'
-          ? 'nodefs'
-          : 'auto'), // W4: default auto-selects lazy-worker for v3 lineages
+        : process.env.PGLITE_CELL_MODE === 'auto'
+          ? 'auto'
+          : 'nodefs'),
+    // W4 default is 'nodefs' (conservative). 'auto' selects lazy-worker for
+    // v3 lineages and is fully built + tested (opt in via cellMode/env), but
+    // it is NOT the default yet: under lazy-worker's higher per-attach
+    // latency, era rotation can exhaust its seal re-cut budget against a
+    // continuous same-host writer (rotation.test.ts #6). The fix is a true
+    // committer quiesce — hold the append mutex across {read head → PUT era
+    // N+1 O-frame → seal era N} so no sibling commit moves the head inside
+    // the O/S-mirror window (a `Committer.sealExclusive(critical)` that runs
+    // one `this.run()` acquisition; rotation.ts moves its register+PUT+seal
+    // into that critical section, and rotation.test.ts #3's sealEra-race
+    // injection moves onto the new method). Flip this default to 'auto' once
+    // that lands and #6 is green in lazy-worker mode.
     chunkCacheBytes: opts.chunkCacheBytes,
     bufferMemoryMax: opts.bufferMemoryMax ?? 8 * 1024 * 1024,
     bufferSpoolMax: opts.bufferSpoolMax ?? 256 * 1024 * 1024,

@@ -71,17 +71,35 @@ the full corpus (core 269 / cell 80 / gateway 51 / cell-server 77+M6).
   moves O(eager-set) bytes and ZERO relation pages; a point query fetches
   exactly its chunks; repeat query fetches nothing; eviction recovers;
   wake-byte counter surfaced in the console.
-- **W4 (DONE):** default `cellMode` → `'auto'` (resolves to `'lazy-worker'`
-  when the latest checkpoint is v3-capable AND the gateway supports ranged
-  reads, else `'nodefs'` for v1/v2 lineages); `GatewayCore.checkpointFormat`
-  default → 3. Worker `resourceLimits` defaults (maxOldGenerationSizeMb 512,
-  stackSizeMb 8, overridable) + the watchdog: `statementTimeoutMs` wires
-  `statement_timeout` (best-effort — see finding) as the first line and a JS
-  worker-terminate + session fatal-reset as the second. Full cell-server
-  corpus green in the new default mode; nodefs spot-run green.
-  FINDING: `statement_timeout` does NOT fire in the single-backend WASM build
-  (no interval-timer / signal delivery — pg_sleep(5) runs the full 5s under a
-  500ms timeout), so the JS watchdog is the ACTUAL line of defense in WASM.
+- **W4 (BUILT; default deferred).** The `'auto'` cell mode (resolves to
+  `'lazy-worker'` when the latest checkpoint is v3-capable AND the gateway
+  supports ranged reads, else `'nodefs'`), the v3 checkpoint format, worker
+  `resourceLimits` defaults (maxOldGenerationSizeMb 512, stackSizeMb 8) and
+  the watchdog are all built, wired, and TESTED (opt in via `cellMode:
+  'auto' | 'lazy-worker'` + `checkpointFormat: 3`; the §16 lazy suite runs
+  them explicitly and is green). **The DEFAULTS were reverted to the
+  conservative `cellMode: 'nodefs'` + `checkpointFormat: 2`** after the
+  full-corpus gate: under lazy-worker's higher per-attach latency, era
+  rotation exhausts its seal re-cut budget against a continuous same-host
+  writer (`rotation.test.ts` #6 — a liveness failure, never data loss; the
+  rotation throws and the DB keeps serving the old era).
+  **Prerequisite to flipping the default to `'auto'` (precisely
+  diagnosed):** a true committer quiesce. The re-cut race is that a sibling
+  commit moves the head between the rotator's O-frame cut and its seal, and
+  the `ifHeadOffset` guard correctly rejects the seal (a moved head breaks
+  the O/S mirror invariant `finalLsn(N) == baseLsn(N+1)`). Fix = add
+  `Committer.sealExclusive(critical)` that holds the append promise-mutex
+  across one `this.run()` acquisition doing {read head → `critical(head)`
+  [rotation's `registerEraAttempt` + O-frame PUT cut against this head] →
+  seal era N at this head}; no sibling commit can interleave, so single-host
+  rotation seals first-try (cross-host still re-cuts, rare and correct).
+  Rotation moves its steps 3–5 into that critical section; `rotation.test.ts`
+  #3's `sealEra`-race monkeypatch moves onto the new method. Then flip both
+  defaults and confirm #6 green in lazy-worker mode.
+  FINDING (independent, keep): `statement_timeout` does NOT fire in the
+  single-backend WASM build (no interval-timer / signal delivery — pg_sleep(5)
+  runs the full 5s under a 500ms timeout), so the JS worker-terminate
+  watchdog is the ACTUAL line of defense in WASM.
 
 ## Explicitly post-goal (log, don't build)
 
