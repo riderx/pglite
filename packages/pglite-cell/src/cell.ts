@@ -127,6 +127,32 @@ export class Cell {
   }
 
   /**
+   * Register (or update) the native sequence-allocation lease for a
+   * sequence (§5.3 rule 1): `nextval` on this cell clamps its effective
+   * MAXVALUE — and the 32-ahead pre-log target — to `leaseEnd`. Exhaustion
+   * raises the standard reached-maximum error with the errdetail
+   * `sequence lease exhausted` (the host's renew signal). `leaseEnd = 0n`
+   * clears the lease for that sequence.
+   */
+  setSequenceLease(seqOid: number, leaseEnd: bigint): void {
+    this.pg.Module._pgl_set_sequence_lease(seqOid, leaseEnd)
+  }
+
+  /** Drop every native sequence lease (vanilla nextval behavior resumes). */
+  clearSequenceLeases(): void {
+    this.pg.Module._pgl_clear_sequence_leases()
+  }
+
+  /**
+   * Flush the backend-local sequence (SeqTable) cache (§5.3 rule 3).
+   * Called after floors/leases apply on cell open — relfilenumber-keyed
+   * invalidation cannot catch replayed foreign sequence records.
+   */
+  resetSequenceCaches(): void {
+    this.pg.Module._pgl_reset_sequence_caches()
+  }
+
+  /**
    * Detach: clean-close the instance (writes session-teardown WAL + a real
    * shutdown checkpoint) and return the final `(cursor .. checkPoint+120]`
    * bytes as the detach slice for the caller to publish (kind `sync`).

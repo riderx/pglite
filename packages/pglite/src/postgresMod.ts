@@ -56,6 +56,11 @@ export interface PostgresMod
   // althought the C function returns bool, we receive in JS a number
   _IsTransactionBlock: () => number
   _pgl_setPGliteActive: (newValue: number) => number
+  // Sequence leases (postgres-pglite src/include/pglite.h, design §5.3):
+  // int64 args cross the WASM boundary as BigInt (-sWASM_BIGINT).
+  _pgl_set_sequence_lease: (seqOid: number, leaseEnd: bigint) => void
+  _pgl_clear_sequence_leases: () => void
+  _pgl_reset_sequence_caches: () => void
   _pgl_startPGlite: () => void
   _pgl_getMyProcPort: () => number
   _pgl_sendConnData: () => void

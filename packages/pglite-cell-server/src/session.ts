@@ -126,6 +126,12 @@ interface AttemptOutcome<T> {
   threw?: unknown
   /** The transaction this unit ended ABORTED (only read at txn end). */
   aborted: boolean
+  /**
+   * The attempt died on the native `sequence lease exhausted` error (M5a,
+   * §5.3 rule 1) — the reactive grant-renewal signal. Set from the thrown
+   * PGlite error (SQL path) or the scanned wire ErrorResponse (unit path).
+   */
+  leaseExhausted?: boolean
 }
 
 /** The shared state machine's classification of a finished unit. */
@@ -156,6 +162,20 @@ function classifyListen(
 }
 
 /** Last non-empty statement is `ROLLBACK` / `ABORT` (not `ROLLBACK TO`). */
+/**
+ * True iff `threw` is the native sequence-lease-exhaustion error (M5a,
+ * §5.3 rule 1): ERRCODE_SEQUENCE_GENERATOR_LIMIT_EXCEEDED decorated with
+ * the errdetail the clamp attaches when the LEASE (not the catalog
+ * MAXVALUE) capped the sequence. The renew signal for one-shot units.
+ */
+function isSequenceLeaseExhausted(threw: unknown): boolean {
+  return (
+    typeof threw === 'object' &&
+    threw !== null &&
+    (threw as { detail?: string }).detail === 'sequence lease exhausted'
+  )
+}
+
 function endsWithRollback(sql: string): boolean {
   const statements = sql
     .split(';')
@@ -309,6 +329,7 @@ export class HostSession {
         payload: results,
         threw,
         aborted: threw !== undefined || endsWithRollback(sql),
+        leaseExhausted: isSequenceLeaseExhausted(threw),
       }
     })
 
@@ -415,6 +436,11 @@ export class HostSession {
             threw !== undefined ||
             scan.hasError ||
             scan.lastCommandTag === 'ROLLBACK',
+          // Wire-level units don't throw on SQL errors — the ErrorResponse
+          // rides the output; the scan carries the lease-renewal signal.
+          leaseExhausted:
+            isSequenceLeaseExhausted(threw) ||
+            scan.errorDetail === 'sequence lease exhausted',
         }
       },
     )
@@ -538,6 +564,7 @@ export class HostSession {
     this.runtime.touch()
 
     let attempt = 0
+    let leaseRenewals = 0
     for (;;) {
       await this.ensureCell()
       const cell = this.cell
@@ -559,10 +586,34 @@ export class HostSession {
       // commitSlice; a lost attempt's harvest dies with the attempt.
       this.notifBuffer = []
 
-      const { payload, threw, aborted } = await runner(cell)
+      const { payload, threw, aborted, leaseExhausted } = await runner(cell)
       const notifications = this.notifBuffer
 
       if (cell.db.isInTransaction()) {
+        if (
+          !wasInTxn &&
+          !this._tainted &&
+          leaseExhausted === true &&
+          leaseRenewals < this.runtime.opts.maxRetries
+        ) {
+          // A SELF-CONTAINED unit (it began outside a transaction) opened
+          // a transaction and died on native lease exhaustion inside it,
+          // leaving the cell mid-aborted-txn. Nothing was acked to the
+          // client: roll it back, renew, and re-execute the whole unit —
+          // one-shot semantics. Truly interactive continuations (wasInTxn)
+          // still surface the error.
+          await cell.db.exec('rollback').catch(() => undefined)
+          await this.runtime.probeFloors(cell)
+          if (this.mode === 'read') {
+            const stray = await cell.captureSlice()
+            if (stray !== null) cell.confirmPublished(stray.endLsn)
+          } else {
+            await cell.db.exec('checkpoint') // flush abort-tail WAL (M4 finding)
+          }
+          await this.runtime.extendGrantsForRetry(cell, leaseRenewals)
+          leaseRenewals++
+          continue
+        }
         // Mid interactive transaction (possibly in aborted state after an
         // error): no capture, no probes — everything rides txn end.
         return { kind: 'mid-txn', payload, threw }
@@ -600,6 +651,22 @@ export class HostSession {
           await cell.db.exec('checkpoint')
         }
         await this.probeTaints(cell)
+        if (
+          !wasInTxn &&
+          !this._tainted &&
+          leaseExhausted === true &&
+          leaseRenewals < this.runtime.opts.maxRetries
+        ) {
+          // Native lease exhaustion mid-unit (M5a): the 50% machinery is
+          // also reactive — the floors probe above already renewed the
+          // grant; escalate headroom (a re-executed batch redraws all its
+          // values) and transparently re-execute the one-shot. Interactive
+          // transactions never land here (wasInTxn / mid-txn return): the
+          // error surfaces to the client.
+          await this.runtime.extendGrantsForRetry(cell, leaseRenewals)
+          leaseRenewals++
+          continue
+        }
         return { kind: 'aborted', payload, threw }
       }
 
@@ -759,6 +826,9 @@ export class HostSession {
         // records); its capture cursor tracks local position.
         expectedHeadLsn: lease.base.localHeadLsn,
       })
+      // Leases apply to read cells too (M5a): a discarded/aborted draw on
+      // a read cell must still stay inside this incarnation's grants.
+      this.runtime.applyLeases(cell, { resetCaches: true })
       this.cell = cell
       this.lease = lease
       this.streamPos = { offset: lease.base.offset, lsn: lease.base.lsn }
@@ -783,6 +853,11 @@ export class HostSession {
         this.runtime.baseDirs.releaseCellDir(lease.dir)
         continue
       }
+      // Native sequence leases + cache flush AFTER floors apply (§5.3
+      // rules 1+3): the fast path must never serve values replayed from a
+      // foreign timeline, and every nextval clamps to this incarnation's
+      // grants from the first draw.
+      this.runtime.applyLeases(cell, { resetCaches: true })
       this.cell = cell
       this.lease = lease
       this.streamPos = floors.pos ?? {

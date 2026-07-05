@@ -334,6 +334,9 @@ export interface BackendScan {
   hasError: boolean
   /** SQLSTATE of the first ErrorResponse (if any). */
   errorCode: string | null
+  /** DETAIL of the first ErrorResponse (if any) — carries the native
+   *  `sequence lease exhausted` renew signal (M5a, §5.3). */
+  errorDetail: string | null
   /** Tag of the last CommandComplete (e.g. 'ROLLBACK', 'INSERT 0 1'). */
   lastCommandTag: string | null
 }
@@ -349,6 +352,7 @@ export function scanBackendOutput(output: Uint8Array): BackendScan {
     rfqStatus: null,
     hasError: false,
     errorCode: null,
+    errorDetail: null,
     lastCommandTag: null,
   }
   if (output.length === 0) return scan
@@ -363,6 +367,7 @@ export function scanBackendOutput(output: Uint8Array): BackendScan {
       scan.hasError = true
       if (scan.errorCode === null) {
         scan.errorCode = (msg as unknown as { code?: string }).code ?? 'XX000'
+        scan.errorDetail = (msg as unknown as { detail?: string }).detail ?? null
       }
     } else if (msg.name === 'commandComplete') {
       scan.lastCommandTag = (msg as unknown as { text: string }).text

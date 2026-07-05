@@ -68,6 +68,12 @@ export interface RuntimeOpts {
    * dial; an explicit value (including 0 = never) overrides it.
    */
   rotateEveryBytes?: number
+  /**
+   * Sequence-grant range size (§5.3; natively enforced by the M5a
+   * `nextval_internal` lease clamp). Default 4096. Tests use tiny sizes
+   * to exercise the clamp/renew path.
+   */
+  sequenceGrantSize?: bigint
 }
 
 export interface ResolvedRuntimeOpts {
@@ -81,6 +87,7 @@ export interface ResolvedRuntimeOpts {
   checkpointEveryBytes: number | undefined
   /** Undefined = defer to the manifest dial. */
   rotateEveryBytes: number | undefined
+  sequenceGrantSize: bigint
 }
 
 export function resolveRuntimeOpts(
@@ -95,13 +102,9 @@ export function resolveRuntimeOpts(
     checkpointOnHibernateBytes: opts.checkpointOnHibernateBytes ?? 0,
     checkpointEveryBytes: opts.checkpointEveryBytes,
     rotateEveryBytes: opts.rotateEveryBytes,
+    sequenceGrantSize: opts.sequenceGrantSize ?? 4096n,
   }
 }
-
-/** Sequence-grant range size (M4, §5.3 JS subset). 4096 with renewal at
- *  50% keeps the unenforced prelog window (HONESTY CLAUSE: no native
- *  `nextval_internal` clamp yet) unreachable under the abuse suite. */
-const GRANT_SIZE = 4096n
 /** Bound on grant-take CAS retries (each loss re-reads the high-water). */
 const GRANT_CAS_ATTEMPTS = 10
 
@@ -113,6 +116,9 @@ export interface SequenceGrant {
   name: string
   /** `schema.name` — the G-frame `seqName`. */
   seqName: string
+  /** The sequence relation OID (stable across cells of one database) —
+   *  the key the native lease clamp is registered under (M5a). */
+  oid: number
   start: bigint
   end: bigint
 }
@@ -686,6 +692,7 @@ export class DatabaseRuntime {
     // Grant maintenance rides the same probe (M4, §5.3): an abort-observed
     // draw is exactly the evidence a grant must cover.
     await this.ensureGrants(rows)
+    this.applyLeases(cell)
   }
 
   /**
@@ -697,15 +704,66 @@ export class DatabaseRuntime {
    */
   async probeGrants(cell: Cell): Promise<void> {
     await this.ensureGrants(await this.querySequences(cell))
+    this.applyLeases(cell)
+  }
+
+  /**
+   * Register this runtime's live grants as native leases on a cell (M5a,
+   * §5.3 rule 1): every granted sequence's `nextval` clamps to the grant
+   * end. Applied on every cell open (after floors) and re-applied after
+   * every grant take/renewal. `resetCaches` additionally flushes the
+   * backend-local SeqTable cache (§5.3 rule 3) — cell-open only: mid-
+   * session it would wipe `currval` state, and cached prepaid values are
+   * always within the lease that admitted them.
+   */
+  applyLeases(cell: Cell, opts: { resetCaches?: boolean } = {}): void {
+    for (const g of this.grants.values()) {
+      cell.setSequenceLease(g.oid, g.end)
+    }
+    if (opts.resetCaches) cell.resetSequenceCaches()
+  }
+
+  /**
+   * Reactive grant renewal on a native `sequence lease exhausted` error
+   * (M5a): the standard probe/renew ran already (the abort's floors probe),
+   * but one grant of headroom may not cover the unit — a re-executed batch
+   * redraws EVERYTHING it drew before dying. Escalate: chain up to
+   * `2^escalation - 1` additional grants beyond the renewal so each retry
+   * doubles the headroom, then re-register the leases on the cell.
+   */
+  async extendGrantsForRetry(cell: Cell, escalation: number): Promise<void> {
+    const rows = await this.querySequences(cell)
+    await this.ensureGrants(rows)
+    const extra = (1 << escalation) - 1
+    for (const row of rows) {
+      const key = `${row.s}.${row.n}`
+      let g = this.grants.get(key)
+      if (!g) continue
+      for (let i = 0; i < extra; i++) {
+        const fresh = await this.takeGrant(row.s, row.n, row.o, g.end)
+        if (fresh === null) break
+        g =
+          fresh.start === g.end
+            ? { ...fresh, start: g.start } // contiguous own extension
+            : fresh
+        this.grants.set(key, g)
+      }
+    }
+    this.applyLeases(cell)
   }
 
   private async querySequences(
     cell: Cell,
-  ): Promise<{ s: string; n: string; v: string }[]> {
+  ): Promise<{ s: string; n: string; v: string; o: number }[]> {
     return (
-      await cell.db.query<{ s: string; n: string; v: string }>(
-        `select schemaname as s, sequencename as n, last_value::text as v
-           from pg_sequences where last_value is not null`,
+      await cell.db.query<{ s: string; n: string; v: string; o: number }>(
+        `select p.schemaname as s, p.sequencename as n,
+                p.last_value::text as v, c.oid::int4 as o
+           from pg_sequences p
+           join pg_namespace ns on ns.nspname = p.schemaname
+           join pg_class c on c.relnamespace = ns.oid
+                          and c.relname = p.sequencename
+          where p.last_value is not null`,
       )
     ).rows
   }
@@ -719,12 +777,13 @@ export class DatabaseRuntime {
    * - ≥50% of the current grant consumed ⇒ renew (next disjoint range at
    *   the high-water; a contiguous own-extension keeps cells drawing
    *   naturally, a jump re-floors future attaches to the new start);
-   * - observed PAST the grant end ⇒ the unenforced prelog window fired
-   *   (HONESTY CLAUSE — no native nextval clamp yet): logged LOUDLY and
-   *   an emergency grant is taken from the observed value.
+   * - observed PAST the grant end ⇒ a FOREIGN published draw replayed
+   *   into a fresh cell advanced the page (own draws are natively lease-
+   *   clamped since M5a): logged, and a fresh grant is taken from the
+   *   observed value.
    */
   private async ensureGrants(
-    rows: { s: string; n: string; v: string }[],
+    rows: { s: string; n: string; v: string; o: number }[],
   ): Promise<void> {
     for (const row of rows) {
       const key = `${row.s}.${row.n}`
@@ -732,19 +791,16 @@ export class DatabaseRuntime {
       const g = this.grants.get(key)
       if (g) {
         if (observed > g.end) {
-          // Draw placement is UNENFORCED in the JS subset (HONESTY
-          // CLAUSE, §14.2: the native nextval clamp is not here yet):
+          // Own draws are natively clamped to the lease since M5a, but
           // under multi-host traffic the on-disk value routinely reflects
-          // FOREIGN published draws replayed into fresh cells, and a
-          // cell's own 32-ahead prelog can also cross the boundary. Both
-          // land here: take a fresh grant from the observed value so the
-          // grant chain stays ahead of every published draw.
+          // FOREIGN published draws replayed into fresh cells — those land
+          // here: take a fresh grant from the observed value so the grant
+          // chain stays ahead of every published draw.
           console.log(
             `[pglite-cell-server] db ${this.databaseId}: sequence ${key} ` +
               `observed at ${observed}, past this host's grant end ` +
-              `${g.end} (foreign replay advance and/or the unenforced ` +
-              `prelog window — §14.2 clamp not yet native); taking a ` +
-              `fresh grant from the observed value`,
+              `${g.end} (foreign replay advance); taking a fresh grant ` +
+              `from the observed value`,
           )
         } else if (observed < g.start + (g.end - g.start) / 2n) {
           continue // under 50% consumed: nothing to do
@@ -758,7 +814,7 @@ export class DatabaseRuntime {
         : observed > floor
           ? observed
           : floor
-      const fresh = await this.takeGrant(row.s, row.n, minStart)
+      const fresh = await this.takeGrant(row.s, row.n, row.o, minStart)
       if (fresh === null) continue // logged; retried on the next probe
       if (g && fresh.start === g.end && observed <= g.end) {
         // Contiguous own extension: the live cells keep drawing naturally
@@ -791,6 +847,7 @@ export class DatabaseRuntime {
   private async takeGrant(
     schema: string,
     name: string,
+    oid: number,
     minStart: bigint,
   ): Promise<SequenceGrant | null> {
     const seqName = `${schema}.${name}`
@@ -801,7 +858,7 @@ export class DatabaseRuntime {
       const res = await committer.appendControl((expectedOffset) => {
         const hw = this.tailer.grantHighWater(seqName)
         start = minStart > hw ? minStart : hw
-        end = start + GRANT_SIZE
+        end = start + this.opts.sequenceGrantSize
         const frame: GFrame = {
           type: 'G',
           header: {
@@ -818,7 +875,7 @@ export class DatabaseRuntime {
         }
         return [frame]
       })
-      if (res.landed) return { schema, name, seqName, start, end }
+      if (res.landed) return { schema, name, seqName, oid, start, end }
       await this.tailer.catchUp() // another host granted first: re-read
     }
     console.log(

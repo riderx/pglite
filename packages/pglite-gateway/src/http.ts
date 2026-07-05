@@ -14,6 +14,7 @@ import { serve } from '@hono/node-server'
 import type { ServerType } from '@hono/node-server'
 import { decodeFrame, parseLsn } from '@electric-sql/pglite-cell'
 import type { GatewayCore } from './core'
+import { CONSOLE_HTML } from './console'
 
 /** Max append body the gateway forwards (32 MiB, matches the frame cap). */
 export const MAX_APPEND_BYTES = 32 * 1024 * 1024
@@ -117,6 +118,14 @@ async function readBody(req: Request): Promise<Uint8Array> {
 export interface GatewayServerOpts {
   core: GatewayCore
   /**
+   * Static config blob the operator wants the M6 console to display (e.g. the
+   * proxy host/port text). Served verbatim as JSON at `GET /v1/console-info`.
+   * M6 v0: a static blob passed at construction (the cell-server registers a
+   * richer one later). May be any JSON value; the console renders a string
+   * as-is or stringifies an object.
+   */
+  consoleInfo?: unknown
+  /**
    * Static bearer token hook (M1: off by default in dev). TODO: wire real
    * capability-token verification (§11.2, control-plane auth §14.6).
    */
@@ -129,6 +138,7 @@ export interface GatewayServerOpts {
  */
 export class GatewayServer {
   private readonly core: GatewayCore
+  private readonly consoleInfo: unknown
   private server: ServerType | null = null
   private boundUrl: string | null = null
 
@@ -136,12 +146,18 @@ export class GatewayServer {
 
   constructor(opts: GatewayServerOpts) {
     this.core = opts.core
+    this.consoleInfo = opts.consoleInfo ?? null
     this.app = this.buildApp()
   }
 
   private buildApp(): Hono {
     const app = new Hono()
     const core = this.core
+    const consoleInfo = this.consoleInfo
+
+    // --- Console (M6 demo GUI) -------------------------------------------
+    app.get('/console', (c) => c.html(CONSOLE_HTML))
+    app.get('/v1/console-info', (c) => c.json(consoleInfo))
 
     // --- Databases -------------------------------------------------------
     app.post('/v1/db', async (c) => {
