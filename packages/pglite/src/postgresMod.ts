@@ -125,6 +125,12 @@ export interface PostgresMod
     baseNextMulti: number,
     baseNextOffset: number,
   ) => number
+  // M5e commit gate (pgl_commit_gate.c, design §3.6/§14.2): deferred
+  // ON COMMIT DELETE ROWS truncates, executed post-CAS-verdict.
+  _pgl_commit_gate_set: (on: number) => void
+  _pgl_commit_gate_pending: () => number
+  _pgl_commit_gate_run: () => number
+  _pgl_commit_gate_discard: () => void
   _pgl_readset_enable: (on: number) => void
   _pgl_readset_reset: () => void
   _pgl_readset_count: () => number

@@ -74,6 +74,12 @@ export interface RuntimeOpts {
    * to exercise the clamp/renew path.
    */
   sequenceGrantSize?: bigint
+  /**
+   * M5e commit gate (§3.6): defer the ON COMMIT DELETE ROWS truncate
+   * past the CAS verdict on every cell this runtime opens. Default true
+   * (off = vanilla commit sequence, pre-M5e contract).
+   */
+  commitGate?: boolean
 }
 
 export interface ResolvedRuntimeOpts {
@@ -88,6 +94,7 @@ export interface ResolvedRuntimeOpts {
   /** Undefined = defer to the manifest dial. */
   rotateEveryBytes: number | undefined
   sequenceGrantSize: bigint
+  commitGate: boolean
 }
 
 export function resolveRuntimeOpts(
@@ -103,6 +110,7 @@ export function resolveRuntimeOpts(
     checkpointEveryBytes: opts.checkpointEveryBytes,
     rotateEveryBytes: opts.rotateEveryBytes,
     sequenceGrantSize: opts.sequenceGrantSize ?? 4096n,
+    commitGate: opts.commitGate ?? true,
   }
 }
 /** Bound on grant-take CAS retries (each loss re-reads the high-water). */

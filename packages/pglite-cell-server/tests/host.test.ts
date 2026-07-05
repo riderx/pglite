@@ -1,7 +1,8 @@
 // M1c exit tests: two connections' cells on one host — the sequencer
 // serializes, the watermark gate gives read-your-writes, the abort-only
 // sequence floor survives recycle/hibernate, hibernate/wake round-trips —
-// plus the §3.7 contract rows the host enforces (taint ⇒ fatal reset,
+// plus the §3.7 contract rows the host enforces (taint ⇒ reset-first
+// survival since M5e, fatal only on the recycle fallback,
 // interactive 40001, read-only never CAS'd) and lease-frame visibility.
 //
 // Each test builds its own GatewayCore + CellHost (many PGlite boots —
@@ -21,9 +22,7 @@ import { GatewayCore, extractDatadir } from '@electric-sql/pglite-gateway'
 import type { Manifest } from '@electric-sql/pglite-gateway'
 import { CellHost } from '../src/host'
 import {
-  FatalSessionResetError,
   SerializationConflictError,
-  SessionClosedError,
 } from '../src/errors'
 
 const TEST_TIMEOUT = 240_000
@@ -220,7 +219,7 @@ describe('CellHost (M1c exit)', () => {
   )
 
   it(
-    '4. taint: temp tables pin the session (gc-pin frame) and a lost race is a fatal session reset',
+    '4. taint: temp tables pin the session (gc-pin frame); a lost race SURVIVES via the M5e gate + in-place reset (temp content intact)',
     async () => {
       const ctx = await setup()
       try {
@@ -261,18 +260,23 @@ describe('CellHost (M1c exit)', () => {
         expect((await c.exec(`insert into t4 values (4)`)).outcome).toBe(
           'committed',
         )
-        let fatal: unknown
+        // M5e taint lift (§3.3/§3.6): the tainted interactive loss is no
+        // longer a fatal reset — the commit gate deferred the only
+        // irreversible pre-commit step and the in-place reset restores
+        // the pre-attempt temp content, so the session gets the ordinary
+        // 40001 and SURVIVES with its temp state intact. (The fatal
+        // contract still governs the recycle fallback, i.e. when the
+        // reset is unsound.)
+        let conflict: unknown
         try {
           await a.exec(`commit`)
         } catch (err) {
-          fatal = err
+          conflict = err
         }
-        expect(fatal).toBeInstanceOf(FatalSessionResetError)
+        expect(conflict).toBeInstanceOf(SerializationConflictError)
 
-        // The session is dead.
-        await expect(a.exec(`select 1`)).rejects.toBeInstanceOf(
-          SessionClosedError,
-        )
+        // The session is ALIVE and its temp content survived the loss.
+        expect((await a.exec(`select x from tt`)).rows).toEqual([{ x: 1 }])
 
         // Exactly-once: B's, A's landed one-shots and C's row — never the
         // raced interactive insert.

@@ -2001,24 +2001,72 @@ Each is independently demoable; the conflict path starts trivial and hardens.
   (§14.5–§14.6; PGlite as the dev control plane). Deliverables are the
   three §14.7 packages from the start — cell, gateway, cell-server.
   Scale-to-zero works here.
-- **M2 — storage lifecycle.** Hardened era rotation (unique per-attempt
+- **M2 — storage lifecycle. DONE (2026-07-04, `M2_PLAN.md`).** Rotation
+  state machine shipped exactly per §6.1 with one chaos-suite-forced
+  addition: after any rotation whose new era bases past the latest
+  checkpoint, cut a fresh checkpoint (else joiners hit a WAL gap); re-cut
+  instead of tail-copy on a raced seal; forks over native stream forks +
+  `F` frames (verified: DS DELETE of a forked parent soft-deletes at 204
+  — the control-plane lineage is the sole authoritative GC pin); GC
+  executor with grace windows; per-db dials; checkpoint slimming (gzip +
+  non-checkpoint pg_wal segments dropped).
+  Original scope: hardened era rotation (unique per-attempt
   URLs, `O`/`S` mirror frames, repair-walk, orphan sweep — §2.4, §6.1)
   with the host sequencer as the quiesce point; fork manifests over stream
   forks + `F` frames; GC horizon from lease pins + fork refcounts **and GC
   execution** — era deletion, checkpoint pruning, page-version trimming;
   the checkpoint cadence dial exposed per database (§2.4).
-- **M3 — followers & live apply.** Lazy tail apply (page-version index,
+- **M3 — followers & live apply. DONE (2026-07-04/05; user-visible scope
+  at M3, live apply landed with the M5 native wave per `M3_PLAN.md`'s
+  re-sequencing).** The §10.2 headline SHIPPED: N frames ride the winning
+  CAS POST, ALL delivery is tailer-driven in global commit order
+  (committer's own connection included; raw 'A' messages stripped from
+  unit output), demo:notify shows three connections + a raw stream
+  activity feed in identical order; freshness modes as product API
+  (`SET pglite.freshness`); DDL propagation + unlogged-table policy +
+  read-replica byte assertions. Live tail apply arrived via M5b/M5c
+  (walscan eager set + generic single-record redo): 100% live-advance
+  hit rate on the server suites, tainted-session pinning lifted.
+  Original scope: lazy tail apply (page-version index,
   base-required flags), eager special-record set, live invalidation incl.
   all three inval carriers; **sibling-cell advance upgraded from reattach
   to incremental live apply**, lifting M1's tainted-session pinning; read
   replicas with freshness modes; DDL-on-followers; **NOTIFY sidecar frames
   with cross-cell LISTEN delivery — the headline demo (§10.2)**.
-- **M4 — multi-host fleet.** Real cross-host CAS contention; sequence
+- **M4 — multi-host fleet. DONE (2026-07-05, `M4_PLAN.md`).** Two-host
+  contention suites green (exactly-once via oracle; zero duplicate
+  sequence values under the abuse suite); typed `G` frames with grant
+  high-waters re-asserted into each new era pre-manifest (the
+  derive-from-checkpoint idea was refuted by test); head-lease
+  claim/refresh/migration with monotone epochs; cross-host session
+  tokens + linearizable verified against a real second host; and the
+  OQ1 upstreaming DELIVERED on the durable-streams
+  `optimistic-physical-replication` branch (strict
+  `Stream-Expected-Offset` in both stores, `Stream-Next-Offset` on both
+  409s, PROTOCOL.md, conformance suites, typed `appendWithResult`
+  client API). The native nextval clamp (M5a) upgraded grants from
+  tested-safe to enforced-safe.
+  Original scope: real cross-host CAS contention; sequence
   lease frames + incarnation-burn rules (§5.3); lease migration between
   hosts; gateway fleet mode; `linearizable` freshness verified against
   multi-host tailer lag (§7); convergence oracle in CI including the §5.1
   identity-chaining assertions.
-- **M5 — interactive transparent rebase.** Read-set hook + repaired
+- **M5 — interactive transparent rebase. DONE (2026-07-05, `M5_PLAN.md`).**
+  As-built deviations, both adversarially audited there: the C-level
+  logical re-apply was not needed (harvest = post-commit same-session
+  reads + parameterized replica-role re-apply, M5d); and the commit gate
+  shipped in the deferred-truncate two-phase form, NOT the SAB/Atomics
+  blocking import — the blocking shape deadlocks the shared event loop
+  (cells, committer, and the in-process gateway are all main-thread) and
+  would break M5d's local-commit-before-capture harvest. Same §3.6
+  property delivered: no irreversible pre-commit step finalized before
+  the CAS verdict (the ON COMMIT DELETE ROWS truncate — the ONE such
+  step — is deferred past it; everything else is reversed by the M5c
+  in-place reset, whose base flush now covers local buffers so temp
+  content survives). §3.3 taint lift shipped: temp tables, holdable
+  cursors, and advisory locks all survive CAS losses on gated cells;
+  fatal reset remains only for the recycle fallback.
+  Original scope: read-set hook + repaired
   validation rules; schema-epoch fence; logical re-apply, inserts first,
   then update/delete with version preconditions; deferred-trigger ctid
   remap; **commit gate + in-place reset** at crash-recovery-grade scope

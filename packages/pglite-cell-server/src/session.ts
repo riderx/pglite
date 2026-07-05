@@ -16,7 +16,15 @@
 //   interactive loss w/ rebase taint (§4.5)   -> 40001 (ctid/xmin/... scan,
 //                                                temp-write-during-attempt,
 //                                                ring overflow, DDL in txn)
-//   tainted session loses                     -> fatal session reset
+//   tainted session loses                     -> M5e: in-place reset +
+//                                                advance (temp content,
+//                                                held cursors, advisory
+//                                                locks all survive; the
+//                                                deferred ON COMMIT
+//                                                truncate never ran);
+//                                                fatal reset ONLY when
+//                                                the reset is unsound
+//                                                (recycle fallback)
 //   read-only (empty slice)                   -> never CAS'd
 //
 // plus the §7 watermark gate (advance before executing when the cell's base
@@ -229,6 +237,15 @@ export class HostSession {
     holdableCursors: false,
     advisoryLocks: false,
   }
+  /**
+   * Holdable cursor names as of the last completed transaction (M5e):
+   * a lost transaction's WITH HOLD cursors materialize at LOCAL commit
+   * and survive the in-place reset (they are memory tuplestores), but a
+   * reversed commit must not leave them behind — vanilla's failed
+   * COMMIT drops them. Compared against pg_cursors on every surviving
+   * loss; strangers are CLOSEd.
+   */
+  private holdableNames = new Set<string>()
   private _tainted = false // latches; the gc-pin is appended once
   private pinExpiresAt = 0
   private dead: string | null = null
@@ -737,7 +754,11 @@ export class HostSession {
         if (notifications.length > 0) {
           await this.runtime.publishNotificationOnlyCommit(notifications)
         }
-        await this.probeTaints(cell)
+        // A temp-only commit with an empty slice still ran the gated
+        // pre-commit sequence: its verdict is trivially "landed" (M5e).
+        if (await this.finishCommitGate(cell)) {
+          await this.probeTaints(cell)
+        }
         return { kind: 'read-only', payload }
       }
 
@@ -802,10 +823,14 @@ export class HostSession {
       if (res.landed) {
         cell.confirmPublished(slice.endLsn)
         this.streamPos = { offset: res.nextOffset, lsn: slice.endLsn }
-        // Grant maintenance (M4, §5.3): committed draws are the probe
-        // evidence that takes/renews this host's sequence grants.
-        await this.runtime.probeGrants(cell)
-        await this.probeTaints(cell)
+        // M5e commit gate: the CAS landed — NOW run the deferred
+        // ON COMMIT DELETE ROWS truncates (§3.6 reorder, achieved).
+        if (await this.finishCommitGate(cell)) {
+          // Grant maintenance (M4, §5.3): committed draws are the probe
+          // evidence that takes/renews this host's sequence grants.
+          await this.runtime.probeGrants(cell)
+          await this.probeTaints(cell)
+        }
         return {
           kind: 'landed',
           payload,
@@ -841,13 +866,66 @@ export class HostSession {
       // non-transactional sequence records whose values may have been
       // observed) dies with the recycled cell. Floor the sequences first.
       await this.runtime.probeFloors(cell)
+      // M5e commit gate: a reversed commit's deferred truncates must
+      // never run (§3.6) — belt and braces, the native reset discards too.
+      cell.commitGateDiscard()
       if (this._tainted) {
-        // The recycle destroys exactly the state re-execution would need:
-        // fatal session reset, never a silent continuation (§3.3/§3.6).
-        await this.destroyCell()
-        this.dead = 'tainted session lost a commit race'
-        this.runtime.removeSession(this)
-        throw new FatalSessionResetError(this.taintNames())
+        // M5e TAINT LIFT (§3.3, the §3.6 whole point): with the commit
+        // gate deferring the temp truncate and pgl_flush_base covering
+        // local buffers, an in-place reset restores the session's
+        // PRE-ATTEMPT temp content exactly; holdable-cursor tuplestores
+        // and advisory locks are memory state a reset never touches.
+        // A tainted loss is therefore survivable whenever the reset is
+        // sound — the fatal reset remains ONLY for the recycle fallback
+        // (which destroys exactly that state).
+        let survived = false
+        if (cell.canResetInPlace()) {
+          try {
+            cell.resetToBase()
+            // Advance to head if live-appliable; a rejected advance
+            // (returns false, cell untouched) leaves the session PINNED
+            // at base — the M1 pinned contract, still alive.
+            await this.tryLiveAdvance()
+            survived = this.cell !== null
+          } catch (err) {
+            if (err instanceof FatalSessionResetError) throw err
+            survived = false
+          }
+        }
+        if (!survived || this.cell === null) {
+          await this.destroyCell()
+          this.dead = 'tainted session lost a commit race (reset unsound)'
+          this.runtime.removeSession(this)
+          throw new FatalSessionResetError(this.taintNames())
+        }
+        // Vanilla failed-COMMIT semantics: WITH HOLD cursors held by the
+        // reversed commit are dropped.
+        await this.dropLostHoldables()
+        if (wasInTxn) {
+          return {
+            kind: 'conflict',
+            detail:
+              'interactive transaction lost the commit race at COMMIT (session state preserved)',
+          }
+        }
+        // One-shot on a surviving tainted session: nothing was acked and
+        // the session state is intact — transparent re-execute, PROVIDED
+        // the advance reached the head (the capture-cursor invariant).
+        if (this.streamPos.lsn === this.runtime.tailer.head.lsn) {
+          attempt++
+          if (attempt > this.runtime.opts.maxRetries) {
+            return {
+              kind: 'conflict',
+              detail: `one-shot re-execution budget exhausted (${this.runtime.opts.maxRetries} retries)`,
+            }
+          }
+          continue
+        }
+        return {
+          kind: 'conflict',
+          detail:
+            'tainted session lost the commit race and is pinned behind the head',
+        }
       }
       // M5c in-place reset (§3.4/§5.1): discard the speculative state
       // without recycling when the soundness gate passes (base snapshot at
@@ -870,6 +948,12 @@ export class HostSession {
       } else {
         await this.destroyCell() // recycle-to-head happens on next attach
       }
+      // Vanilla failed-COMMIT semantics: drop WITH HOLD cursors the lost
+      // transaction materialized (they survive an in-place reset; a
+      // recycled cell has none). M5c latent-bug fix: without this, a
+      // surviving reset cell re-executing `DECLARE .. WITH HOLD` would
+      // hit "cursor already exists".
+      await this.dropLostHoldables()
       if (wasInTxn) {
         // Interactive COMMIT loss: 40001; the session survives and its
         // next statement attaches a fresh cell at head.
@@ -944,6 +1028,7 @@ export class HostSession {
         // clean head (past the stream head by the unpublished boot
         // records); its capture cursor tracks local position.
         expectedHeadLsn: lease.base.localHeadLsn,
+        commitGate: this.runtime.opts.commitGate,
       })
       // Leases apply to read cells too (M5a): a discarded/aborted draw on
       // a read cell must still stay inside this incarnation's grants.
@@ -965,6 +1050,7 @@ export class HostSession {
       const lease = await this.runtime.baseDirs.takeCellDir('write')
       const cell = await Cell.open(lease.dir, {
         expectedHeadLsn: lease.base.localHeadLsn,
+        commitGate: this.runtime.opts.commitGate,
       })
       const floors = await this.runtime.applyFloors(cell)
       if (floors.lost) {
@@ -1276,6 +1362,8 @@ export class HostSession {
   ): Promise<{ landed: false; detail: string }> {
     this.rebaseStats.failed++
     await this.runtime.probeFloors(cell)
+    // M5e: the reversed commit's deferred truncates die with it (§3.6).
+    cell.commitGateDiscard()
     if (cell.canResetInPlace()) {
       try {
         cell.resetToBase()
@@ -1286,6 +1374,9 @@ export class HostSession {
     } else {
       await this.destroyCell()
     }
+    // Vanilla failed-COMMIT semantics: WITH HOLD cursors materialized by
+    // the reversed commit are dropped (survivors of an in-place reset).
+    await this.dropLostHoldables()
     return { landed: false, detail }
   }
 
@@ -1359,24 +1450,83 @@ export class HostSession {
   }
 
   /**
+   * M5e commit gate, landed verdict: execute the deferred ON COMMIT
+   * DELETE ROWS truncates strictly AFTER the CAS (§3.6 reorder). On a
+   * read cell the truncate's catalog WAL can never publish — swallow it
+   * like the abort path does. Returns false when the run failed and the
+   * cell was recycled (tainted sessions get the fatal reset then: the
+   * recycle destroys their state, and the NEXT transaction's DELETE
+   * ROWS contract would otherwise be silently broken).
+   */
+  private async finishCommitGate(cell: Cell): Promise<boolean> {
+    if (cell.commitGatePending() === 0) return true
+    try {
+      cell.commitGateRun()
+      if (this.mode === 'read') {
+        const stray = await cell.captureSlice()
+        if (stray !== null) cell.confirmPublished(stray.endLsn)
+      }
+      return true
+    } catch {
+      await this.destroyCell()
+      if (this._tainted) {
+        this.dead = 'commit-gate truncate failed; cell recycled'
+        this.runtime.removeSession(this)
+        throw new FatalSessionResetError(this.taintNames())
+      }
+      return false
+    }
+  }
+
+  /**
+   * Drop WITH HOLD cursors materialized by a REVERSED local commit
+   * (M5e): they are memory tuplestores that survive the in-place reset,
+   * but vanilla's failed COMMIT destroys them — a bare survivor would
+   * be a silent continuation against aborted state. Compares pg_cursors
+   * against the last completed transaction's holdable set. No-op when
+   * the cell was recycled (cursors died with it). CLOSE writes no WAL.
+   */
+  private async dropLostHoldables(): Promise<void> {
+    const cell = this.cell
+    if (cell === null || cell.db.isInTransaction()) return
+    try {
+      const rows = (
+        await cell.db.query<{ name: string }>(
+          `select name from pg_cursors where is_holdable`,
+        )
+      ).rows
+      for (const r of rows) {
+        if (!this.holdableNames.has(r.name)) {
+          await cell.db.exec(`close "${r.name.replace(/"/g, '""')}"`)
+        }
+      }
+    } catch {
+      // Best effort: a failure here leaves a stale cursor, never a
+      // wrong result — and the cell may legitimately be mid-teardown.
+    }
+  }
+
+  /**
    * One post-transaction catalog probe for session-state taints (§3.3):
    * temp schema, holdable cursors, session advisory locks. Tainting
    * latches; the gc-pin L frame is appended once, at the transition.
    */
   private async probeTaints(cell: Cell): Promise<void> {
     const row = (
-      await cell.db.query<{ temp: boolean; cur: number; adv: number }>(
+      await cell.db.query<{ temp: boolean; cur: string[]; adv: number }>(
         `select pg_my_temp_schema()::oid <> 0 as temp,
-                (select count(*)::int from pg_cursors where is_holdable) as cur,
+                (select coalesce(array_agg(name), '{}') from pg_cursors where is_holdable) as cur,
                 (select count(*)::int from pg_locks where locktype = 'advisory') as adv`,
       )
     ).rows[0]
     this.taints = {
       tempSchema: row.temp,
-      holdableCursors: row.cur > 0,
+      holdableCursors: row.cur.length > 0,
       advisoryLocks: row.adv > 0,
     }
-    const any = row.temp || row.cur > 0 || row.adv > 0
+    // The survivor set dropLostHoldables compares against (M5e).
+    this.holdableNames = new Set(row.cur)
+    const any = row.temp || row.cur.length > 0 || row.adv > 0
     if (any && !this._tainted) {
       this._tainted = true
       this.pinExpiresAt = Date.now() + this.runtime.opts.pinTtlMs
@@ -1398,6 +1548,7 @@ export class HostSession {
     this.cell = null
     this.lease = null
     this.cellListenVersion = -1
+    this.holdableNames = new Set() // cursors die with the instance
     if (cell) await cell.db.close().catch(() => undefined)
     if (lease) this.runtime.baseDirs.releaseCellDir(lease.dir)
   }

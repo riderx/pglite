@@ -49,6 +49,13 @@ export interface CellOpenOpts {
    * boot WAL — M0 finding 1).
    */
   expectedHeadLsn: bigint
+  /**
+   * M5e commit gate (design §3.6): defer the ON COMMIT DELETE ROWS
+   * temp-table truncate — the one irreversible pre-commit step — past
+   * the CAS verdict. The host runs `commitGateRun()` after a landed
+   * verdict and `commitGateDiscard()` on loss. Default true.
+   */
+  commitGate?: boolean
 }
 
 /** §9 configuration pins asserted at every open. */
@@ -161,6 +168,9 @@ export class Cell {
       if (insertLsn !== opts.expectedHeadLsn) {
         throw new ZeroBootWalError(opts.expectedHeadLsn, insertLsn)
       }
+      // M5e commit gate (§3.6): armed by default — vanilla behavior
+      // returns only when explicitly disabled.
+      if (opts.commitGate !== false) pg.Module._pgl_commit_gate_set(1)
       const cell = new Cell(dir, pg, opts.expectedHeadLsn)
       cell.maybeSnapshotBase()
       return cell
@@ -228,6 +238,36 @@ export class Cell {
   /** Flush local WAL through the insert position (pgl_flush_wal). */
   flushWal(): void {
     this.pg.Module._pgl_flush_wal()
+  }
+
+  /**
+   * Deferred ON COMMIT DELETE ROWS truncates awaiting a CAS verdict
+   * (M5e commit gate, §3.6). Nonzero only between a gated local commit
+   * and its verdict.
+   */
+  commitGatePending(): number {
+    return this.pg.Module._pgl_commit_gate_pending()
+  }
+
+  /**
+   * Landed verdict: execute the deferred truncates (their own native
+   * transaction — strictly after the CAS). Throws on native failure;
+   * the caller must then treat the cell as poisoned and recycle.
+   */
+  commitGateRun(): void {
+    const rc = this.pg.Module._pgl_commit_gate_run()
+    if (rc !== 0) {
+      throw new Error(`commitGateRun: native truncate run failed (${rc})`)
+    }
+  }
+
+  /**
+   * Loss verdict: the local commit is being reversed — the deferred
+   * truncates must never run. (pgl_reset_to_base also discards natively;
+   * this covers the recycle path and belt-and-braces callers.)
+   */
+  commitGateDiscard(): void {
+    this.pg.Module._pgl_commit_gate_discard()
   }
 
   /**
