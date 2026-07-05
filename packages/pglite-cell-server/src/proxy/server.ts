@@ -461,6 +461,23 @@ export class CellProxyServer {
         this.write(conn, readyForQuery('I'))
         return
       }
+      if (res.disposition === 'held-advisory') {
+        // M6 §4.6 advisoryLocks='error': the statement was NOT executed;
+        // synthesize the strict-mode rejection. Session survives.
+        conn.lastRfq = conn.lastRfq === 'T' ? 'E' : 'I'
+        this.write(
+          conn,
+          errorResponse({
+            code: '0A000', // feature_not_supported
+            message:
+              'advisory locks are disabled on this database: their scope is ' +
+              'cell-local and does not provide cross-cell/host mutual exclusion',
+            hint: "set the host option advisoryLocks='local-warn' to allow them",
+          }),
+        )
+        this.write(conn, readyForQuery(conn.lastRfq))
+        return
+      }
       // flushed-readonly / landed: final by contract. mid-txn / aborted:
       // interactive transactions stream mid-txn results by design; only
       // the COMMIT response is held.

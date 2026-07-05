@@ -289,6 +289,9 @@ importers:
       '@electric-sql/pglite-gateway':
         specifier: workspace:*
         version: link:../pglite-gateway
+      '@electric-sql/pglite-tools':
+        specifier: workspace:*
+        version: link:../pglite-tools
     devDependencies:
       '@types/node':
         specifier: ^20.16.11

@@ -31,6 +31,8 @@ import { checkpointDatabase } from './checkpoint'
 import type { CheckpointReport } from './checkpoint'
 import { rotateDatabase } from './rotation'
 import type { RotationReport } from './rotation'
+import { Janitor, resolveJanitorOpts, janitorEnabled } from './janitor'
+import type { JanitorOpts, ResolvedJanitorOpts } from './janitor'
 
 /** Runtime tuning knobs (host-wide defaults, applied per database). */
 export interface RuntimeOpts {
@@ -80,6 +82,23 @@ export interface RuntimeOpts {
    * (off = vanilla commit sequence, pre-M5e contract).
    */
   commitGate?: boolean
+  /**
+   * Background maintenance dials (M6 janitor, §6.4): per-active-database
+   * vacuum / freeze-age / GC scheduling. All OFF by default.
+   */
+  janitor?: JanitorOpts
+  /**
+   * Advisory-lock policy (M6, §4.6). `pg_advisory_*` locks are cell-local:
+   * two hosts' locks do NOT exclude each other, so cross-cell mutual
+   * exclusion is not provided.
+   *
+   * - 'local-warn' (default): the FIRST advisory-lock use per session
+   *   injects a synthesized WARNING (01000) naming the cell-local scope
+   *   before the statement's output; the statement still runs.
+   * - 'error': any advisory-lock statement is rejected with 0A000 and NOT
+   *   executed.
+   */
+  advisoryLocks?: 'local-warn' | 'error'
 }
 
 export interface ResolvedRuntimeOpts {
@@ -95,6 +114,8 @@ export interface ResolvedRuntimeOpts {
   rotateEveryBytes: number | undefined
   sequenceGrantSize: bigint
   commitGate: boolean
+  janitor: ResolvedJanitorOpts
+  advisoryLocks: 'local-warn' | 'error'
 }
 
 export function resolveRuntimeOpts(
@@ -111,6 +132,8 @@ export function resolveRuntimeOpts(
     rotateEveryBytes: opts.rotateEveryBytes,
     sequenceGrantSize: opts.sequenceGrantSize ?? 4096n,
     commitGate: opts.commitGate ?? true,
+    janitor: resolveJanitorOpts(opts.janitor),
+    advisoryLocks: opts.advisoryLocks ?? 'local-warn',
   }
 }
 /** Bound on grant-take CAS retries (each loss re-reads the high-water). */
@@ -249,6 +272,8 @@ export class DatabaseRuntime {
   private eraBaseLsn = 0n
   /** Control-plane pin ids this host holds (mirror of L{gc-pin} frames). */
   private readonly pinIds = new Set<string>()
+  /** The background maintenance janitor (M6 §6.4); null when disabled. */
+  private _janitor: Janitor | null = null
 
   constructor(init: DatabaseRuntimeInit) {
     this.databaseId = init.databaseId
@@ -285,6 +310,11 @@ export class DatabaseRuntime {
   /** The gateway handle (M1e checkpoint worker consumes object/checkpoint). */
   get gateway(): GatewayHandle {
     return this._gateway
+  }
+
+  /** The background maintenance janitor (M6), or null when disabled/inactive. */
+  get janitor(): Janitor | null {
+    return this._janitor
   }
 
   get sessionCount(): number {
@@ -395,6 +425,14 @@ export class DatabaseRuntime {
     this.eraBaseLsn = parseLsn(manifest.era.baseLsn)
     this._state = 'active'
     await this.appendHeadLease()
+
+    // Background maintenance (M6 janitor, §6.4): armed only when a dial is
+    // set. A fresh janitor per activation — its timers are cleared on
+    // hibernate; the wake builds a new one.
+    if (janitorEnabled(this.opts.janitor)) {
+      this._janitor = new Janitor(this, this.opts.janitor)
+      this._janitor.start()
+    }
 
     console.log(
       `[pglite-cell-server] db ${this.databaseId} active in ` +
@@ -1148,6 +1186,19 @@ export class DatabaseRuntime {
     if (this._state !== 'active') return
     this.clearHibernateTimer()
     this.hibernating = true
+
+    // Run-once janitor hooks (freeze check + opportunistic GC), then stop the
+    // timers — the maintenance loop must not outlive the incarnation. The
+    // hook runs while the runtime is still active (it needs a session).
+    if (this._janitor) {
+      try {
+        await this._janitor.onHibernate()
+      } catch {
+        // Best-effort: maintenance must never block hibernation.
+      }
+      this._janitor.stop()
+      this._janitor = null
+    }
 
     // Checkpoint FIRST when the tail past the last checkpoint exceeds the
     // threshold (default 0 = always). This is what makes wake cheap (zero

@@ -76,6 +76,25 @@ export class PinnedWriteError extends Error {
   }
 }
 
+/**
+ * An advisory-lock statement ran under the strict host policy
+ * `advisoryLocks='error'` (M6, §4.6). Advisory locks are cell-local and do
+ * not exclude locks on other cells/hosts, so this deployment disables them.
+ * SQLSTATE 0A000 (`feature_not_supported`); the statement was not executed.
+ */
+export class AdvisoryLockDisabledError extends Error {
+  readonly code = '0A000'
+
+  constructor() {
+    super(
+      `advisory locks are disabled on this database (advisoryLocks='error'): ` +
+        `their scope is cell-local and provides no cross-cell/host mutual ` +
+        `exclusion`,
+    )
+    this.name = 'AdvisoryLockDisabledError'
+  }
+}
+
 /** Any use of a session that is closed, reset, or destroyed by hibernation. */
 export class SessionClosedError extends Error {
   constructor(reason: string) {

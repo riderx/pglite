@@ -75,6 +75,46 @@ session-level `SET` statements (re-run on every fresh cell, output discarded).
 **Not replayed (M1 limitation):** prepared statements — a conflict recycle loses
 them; pooler-grade replay comes later.
 
+## Operations (M6)
+
+Three productization surfaces, all opt-in via `CellHostOpts.opts`:
+
+### Janitor — background maintenance (`opts.janitor`, §6.4)
+
+Per-active-database maintenance driven by the host; **every dial is OFF by
+default**. Timers are cleared on hibernate/shutdown; the wake rebuilds them.
+
+- `vacuumIntervalMs` — run `VACUUM (ANALYZE)` on this cadence through an
+  ordinary internal session; the commit rides the normal CAS path and appears
+  in the stream as an ordinary `W` frame. A vacuum is skipped when this host
+  ran one within the interval (a duplicate vacuum across hosts is harmless).
+- `freezeMaxAge` — when `age(datfrozenxid)` exceeds this, run `VACUUM (FREEZE)`
+  (wraparound defence). Also checked once on the hibernate path.
+- `gcIntervalMs` — call the gateway GC (`runGc`) for this database on an
+  interval, and opportunistically once on hibernate.
+
+### Advisory-lock policy (`opts.advisoryLocks`, §4.6)
+
+`pg_advisory_*` locks are **cell-local**: two hosts' locks do not exclude each
+other, so cross-cell mutual exclusion is not provided. Detection is a
+statement-text scan for `pg_advisory_` (documented approximation).
+
+- `'local-warn'` (default) — the first advisory-lock use per session injects a
+  `WARNING` (`01000`) naming the cell-local scope ahead of the statement's
+  output; the statement still runs. Fires once per session.
+- `'error'` — any advisory-lock statement is rejected with `0A000` and **not
+  executed**; the session survives.
+
+### Graduation (`CellHost.graduateDatabase(db)`, §15 / OQ7)
+
+Produces a **logical** export at a linearizable-fresh head: a `pg_dump` SQL
+artifact (via `@electric-sql/pglite-tools`, `--inserts` so it restores by
+`exec(sql)`) plus a `manifestSnapshot` (`databaseId`, `headLsn`, `headOffset`,
+`checkpointRef`, `eraOrdinal`). OQ7 is closed: a PGlite (wasm32) datadir cannot
+boot under stock 64-bit Postgres, so **logical dump/restore is THE graduation
+path**. The dump is driven against a fresh throwaway PGlite opened on a
+materialized-at-head scratch datadir (no serving cell is perturbed).
+
 ## Demo
 
 ```sh

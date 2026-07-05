@@ -107,6 +107,10 @@ export interface GatewayHandle {
   // --- Pins (control-plane mirror of L{gc-pin} frames; §6.4) ------------
   upsertPin(databaseId: string, pin: PinInput): Promise<void>
   deletePin(pinId: string): Promise<void>
+
+  // --- GC (§6.4; the M6 janitor schedules it) ---------------------------
+  /** Run the gateway GC sweeps scoped to one database. */
+  runGc(databaseId: string): Promise<void>
 }
 
 class InProcessGatewayHandle implements GatewayHandle {
@@ -189,6 +193,10 @@ class InProcessGatewayHandle implements GatewayHandle {
 
   deletePin(pinId: string): Promise<void> {
     return this.core.catalog.deletePin(pinId)
+  }
+
+  async runGc(databaseId: string): Promise<void> {
+    await this.core.runGc(databaseId)
   }
 }
 
@@ -346,6 +354,10 @@ class HttpGatewayHandle implements GatewayHandle {
 
   async deletePin(): Promise<void> {
     // No pin routes over HTTP yet: advisory index only, no-op (M2c limitation).
+  }
+
+  async runGc(databaseId: string): Promise<void> {
+    await this.post(`/v1/db/${databaseId}/gc`, {})
   }
 }
 

@@ -219,6 +219,17 @@ export function errorResponse(fields: ErrorFields): Uint8Array {
   return new Uint8Array(out)
 }
 
+/**
+ * Hand-rolled NoticeResponse ('N'): identical field encoding to
+ * ErrorResponse, different message type byte. Used to inject the M6
+ * advisory-lock WARNING ahead of a statement's output (§4.6 'local-warn').
+ */
+export function noticeResponse(fields: ErrorFields): Uint8Array {
+  const out = errorResponse(fields)
+  out[0] = 0x4e // 'N'
+  return out
+}
+
 /** Hand-rolled CommandComplete: 'C' + i32 length + tag cstring. */
 export function commandComplete(tag: string): Uint8Array {
   const tagLen = Buffer.byteLength(tag)

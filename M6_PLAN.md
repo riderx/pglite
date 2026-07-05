@@ -27,7 +27,13 @@ existing HTTP API):
   (derivable from manifest + HEAD offsets) — the §6.5 footprint story
   ("this database woke by moving X KB").
 
-## Janitor automation (cell-server)
+## Janitor automation (cell-server) — SHIPPED
+
+Implemented in `src/janitor.ts`, wired into `DatabaseRuntime` lifecycle
+(built + started on activate, `onHibernate` hook + `stop()` on hibernate).
+Dials on `RuntimeOpts.janitor` (`vacuumIntervalMs` / `freezeMaxAge` /
+`freezeCheckMs` / `gcIntervalMs`), all OFF by default. `runGc` added to the
+`GatewayHandle`. Tests: `tests/janitor.test.ts` (6).
 
 - Periodic per-active-database maintenance driven by the host:
   scheduled `VACUUM (no FULL)` through an ordinary session at a
@@ -37,7 +43,15 @@ existing HTTP API):
 - GC scheduling: `runGc` on an interval + after rotation/hibernate;
 - both off by default, dials on the host options + per-db columns.
 
-## Advisory-lock policy (§4.6 interim → M6 decision)
+## Advisory-lock policy (§4.6 interim → M6 decision) — SHIPPED
+
+Host option `advisoryLocks: 'local-warn' | 'error'` (default 'local-warn').
+Detection = statement-text scan for `pg_advisory_` in `session.ts`;
+'local-warn' injects a one-per-session `NoticeResponse` (WARNING 01000) via a
+new `noticeResponse` wire helper; 'error' rejects with 0A000 (unit path:
+`held-advisory` disposition → proxy synthesizes; SQL path:
+`AdvisoryLockDisabledError`). Tests: `tests/advisory.test.ts` (3, real
+node-postgres `notice` events).
 
 Decision for M6: **loud-local** (the design's documented interim,
 hardened): first advisory-lock use in a session raises a WARNING naming
@@ -47,7 +61,16 @@ advisory locks keep tainting (existing), and a host option
 mode (0A000 on any advisory call). The stream-level lock service stays
 future work (needs product signal first).
 
-## Graduation tooling
+## Graduation tooling — SHIPPED
+
+Implemented in `src/graduation.ts` + `CellHost.graduateDatabase(db)`. Path
+taken: pg_dump runs against a FRESH throwaway PGlite opened on a
+materialized-at-head scratch datadir (hydrate checkpoint object → materialize
+W tail → open PGlite → `pgDump({ pg })`), NOT a live serving cell — pgDump
+mutates its target's search_path and issues `DEALLOCATE ALL`, so a quiescent
+throwaway instance is used. `@electric-sql/pglite-tools` added as a workspace
+dep. Returns `{ sql, manifestSnapshot }`. Test: `tests/graduation.test.ts` (1,
+dump → restore into a plain PGlite → tables/rows/sequence-floor/index match).
 
 - `graduateDatabase(db)`: logical export via `pglite-tools`' pg_dump on
   a linearizable-fresh cell → SQL artifact + manifest snapshot (the

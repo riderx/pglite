@@ -2072,7 +2072,24 @@ Each is independently demoable; the conflict path starts trivial and hardens.
   remap; **commit gate + in-place reset** at crash-recovery-grade scope
   (§3.4, §5.1) incl. the temp-write rebase taint (§4.5); commit-sequence
   placement reorder (§3.6); session-state taint lift (§3.3).
-- **M6 — productization.** Lease polish; advisory-lock service or
+- **M6 — productization. DONE (2026-07-05, `M6_PLAN.md`).** Demo console
+  shipped in the gateway (`GET /console`, dependency-free single-file
+  app; browser-side frame decoder proven byte-identical to the codec;
+  live feed follows era hops through terminal S frames — the "GUI is
+  just another stream listener" §10.2 demo). Janitor automation
+  (vacuum/freeze-age/GC dials, off by default; maintenance commits ride
+  the ordinary CAS path per §6.4). Advisory-lock policy decided and
+  shipped: `local-warn` (one WARNING per session naming the cell-local
+  scope) | `error` (0A000) — the stream lock service stays future work.
+  Graduation = logical export via pg_dump against a materialized-at-head
+  throwaway cell (never a serving cell), restore-verified. **OQ7 settled
+  definitively: physical graduation to stock 64-bit Postgres is
+  impossible (USE_FLOAT8_BYVAL, inherent to wasm32) — logical is THE
+  path.** Post-M6 addenda tracked in `HARDENING_PLAN.md` (audit gaps)
+  and `M7_LAZY_VFS_PLAN.md` (the lazy-VFS capstone, in progress —
+  which also delivers the per-cell lazy-load counters this milestone's
+  GUI bullet wanted).
+  Original scope: lease polish; advisory-lock service or
   errors; **janitor automation** (vacuum/freeze cadence, GC scheduling);
   graduation tooling (logical export; physical materialize-and-start
   experiment); demo GUI: list databases, fork button, connect via psql

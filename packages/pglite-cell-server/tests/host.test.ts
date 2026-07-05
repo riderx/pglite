@@ -21,9 +21,7 @@ import {
 import { GatewayCore, extractDatadir } from '@electric-sql/pglite-gateway'
 import type { Manifest } from '@electric-sql/pglite-gateway'
 import { CellHost } from '../src/host'
-import {
-  SerializationConflictError,
-} from '../src/errors'
+import { SerializationConflictError } from '../src/errors'
 
 const TEST_TIMEOUT = 240_000
 

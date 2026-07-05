@@ -15,6 +15,10 @@ import {
   renameSync,
   existsSync,
   rmSync,
+  openSync,
+  readSync,
+  fstatSync,
+  closeSync,
 } from 'node:fs'
 import { join } from 'node:path'
 
@@ -103,6 +107,43 @@ export class FsObjectStore {
     const src = this.pathFor(ref)
     if (!existsSync(src)) throw new ObjectNotFoundError(ref)
     return readFileSync(src)
+  }
+
+  /**
+   * Read `length` bytes starting at `offset` from the object at `ref` via a
+   * positional fd read (no full-object load) — the ranged read the lazy VFS
+   * host cache uses (§decision 3). `offset` is clamped to the object size and
+   * the returned slice is truncated at EOF, so an over-long range yields the
+   * available tail (possibly empty). Throws `ObjectNotFoundError` if absent,
+   * or a RangeError on a negative offset/length.
+   */
+  async getRange(
+    ref: string,
+    offset: number,
+    length: number,
+  ): Promise<Uint8Array> {
+    if (offset < 0 || length < 0) {
+      throw new RangeError(`invalid range: offset=${offset} length=${length}`)
+    }
+    const src = this.pathFor(ref)
+    if (!existsSync(src)) throw new ObjectNotFoundError(ref)
+    const fd = openSync(src, 'r')
+    try {
+      const size = fstatSync(fd).size
+      const start = Math.min(offset, size)
+      const avail = Math.min(length, size - start)
+      if (avail <= 0) return new Uint8Array(0)
+      const buf = Buffer.allocUnsafe(avail)
+      let read = 0
+      while (read < avail) {
+        const n = readSync(fd, buf, read, avail - read, start + read)
+        if (n === 0) break
+        read += n
+      }
+      return new Uint8Array(buf.buffer, buf.byteOffset, read)
+    } finally {
+      closeSync(fd)
+    }
   }
 
   /** True iff an object with `ref` is present. */

@@ -26,7 +26,7 @@ import {
 } from '@electric-sql/pglite-cell'
 import type { OFrame, Frame } from '@electric-sql/pglite-cell'
 import { FsObjectStore } from './object-store'
-import { packDatadir } from './checkpoint-object'
+import { packDatadir, packDatadirV3 } from './checkpoint-object'
 import { ControlPlane } from './control-plane'
 
 /**
@@ -72,6 +72,13 @@ export interface Manifest {
 export interface GatewayCoreOpts {
   /** Root directory for all backing state (streams, objects, control plane). */
   dataRoot: string
+  /**
+   * Checkpoint object format `createDatabase` writes: 2 = gzip'd tar (default,
+   * M2), 3 = per-file content-addressed + manifest (M7 lazy VFS). The flip to
+   * default 3 is a W3/W4 call; createDatabase/registerCheckpoint store the
+   * resulting ref opaquely either way.
+   */
+  checkpointFormat?: 1 | 2 | 3
 }
 
 /**
@@ -94,6 +101,7 @@ function sortableId(): string {
  */
 export class GatewayCore {
   private readonly dataRoot: string
+  private readonly checkpointFormat: 1 | 2 | 3
   private _store: FsObjectStore | null = null
   private _controlPlane: ControlPlane | null = null
   private _ds: DurableStreamTestServer | null = null
@@ -101,6 +109,7 @@ export class GatewayCore {
 
   constructor(opts: GatewayCoreOpts) {
     this.dataRoot = opts.dataRoot
+    this.checkpointFormat = opts.checkpointFormat ?? 2
   }
 
   /** The embedded Durable Streams base URL (valid after `start()`). */
@@ -198,9 +207,17 @@ export class GatewayCore {
       checkpointC0 = readControl(scratch).checkPoint
       snapEnd = checkpointC0 + BigInt(SHUTDOWN_CKPT_ALIGNED)
 
-      // (4) pack + store the checkpoint object.
-      const packed = await packDatadir(scratch)
-      checkpointRef = (await this.store.put(packed)).ref
+      // (4) pack + store the checkpoint object. v3 uploads per-file objects +
+      // a manifest itself; v1/v2 upload the single archive blob. The ref is
+      // stored opaquely in the control plane either way.
+      if (this.checkpointFormat === 3) {
+        checkpointRef = (await packDatadirV3(scratch, this.store)).manifestRef
+      } else {
+        const packed = await packDatadir(scratch, {
+          format: this.checkpointFormat,
+        })
+        checkpointRef = (await this.store.put(packed)).ref
+      }
     } finally {
       rmSync(scratch, { recursive: true, force: true })
     }
@@ -588,6 +605,18 @@ export class GatewayCore {
   /** Fetch an object by content-address ref. */
   async getObject(ref: string): Promise<Uint8Array> {
     return this.store.get(ref)
+  }
+
+  /**
+   * Ranged object read (`length` bytes from `offset`) — the lazy VFS host
+   * cache's per-chunk fetch (§decision 3). Positional fd read, no full load.
+   */
+  async getObjectRange(
+    ref: string,
+    offset: number,
+    length: number,
+  ): Promise<Uint8Array> {
+    return this.store.getRange(ref, offset, length)
   }
 
   /** Store bytes; returns the content-address ref (idempotent). */

@@ -57,6 +57,7 @@ import type { CellDirLease } from './base-dir'
 import type { DatabaseRuntime, DeliveredNotification } from './database-runtime'
 import {
   AdvanceRaceError,
+  AdvisoryLockDisabledError,
   FatalSessionResetError,
   PinnedWriteError,
   SerializationConflictError,
@@ -66,6 +67,7 @@ import {
 import {
   concatBytes,
   extractNotificationResponses,
+  noticeResponse,
   scanBackendOutput,
 } from './proxy/wire'
 import type { BackendScan } from './proxy/wire'
@@ -112,6 +114,7 @@ export type UnitDisposition =
   | 'held-pinned' // pinned-mode write: output DISCARDED, proxy sends 0A000
   | 'mid-txn' // interactive transaction in progress: streams by design
   | 'aborted' // transaction aborted (error / ROLLBACK): nothing to publish
+  | 'held-advisory' // advisoryLocks='error': not executed, proxy sends 0A000
 
 /**
  * Session freshness mode (§7 / M3): changes ONLY the gate step before an
@@ -190,6 +193,17 @@ function classifyListen(
   return { op, channel }
 }
 
+/**
+ * Advisory-lock statement detection (M6, §4.6): a case-insensitive scan for
+ * a `pg_advisory_` function reference in the statement text. Documented v1
+ * approximation, consistent with the other statement-text classifiers here
+ * (rebase taints, LISTEN) — a string literal mentioning the name yields a
+ * false positive, accepted as harmless-conservative.
+ */
+function mentionsAdvisoryLock(text: string): boolean {
+  return /pg_advisory_/i.test(text)
+}
+
 /** Last non-empty statement is `ROLLBACK` / `ABORT` (not `ROLLBACK TO`). */
 /**
  * True iff `threw` is the native sequence-lease-exhaustion error (M5a,
@@ -247,6 +261,8 @@ export class HostSession {
    */
   private holdableNames = new Set<string>()
   private _tainted = false // latches; the gc-pin is appended once
+  /** M6 §4.6: the cell-local advisory-lock WARNING fires once per session. */
+  private advisoryWarned = false
   private pinExpiresAt = 0
   private dead: string | null = null
   private chain: Promise<unknown> = Promise.resolve()
@@ -366,6 +382,16 @@ export class HostSession {
 
   private async execInner(sql: string): Promise<ExecResult> {
     this.currentUnitText = sql
+    // M6 §4.6: strict advisory-lock policy rejects without executing. The
+    // 'local-warn' notice is a wire-level NoticeResponse with no SQL-result
+    // analogue, so the programmatic path only enforces the 'error' mode
+    // (`advisoryWarned` still latches so a later proxy unit fires once).
+    if (
+      this.runtime.opts.advisoryLocks === 'error' &&
+      mentionsAdvisoryLock(sql)
+    ) {
+      throw new AdvisoryLockDisabledError()
+    }
     const r = await this.drive<Results[]>(async (cell) => {
       let threw: unknown
       let results: Results[] = []
@@ -448,6 +474,19 @@ export class HostSession {
     // SQL text — the scan only needs substrings).
     this.currentUnitText =
       unit.sqlForReplay ?? Buffer.from(unit.bytes).toString('latin1')
+
+    // M6 §4.6 advisory-lock policy: 'error' rejects the statement WITHOUT
+    // executing (the proxy synthesizes 0A000). 'local-warn' lets it run and
+    // prepends a one-per-session WARNING to the output (applied below).
+    const advisory = mentionsAdvisoryLock(this.currentUnitText)
+    if (advisory && this.runtime.opts.advisoryLocks === 'error') {
+      return {
+        output: new Uint8Array(0),
+        rfqStatus: 'I',
+        disposition: 'held-advisory',
+      }
+    }
+
     let attempt = 0
     const r = await this.drive<{ output: Uint8Array; scan: BackendScan }>(
       async (cell) => {
@@ -551,6 +590,23 @@ export class HostSession {
           disposition: 'held-pinned',
         }
         break
+    }
+    // M6 §4.6 'local-warn': prepend the one-per-session advisory WARNING
+    // ahead of the statement's own output (the client sees the statement
+    // succeed plus the notice). Only when the output is actually flushed —
+    // a held/discarded disposition carries no client-visible bytes to fix.
+    if (
+      advisory &&
+      this.runtime.opts.advisoryLocks === 'local-warn' &&
+      (result.disposition === 'flushed-readonly' ||
+        result.disposition === 'landed' ||
+        result.disposition === 'mid-txn' ||
+        result.disposition === 'aborted')
+    ) {
+      const notice = this.advisoryNoticeBytes()
+      if (notice.length > 0) {
+        result = { ...result, output: concatBytes([notice, result.output]) }
+      }
     }
     this._unitObserver?.({
       phase: 'result',
@@ -1532,6 +1588,26 @@ export class HostSession {
       this.pinExpiresAt = Date.now() + this.runtime.opts.pinTtlMs
       await this.runtime.appendGcPin(this.id, this.streamPos)
     }
+  }
+
+  /**
+   * The synthesized advisory-lock WARNING (M6 §4.6 'local-warn'), naming the
+   * cell-local scope. Returns the NoticeResponse bytes to prepend before the
+   * statement's output on the FIRST advisory-lock use in this session; empty
+   * on subsequent uses (fires once). Assumes 'local-warn' policy.
+   */
+  private advisoryNoticeBytes(): Uint8Array {
+    if (this.advisoryWarned) return new Uint8Array(0)
+    this.advisoryWarned = true
+    return noticeResponse({
+      severity: 'WARNING',
+      code: '01000', // warning
+      message:
+        'advisory lock scope is cell-local: this session serves one PGlite ' +
+        'cell, and advisory locks held here do NOT exclude locks on other ' +
+        'cells or hosts of the same database',
+      hint: 'do not rely on pg_advisory_* for cross-connection mutual exclusion',
+    })
   }
 
   private taintNames(): string[] {

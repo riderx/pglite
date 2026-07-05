@@ -154,8 +154,9 @@ describe('M5e commit gate + taint lift', () => {
         expect(cellOf(s).commitGatePending()).toBe(0)
 
         // Vanilla ON COMMIT DELETE ROWS semantics preserved end-to-end.
-        expect((await s.exec(`select count(*)::int as n from stage`)).rows[0].n)
-          .toBe(0)
+        expect(
+          (await s.exec(`select count(*)::int as n from stage`)).rows[0].n,
+        ).toBe(0)
         expect(
           (await s.exec(`select count(*)::int as n from reg`)).rows[0].n,
         ).toBe(2)
@@ -183,9 +184,8 @@ describe('M5e commit gate + taint lift', () => {
           ).outcome,
         ).toBe('committed')
         expect(
-          (
-            await a.exec(`insert into keep values ('k1'), ('k2'), ('k3')`)
-          ).outcome,
+          (await a.exec(`insert into keep values ('k1'), ('k2'), ('k3')`))
+            .outcome,
         ).toBe('committed')
         // Seed reg: a first-ever insert would EXTEND the file on disk
         // (smgrzeroextend), which the reset soundness gate rejects — the
@@ -202,9 +202,9 @@ describe('M5e commit gate + taint lift', () => {
 
         // A REAL foreign commit while A is thinking — A's COMMIT loses.
         const b = await ctx.host.connect('appdb')
-        expect((await b.exec(`insert into reg (v) values ('b1')`)).outcome).toBe(
-          'committed',
-        )
+        expect(
+          (await b.exec(`insert into reg (v) values ('b1')`)).outcome,
+        ).toBe('committed')
 
         // Pre-M5e contract: fatal session reset. M5e: 40001, session alive.
         await expect40001(a.exec(`commit`))
@@ -228,11 +228,7 @@ describe('M5e commit gate + taint lift', () => {
         expect((await a.exec(`commit`)).outcome).toBe('committed')
 
         expect(
-          (
-            await a.exec(
-              `select v from reg order by v`,
-            )
-          ).rows.map((r) => r.v),
+          (await a.exec(`select v from reg order by v`)).rows.map((r) => r.v),
         ).toEqual(['a-retry-staged', 'b1', 'seed0'])
         await a.close()
         await b.close()
@@ -270,9 +266,7 @@ describe('M5e commit gate + taint lift', () => {
         expect(r.outcome).toBe('committed')
         expect(probe.state.losses).toBe(1)
         expect(a.closed).toBe(false)
-        expect(
-          (await a.exec(`select v from keep`)).rows[0].v,
-        ).toBe('kept')
+        expect((await a.exec(`select v from keep`)).rows[0].v).toBe('kept')
         expect(
           (await a.exec(`select count(*)::int as n from reg`)).rows[0].n,
         ).toBe(2)

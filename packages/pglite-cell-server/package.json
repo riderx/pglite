@@ -50,7 +50,8 @@
     "@electric-sql/pg-protocol": "workspace:*",
     "@electric-sql/pglite": "workspace:*",
     "@electric-sql/pglite-cell": "workspace:*",
-    "@electric-sql/pglite-gateway": "workspace:*"
+    "@electric-sql/pglite-gateway": "workspace:*",
+    "@electric-sql/pglite-tools": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^20.16.11",

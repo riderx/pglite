@@ -33,6 +33,16 @@
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
       }
+    },
+    "./worker-cell": {
+      "import": {
+        "types": "./dist/worker-cell/index.d.ts",
+        "default": "./dist/worker-cell/index.js"
+      },
+      "require": {
+        "types": "./dist/worker-cell/index.d.cts",
+        "default": "./dist/worker-cell/index.cjs"
+      }
     }
   },
   "scripts": {

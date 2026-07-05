@@ -318,16 +318,38 @@ export class GatewayServer {
     })
 
     // --- Objects (content-addressed, immutable) --------------------------
+    // Honors a single-range `Range: bytes=a-b` header (206 + Content-Range);
+    // no Range ⇒ full 200; a syntactically-valid but unsatisfiable range ⇒ 416.
+    // The immutable cache header rides on every response.
     app.get('/v1/objects/:ref', async (c) => {
       const ref = c.req.param('ref')
+      let full: Uint8Array
       try {
-        const bytes = await core.getObject(ref)
-        c.header('Content-Type', 'application/octet-stream')
-        c.header('Cache-Control', 'public, max-age=31536000, immutable')
-        return c.body(toArrayBufferView(bytes))
+        full = await core.getObject(ref)
       } catch {
         return c.text(`object not found: ${ref}`, 404)
       }
+      c.header('Content-Type', 'application/octet-stream')
+      c.header('Cache-Control', 'public, max-age=31536000, immutable')
+      c.header('Accept-Ranges', 'bytes')
+
+      const rangeHeader = c.req.header('Range')
+      if (rangeHeader === undefined) {
+        return c.body(toArrayBufferView(full))
+      }
+      const parsed = parseByteRange(rangeHeader, full.length)
+      if (parsed === 'invalid') {
+        // Ignore unparseable ranges — serve the full body (RFC 7233 §3.1).
+        return c.body(toArrayBufferView(full))
+      }
+      if (parsed === 'unsatisfiable') {
+        c.header('Content-Range', `bytes */${full.length}`)
+        return c.body(null, 416)
+      }
+      const { start, end } = parsed // end inclusive
+      const slice = full.subarray(start, end + 1)
+      c.header('Content-Range', `bytes ${start}-${end}/${full.length}`)
+      return c.body(toArrayBufferView(slice), 206)
     })
 
     app.put('/v1/objects', async (c) => {
@@ -437,4 +459,61 @@ function toArrayBufferView(bytes: Uint8Array): ArrayBuffer {
   const ab = new ArrayBuffer(bytes.byteLength)
   new Uint8Array(ab).set(bytes)
   return ab
+}
+
+/**
+ * Parse a single-range `Range: bytes=a-b` header against a known `size`.
+ * Returns `{ start, end }` (both inclusive, clamped to size) for a satisfiable
+ * range, `'unsatisfiable'` for a syntactically-valid range wholly past EOF
+ * (⇒ 416), or `'invalid'` for anything unparseable / multi-range (⇒ ignore,
+ * serve full). Supports `a-`, `a-b`, and suffix `-n` forms.
+ */
+export function parseByteRange(
+  header: string,
+  size: number,
+): { start: number; end: number } | 'unsatisfiable' | 'invalid' {
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim())
+  if (!m) return 'invalid'
+  const [, startStr, endStr] = m
+  if (startStr === '' && endStr === '') return 'invalid'
+
+  let start: number
+  let end: number
+  if (startStr === '') {
+    // Suffix form `-n`: the last n bytes.
+    const n = Number(endStr)
+    if (n === 0) return 'unsatisfiable'
+    start = Math.max(0, size - n)
+    end = size - 1
+  } else {
+    start = Number(startStr)
+    end = endStr === '' ? size - 1 : Number(endStr)
+    if (start > end) return 'invalid'
+    if (start >= size) return 'unsatisfiable'
+    end = Math.min(end, size - 1)
+  }
+  if (size === 0) return 'unsatisfiable'
+  return { start, end }
+}
+
+/**
+ * Client helper for W3's host chunk cache: fetch `length` bytes at `offset`
+ * from `GET <baseUrl>/v1/objects/<ref>` via a `Range` header. Returns the
+ * 206 body bytes (or the full 200 body if the server ignored the range).
+ * Throws on 404/416/other non-2xx.
+ */
+export async function fetchObjectRange(
+  baseUrl: string,
+  ref: string,
+  offset: number,
+  length: number,
+): Promise<Uint8Array> {
+  const end = offset + length - 1
+  const res = await fetch(`${baseUrl}/v1/objects/${ref}`, {
+    headers: { Range: `bytes=${offset}-${end}` },
+  })
+  if (res.status !== 200 && res.status !== 206) {
+    throw new Error(`ranged object fetch failed: HTTP ${res.status} for ${ref}`)
+  }
+  return new Uint8Array(await res.arrayBuffer())
 }

@@ -11,6 +11,8 @@ import type { ResolvedRuntimeOpts, RuntimeOpts } from './database-runtime'
 import type { HostSession } from './session'
 import type { CheckpointReport } from './checkpoint'
 import type { RotationReport } from './rotation'
+import { graduateDatabase } from './graduation'
+import type { GraduationResult } from './graduation'
 
 export interface CellHostOpts {
   /** The gateway: an in-process GatewayCore or `{ url }` for HTTP. */
@@ -111,6 +113,30 @@ export class CellHost {
     }
     await runtime.ensureActive()
     return runtime.rotate()
+  }
+
+  /**
+   * Graduate a database (M6, §15): produce a logical pg_dump export at a
+   * linearizable-fresh head plus a manifest snapshot pinning the exported
+   * stream position. The documented migration path OUT of the fleet (OQ7:
+   * physical graduation to stock Postgres is closed; logical is THE path).
+   * The runtime is created + activated lazily if not already resident.
+   */
+  async graduateDatabase(dbNameOrId: string): Promise<GraduationResult> {
+    const databaseId = await this.gateway.resolveDatabaseId(dbNameOrId)
+    let runtime = this.runtimes.get(databaseId)
+    if (!runtime) {
+      runtime = new DatabaseRuntime({
+        databaseId,
+        hostId: this.hostId,
+        gateway: this.gateway,
+        dataRoot: this.dataRoot,
+        opts: this.opts,
+      })
+      this.runtimes.set(databaseId, runtime)
+    }
+    await runtime.ensureActive()
+    return graduateDatabase(runtime)
   }
 
   /**
