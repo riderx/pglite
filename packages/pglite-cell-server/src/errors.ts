@@ -95,6 +95,36 @@ export class AdvisoryLockDisabledError extends Error {
   }
 }
 
+/**
+ * H1 (§3.5): a transaction the client DECLARED read-only (BEGIN READ ONLY /
+ * default_transaction_read_only) nevertheless captured a nonempty WAL slice
+ * at commit. Its output was already streamed to the client with no buffering
+ * on the read-only promise, so the write cannot be un-sent OR published —
+ * this is a protocol bug (a write slipped past both the classifier and
+ * Postgres's own read-only enforcement) and MUST fail loudly rather than
+ * silently drop data. XX000 (internal_error): not a user error.
+ */
+export class ReadOnlyCaptureError extends Error {
+  readonly code = 'XX000'
+  constructor(byteLength: number) {
+    super(
+      `PROTOCOL BUG: a transaction declared READ ONLY captured a nonempty ` +
+        `WAL slice (${byteLength} bytes) at commit — its response was already ` +
+        `streamed to the client and cannot be reversed. This should be ` +
+        `impossible: Postgres rejects writes in a read-only transaction. ` +
+        `The read-only classifier or the streaming path is broken.`,
+    )
+    this.name = 'ReadOnlyCaptureError'
+  }
+}
+
+/**
+ * H1 (§3.5): a unit's buffered backend response exceeded the per-connection
+ * spool cap. Re-export of the proxy-level error's shape for the session
+ * boundary — see `proxy/response-buffer.ts`. (Defined there to keep the fs
+ * dependency in the proxy layer.)
+ */
+
 /** Any use of a session that is closed, reset, or destroyed by hibernation. */
 export class SessionClosedError extends Error {
   constructor(reason: string) {

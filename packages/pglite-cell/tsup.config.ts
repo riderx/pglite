@@ -7,10 +7,17 @@ const entryPoints = [
   // its own bundle, so both must land in dist/worker-cell/ per format.
   'src/worker-cell/index.ts',
   'src/worker-cell/worker-entry.ts',
+  // H7: test-only fixture helpers, published under `./testing` so the
+  // cell-server suite can import the same template-datadir fixture.
+  'src/testing.ts',
 ]
 
 // Only entries with exports get dts (worker-entry is a side-effect script).
-const dtsEntryPoints = ['src/index.ts', 'src/worker-cell/index.ts']
+const dtsEntryPoints = [
+  'src/index.ts',
+  'src/worker-cell/index.ts',
+  'src/testing.ts',
+]
 
 const minify = process.env.DEBUG === 'true' ? false : true
 

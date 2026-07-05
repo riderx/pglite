@@ -65,6 +65,12 @@ function forwardedResponseHeaders(headers: Headers): Record<string, string> {
  * W frame's LSNs parse with baseLsn < endLsn and every frame carries a nonempty
  * eraId. Returns a reason string on failure, or null when the body is valid.
  *
+ * A W frame may be an OBJECT-REF SLICE SPILL (the "w" spill: its WAL bytes live
+ * in a content-addressed object rather than inline) — header-only, no inline
+ * WAL, carrying a nonempty `objectRef`. These are accepted (the H3 spill path)
+ * provided objectRef is nonempty and baseLsn < endLsn: the same LSN discipline
+ * as an inline W frame, just no wal payload to size.
+ *
  * NEVER checks CAS position — that is the DS server's job (§14.5).
  */
 export function validateAppendBody(body: Uint8Array): string | null {
@@ -101,6 +107,15 @@ export function validateAppendBody(body: Uint8Array): string | null {
       }
       if (!(baseLsn < endLsn)) {
         return `frame ${count} W baseLsn ${frame.header.baseLsn} not < endLsn ${frame.header.endLsn}`
+      }
+      // Object-ref slice spill ("w"): a header carrying `objectRef` moves the
+      // WAL bytes out of band (no inline wal). When present it must be nonempty
+      // — an empty objectRef is a malformed spill and cannot be resolved.
+      const objectRef = (frame.header as { objectRef?: unknown }).objectRef
+      if (objectRef !== undefined) {
+        if (typeof objectRef !== 'string' || objectRef.length === 0) {
+          return `frame ${count} W spill has empty objectRef`
+        }
       }
     }
     pos = next
@@ -171,6 +186,14 @@ export class GatewayServer {
 
     app.get('/v1/db', async (c) => {
       return c.json(await core.listDatabases())
+    })
+
+    app.get('/v1/db/:id/stats', async (c) => {
+      try {
+        return c.json(await core.dbStats(c.req.param('id')))
+      } catch (err) {
+        return c.text(err instanceof Error ? err.message : String(err), 404)
+      }
     })
 
     app.get('/v1/db/:id/manifest', async (c) => {

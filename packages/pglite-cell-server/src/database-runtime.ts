@@ -115,6 +115,17 @@ export interface RuntimeOpts {
    *   executed.
    */
   advisoryLocks?: 'local-warn' | 'error'
+  /**
+   * H1 response-size safety (§3.5 ladder v1). A protocol unit's backend
+   * response is buffered in memory up to `bufferMemoryMax`; past that it
+   * spools to a per-connection temp file up to `bufferSpoolMax`; past THAT
+   * the unit aborts with 40001 + a HINT to use a READ ONLY transaction or a
+   * cursor. Declared-read-only units (BEGIN READ ONLY etc.) stream with no
+   * buffering and bypass the ladder entirely.
+   */
+  bufferMemoryMax?: number
+  /** H1 per-connection spool-file cap (§3.5). Default 256 MiB. */
+  bufferSpoolMax?: number
 }
 
 export interface ResolvedRuntimeOpts {
@@ -134,6 +145,8 @@ export interface ResolvedRuntimeOpts {
   advisoryLocks: 'local-warn' | 'error'
   cellMode: CellMode
   chunkCacheBytes: number | undefined
+  bufferMemoryMax: number
+  bufferSpoolMax: number
 }
 
 export function resolveRuntimeOpts(
@@ -158,6 +171,8 @@ export function resolveRuntimeOpts(
         ? 'lazy-worker'
         : 'nodefs'),
     chunkCacheBytes: opts.chunkCacheBytes,
+    bufferMemoryMax: opts.bufferMemoryMax ?? 8 * 1024 * 1024,
+    bufferSpoolMax: opts.bufferSpoolMax ?? 256 * 1024 * 1024,
   }
 }
 /** Bound on grant-take CAS retries (each loss re-reads the high-water). */

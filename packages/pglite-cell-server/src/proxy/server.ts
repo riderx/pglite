@@ -31,7 +31,7 @@ import {
   readyForQuery,
   simpleQueryText,
 } from './wire'
-import type { FrontendFrame } from './wire'
+import type { ErrorFields, FrontendFrame } from './wire'
 
 /** Synthetic backend pid carried by proxy-synthesized 'A' messages (M3):
  *  notifications are tailer-driven, not tied to any real backend. */
@@ -64,6 +64,74 @@ export function parseFreshness(value: string): Freshness | null {
 /** `CREATE [GLOBAL|LOCAL] UNLOGGED TABLE` anywhere in a simple unit (§9):
  *  the tested policy is a loud ERROR, never execution. */
 const UNLOGGED_RE = /\bcreate\s+(?:(?:global|local)\s+)?unlogged\s+table\b/i
+
+// H4 feature policing (§9). Statement-text classifiers, consistent with the
+// existing UNLOGGED one — a documented simple-protocol approximation. Each
+// rejects LOUDLY with 0A000 (feature_not_supported) WITHOUT executing.
+
+/** `PREPARE TRANSACTION 'gid'` (two-phase commit) — never `PREPARE stmt AS`. */
+const PREPARE_TXN_RE = /^\s*prepare\s+transaction\b/i
+
+/** `CREATE DATABASE` / `CREATE TABLESPACE` — a cell serves one database. */
+const CREATE_DATABASE_RE = /^\s*create\s+database\b/i
+const CREATE_TABLESPACE_RE = /^\s*create\s+tablespace\b/i
+
+/**
+ * `ALTER SEQUENCE ... RESTART` — RESTART rewinds a sequence below values
+ * this host has already granted/published (§5.3), silently reissuing ids the
+ * stream considers spent. Every sequence in a cell stream is lease-managed,
+ * so RESTART is rejected wholesale (the documented "on leased sequences"
+ * approximation). `ALTER SEQUENCE ... RESTART WITH n` and bare `RESTART`
+ * both match; other ALTER SEQUENCE forms (OWNED BY, INCREMENT, …) pass.
+ */
+const ALTER_SEQUENCE_RESTART_RE =
+  /^\s*alter\s+sequence\s+(?:if\s+exists\s+)?[\s\S]*?\brestart\b/i
+
+/** The H4 policing verdict for a simple unit: an error to synthesize, or null. */
+function policeStatement(sql: string): ErrorFields | null {
+  if (PREPARE_TXN_RE.test(sql)) {
+    return {
+      code: '0A000',
+      message: 'two-phase commit is not supported',
+      detail:
+        'PREPARE TRANSACTION would strand a prepared transaction on a single ' +
+        'cell that other cells and hosts of this database cannot see or ' +
+        'resolve',
+      hint: 'commit or roll back in one transaction',
+    }
+  }
+  if (CREATE_DATABASE_RE.test(sql)) {
+    return {
+      code: '0A000',
+      message: 'CREATE DATABASE is not supported',
+      detail:
+        'each cell stream serves exactly one database; create databases ' +
+        'through the gateway control plane',
+    }
+  }
+  if (CREATE_TABLESPACE_RE.test(sql)) {
+    return {
+      code: '0A000',
+      message: 'CREATE TABLESPACE is not supported',
+      detail:
+        'cell storage is managed by the stream/checkpoint layer; there is no ' +
+        'stable filesystem location for a user tablespace',
+    }
+  }
+  if (ALTER_SEQUENCE_RESTART_RE.test(sql)) {
+    return {
+      code: '0A000',
+      message:
+        'ALTER SEQUENCE ... RESTART is not supported on a leased sequence',
+      detail:
+        'sequences are lease-managed across cells/hosts (§5.3); RESTART would ' +
+        'rewind below already-granted values and reissue ids the stream ' +
+        'considers spent',
+      hint: 'to advance a sequence use setval(); ids never move backwards',
+    }
+  }
+  return null
+}
 
 export interface CellProxyServerOpts {
   host: CellHost
@@ -294,6 +362,19 @@ export class CellProxyServer {
         return
       }
 
+      // H4 feature policing (§9): PREPARE TRANSACTION / CREATE DATABASE /
+      // CREATE TABLESPACE / ALTER SEQUENCE ... RESTART are rejected LOUDLY
+      // with 0A000 without executing (simple-protocol classifiers, same
+      // documented approximation as the unlogged-table policy above).
+      const policed = policeStatement(sql)
+      if (policed !== null) {
+        this.enqueue(conn, async () => {
+          this.write(conn, errorResponse(policed))
+          this.write(conn, readyForQuery(conn.lastRfq === 'I' ? 'I' : 'E'))
+        })
+        return
+      }
+
       const unit: ProtocolUnit = {
         kind: 'simple',
         bytes: frame.bytes,
@@ -433,9 +514,41 @@ export class CellProxyServer {
       return
     }
     try {
-      const res = await session.execUnit(unit)
+      // H1 (§3.5): give the session a streaming sink. It uses it ONLY for
+      // declared-read-only units (BEGIN READ ONLY / default_transaction_read_
+      // only), streaming their output with no buffering; every other unit
+      // buffers through the §3.5 ladder and this sink is never called.
+      const res = await session.execUnit(unit, (bytes) =>
+        this.write(conn, bytes),
+      )
       if (conn.closed) return
       conn.lastRfq = res.rfqStatus
+      if (res.disposition === 'streamed-readonly') {
+        // The output (incl. its ReadyForQuery) already went to the client
+        // incrementally — nothing left to flush.
+        return
+      }
+      if (res.disposition === 'held-too-large') {
+        // §3.5 rung 3: the response exceeded the per-connection spool cap.
+        // Nothing reached the client; surface a clean 40001 + HINT naming
+        // the real fix (a READ ONLY transaction streams unbounded).
+        conn.lastRfq = 'I'
+        this.write(
+          conn,
+          errorResponse({
+            code: '40001', // serialization_failure (blind-retryable)
+            message:
+              'response exceeded the proxy buffer: this transaction produced ' +
+              'more output than can be held before its commit is known',
+            hint:
+              'run large reads in a READ ONLY transaction (BEGIN READ ONLY / ' +
+              'SET default_transaction_read_only = on) so results stream ' +
+              'unbuffered, or use a cursor to fetch in batches',
+          }),
+        )
+        this.write(conn, readyForQuery('I'))
+        return
+      }
       if (res.disposition === 'held-conflict') {
         // The buffered output died unsent (§3.5); surface the one §4.0
         // client-visible failure mode in its place.

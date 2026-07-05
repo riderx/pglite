@@ -12,6 +12,16 @@
 //                              prune the rest.
 //   4. Unreferenced objects   — checkpoint objects no row references anymore
 //                              (content-addressed: shared across databases).
+//                              CRITICAL: a v3 checkpoint row references only its
+//                              MANIFEST object; the per-FILE objects the manifest
+//                              lists (`files[].ref`) are live but invisible to a
+//                              naive row scan. Sweep 4 therefore RESOLVES every
+//                              referenced ref that is a v3 manifest and marks all
+//                              of its `files[].ref` (plus the manifest itself) as
+//                              referenced before deleting anything. Content-
+//                              addressing means surviving v3 checkpoints share
+//                              file refs, so a file object survives while ANY
+//                              remaining manifest lists it.
 //
 // CRITICAL DS-server fact (verified against durable-streams server/store):
 // DELETE of a stream that HAS forks does NOT refuse — the server soft-deletes
@@ -23,6 +33,8 @@
 // that here (sweep 2's lineage join), so we never issue the DELETE at all.
 
 import { parseLsn } from '@electric-sql/pglite-cell'
+import { readCheckpointManifest } from './checkpoint-object'
+import type { CheckpointManifestV3 } from './checkpoint-object'
 import type { GatewayCore } from './core'
 import type { EraRow, LineageRow, PinRow } from './control-plane'
 
@@ -156,14 +168,59 @@ export class GcExecutor {
 
     // --- Sweep 4: unreferenced objects (global; content-addressed) ------
     // An object survives while ANY checkpoint row (any database — a fork shares
-    // its parent's object) still references it.
-    const referenced = new Set(await cp.allReferencedObjects())
+    // its parent's object) still references it, DIRECTLY (the row's object_ref)
+    // or TRANSITIVELY (a v3 manifest lists it as one of its file objects).
+    const referenced = await this.buildReferencedSet(
+      await cp.allReferencedObjects(),
+    )
     for (const ref of await this.core.listObjects()) {
       if (referenced.has(ref)) continue
       if (await this.core.deleteObject(ref)) report.deletedObjects++
     }
 
     return report
+  }
+
+  /**
+   * Expand the set of directly-referenced checkpoint refs into the FULL set of
+   * live object refs: every ref itself, plus — for any ref that resolves to a v3
+   * checkpoint manifest — every `files[].ref` it lists. Non-manifest refs (v1/v2
+   * archive blobs, or refs whose object is absent) are tolerated cheaply: they
+   * contribute only themselves. Manifests are parsed at most once per run.
+   */
+  private async buildReferencedSet(directRefs: string[]): Promise<Set<string>> {
+    const referenced = new Set<string>()
+    const manifestCache = new Map<string, CheckpointManifestV3 | null>()
+    const store = this.core.objectGetStore
+    for (const ref of directRefs) {
+      referenced.add(ref) // the ref itself is always live (manifest or blob)
+      let manifest = manifestCache.get(ref)
+      if (manifest === undefined) {
+        manifest = await this.tryReadManifest(ref, store)
+        manifestCache.set(ref, manifest)
+      }
+      if (manifest) {
+        for (const file of manifest.files) referenced.add(file.ref)
+      }
+    }
+    return referenced
+  }
+
+  /**
+   * Read `ref` as a v3 manifest, or return null if it is not one (a v1/v2
+   * archive blob, a missing object, or unparseable bytes). `readCheckpointManifest`
+   * already validates the `{"v":3,…}` shape and throws otherwise, so a plain
+   * catch is the cheap sniff.
+   */
+  private async tryReadManifest(
+    ref: string,
+    store: { get(ref: string): Promise<Uint8Array> },
+  ): Promise<CheckpointManifestV3 | null> {
+    try {
+      return await readCheckpointManifest(ref, store)
+    } catch {
+      return null
+    }
   }
 
   /** True iff a live child fork's fork point lies within this era's range. */

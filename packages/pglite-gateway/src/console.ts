@@ -288,6 +288,8 @@ async function showDetail(id){
   catch(e){ d.innerHTML = '<div class="empty">manifest error</div>'; return; }
   try { ckpt = await jget("/v1/db/" + id + "/checkpoint/latest"); } catch(e){}
   try { pins = await jget("/v1/db/" + id + "/pins"); } catch(e){}
+  var stats = null;
+  try { stats = await jget("/v1/db/" + id + "/stats"); } catch(e){}
   var size = null;
   if(ckpt && ckpt.objectRef){
     try { var hr = await fetch("/v1/objects/" + ckpt.objectRef, { method: "HEAD" });
@@ -303,6 +305,11 @@ async function showDetail(id){
     fact("checkpoint ref", h((ckpt ? ckpt.objectRef : m.checkpoint.ref) || "")) +
     fact("checkpoint offset", h(shortOff((ckpt ? ckpt.streamOffset : m.checkpoint.streamOffset)))) +
     (size != null ? fact("checkpoint size", fmtBytes(size)) : "") +
+    ((stats && stats.latestCheckpoint && stats.latestCheckpoint.eagerBytes != null) ?
+      fact("eager set", fmtBytes(stats.latestCheckpoint.eagerBytes) +
+        " (what a cold wake moves)") +
+      fact("lazy set", fmtBytes(stats.latestCheckpoint.lazyBytes || 0)) +
+      fact("file count", String(stats.latestCheckpoint.fileCount)) : "") +
     "</table></div>" +
     '<div class="card"><h2>Dials</h2>' +
     '<table class="facts">' +

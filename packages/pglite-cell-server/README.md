@@ -70,6 +70,23 @@ are flushed — zero bytes of the discarded attempt ever leak. Interactive
 transactions stream mid-txn results by design; only the `COMMIT` response is
 held.
 
+**Response-size safety — the §3.5 ladder (H1).** A unit's buffered response
+grows in memory up to `opts.bufferMemoryMax` (default 8 MiB), then spills to a
+per-connection **spool file** up to `opts.bufferSpoolMax` (default 256 MiB);
+past that the unit aborts with `40001` + a `HINT` naming the real fix. Spool
+files are disposed on unit end and on connection close. (The §3.5 lease-probe
+rungs 3–4 are spec'd but **deferred** — not faked; the `40001`+HINT is the v1
+ceiling.)
+
+**Declared read-only streaming (the true fix).** A transaction the client
+*declares* read-only — `BEGIN READ ONLY`, `START TRANSACTION READ ONLY`, or a
+plain `BEGIN` under a session `default_transaction_read_only = on` (text
+classifier) — has its output **streamed to the client incrementally with no
+buffering** (COPY … TO in such a txn rides the same path). At txn end the
+capture MUST be empty; a nonempty capture is a loud protocol-bug error
+(`XX000`), never a silent drop. Large read-only scans therefore run under
+bounded host memory with no ladder and no `40001`.
+
 **Replayed on recycle:** the connection's `StartupMessage` bytes and tracked
 session-level `SET` statements (re-run on every fresh cell, output discarded).
 **Not replayed (M1 limitation):** prepared statements — a conflict recycle loses
@@ -105,6 +122,24 @@ statement-text scan for `pg_advisory_` (documented approximation).
 - `'error'` — any advisory-lock statement is rejected with `0A000` and **not
   executed**; the session survives.
 
+### Feature policing (§9, H4)
+
+Statement-text classifiers (simple-protocol approximation, consistent with the
+unlogged-table and advisory-lock scans) reject unsupported features **loudly
+with `0A000` before executing**:
+
+| Statement | Verdict | Why |
+| --------- | ------- | --- |
+| `PREPARE TRANSACTION` | `0A000` "two-phase commit is not supported" | a prepared txn would strand on one cell that other cells/hosts cannot resolve |
+| `CREATE DATABASE` | `0A000` | each cell stream serves exactly one database (use the gateway control plane) |
+| `CREATE TABLESPACE` | `0A000` | no stable filesystem location under the stream/checkpoint layer |
+| `ALTER SEQUENCE … RESTART` | `0A000` on leased sequences | RESTART rewinds below already-granted values and would reissue spent ids (§5.3) |
+
+**`setval(...)` is ALLOWED** (migrations legitimately setval): after the
+transaction lands, the host re-probes `pg_sequences`, re-grants **strictly
+above** the set value, and republishes the sequence floors — keeping §5.3
+rule 5 honest without breaking data-import migrations. Ids never move backwards.
+
 ### Graduation (`CellHost.graduateDatabase(db)`, §15 / OQ7)
 
 Produces a **logical** export at a linearizable-fresh head: a `pg_dump` SQL
@@ -135,6 +170,5 @@ Measured on the demo: create ~1.4 s, wake-to-first-row ~940 ms, recycle ~100 ms.
 - one era per database; **no era rotation** yet (M2);
 - **single host** — cross-host leases with strict CAS deferred to M4;
 - **prepared statements not replayed** across a conflict recycle;
-- unlogged tables **not policed** yet;
 - sequence floors are in-memory (lost on host restart) — native `nextval`
   clamps + `G`-frame leases land at M4.

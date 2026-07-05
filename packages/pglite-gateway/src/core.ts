@@ -288,6 +288,49 @@ export class GatewayCore {
     return this.controlPlane.latestCheckpoint(databaseId)
   }
 
+  /**
+   * Operator stats for a database's LATEST checkpoint. When that checkpoint's
+   * ref resolves to a v3 manifest, reports the eager/lazy byte split and file
+   * count (summed from the manifest by kind) — the numbers the console's
+   * wake-byte counter needs (eager bytes = what a cold wake moves). When the
+   * latest checkpoint is a v1/v2 archive (or there is none), the fields are
+   * omitted (undefined) and only the shape is returned.
+   */
+  async dbStats(databaseId: string): Promise<{
+    latestCheckpoint: {
+      eagerBytes?: number
+      lazyBytes?: number
+      fileCount?: number
+    }
+  }> {
+    const latest = await this.controlPlane.latestCheckpoint(databaseId)
+    if (!latest) return { latestCheckpoint: {} }
+    const { readCheckpointManifest } = await import('./checkpoint-object')
+    let manifest
+    try {
+      manifest = await readCheckpointManifest(
+        latest.objectRef,
+        this.objectGetStore,
+      )
+    } catch {
+      // v1/v2 archive blob, or object absent — no per-kind stats available.
+      return { latestCheckpoint: {} }
+    }
+    let eagerBytes = 0
+    let lazyBytes = 0
+    for (const f of manifest.files) {
+      if (f.kind === 'lazy') lazyBytes += f.size
+      else eagerBytes += f.size
+    }
+    return {
+      latestCheckpoint: {
+        eagerBytes,
+        lazyBytes,
+        fileCount: manifest.files.length,
+      },
+    }
+  }
+
   /** Read a database's current manifest from the control plane. */
   async getManifest(databaseId: string): Promise<Manifest> {
     const db = await this.controlPlane.getDatabaseById(databaseId)
@@ -605,6 +648,15 @@ export class GatewayCore {
   /** Fetch an object by content-address ref. */
   async getObject(ref: string): Promise<Uint8Array> {
     return this.store.get(ref)
+  }
+
+  /**
+   * An `ObjectGetStore` handle over the object store (fetch-by-ref only). GC
+   * uses this to resolve v3 checkpoint manifests when expanding the live-object
+   * set; also the read side any manifest-aware consumer needs.
+   */
+  get objectGetStore(): import('./checkpoint-object').ObjectGetStore {
+    return { get: (ref: string) => this.store.get(ref) }
   }
 
   /**

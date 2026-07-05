@@ -65,6 +65,7 @@ import {
   AdvisoryLockDisabledError,
   FatalSessionResetError,
   PinnedWriteError,
+  ReadOnlyCaptureError,
   SerializationConflictError,
   SessionClosedError,
   SessionPinnedExpiredError,
@@ -76,6 +77,7 @@ import {
   scanBackendOutput,
 } from './proxy/wire'
 import type { BackendScan } from './proxy/wire'
+import { ResponseBuffer, ResponseTooLargeError } from './proxy/response-buffer'
 
 export type ExecOutcome =
   | 'committed'
@@ -114,9 +116,11 @@ export interface ProtocolUnit {
 
 export type UnitDisposition =
   | 'flushed-readonly' // empty slice: never CAS'd, response final (§3.5)
+  | 'streamed-readonly' // H1: declared read-only, output ALREADY streamed
   | 'landed' // commit CAS'd and landed: buffered response is now true
   | 'held-conflict' // unrecoverable loss: output DISCARDED, proxy sends 40001
   | 'held-pinned' // pinned-mode write: output DISCARDED, proxy sends 0A000
+  | 'held-too-large' // H1: response exceeded the spool cap, proxy sends 40001
   | 'mid-txn' // interactive transaction in progress: streams by design
   | 'aborted' // transaction aborted (error / ROLLBACK): nothing to publish
   | 'held-advisory' // advisoryLocks='error': not executed, proxy sends 0A000
@@ -243,6 +247,55 @@ function isReplayableSet(sql: string): boolean {
   return /^\s*set\b/i.test(sql) && !/^\s*set\s+(transaction|local)\b/i.test(sql)
 }
 
+// H1 declared-read-only classification (§3.5). A statement-text scan,
+// consistent with the other simple-protocol classifiers here. It recognizes
+// only the DECLARED read-only forms — a transaction the client PROMISES is
+// read-only — so that we can stream its output with no buffering and assert
+// an empty capture at the end (a nonempty capture is then a loud protocol
+// bug, not a silent write). It does NOT try to prove an arbitrary statement
+// read-only; the buffering ladder is the safety net for everything else.
+
+/**
+ * `BEGIN READ ONLY` / `START TRANSACTION READ ONLY` (in any word order of
+ * the READ-ONLY / ISOLATION / DEFERRABLE modes) as the opening statement of
+ * a simple unit — the client declares the whole transaction read-only.
+ */
+function opensReadOnlyTransaction(sql: string): boolean {
+  const m = /^\s*(begin|start\s+transaction)\b([^;]*)/i.exec(sql)
+  if (m === null) return false
+  return /\bread\s+only\b/i.test(m[2])
+}
+
+/** `SET [SESSION] default_transaction_read_only = on/true` (session state). */
+function setsDefaultReadOnly(sql: string): boolean {
+  return /^\s*set\s+(?:session\s+)?default_transaction_read_only\s*(?:=|\s+to\s+)\s*(?:'?on'?|'?true'?|1)\s*;?\s*$/i.test(
+    sql,
+  )
+}
+
+/** `SET [SESSION] default_transaction_read_only = off/false` — clears it. */
+function setsDefaultReadWrite(sql: string): boolean {
+  return /^\s*set\s+(?:session\s+)?default_transaction_read_only\s*(?:=|\s+to\s+)\s*(?:'?off'?|'?false'?|0)\s*;?\s*$/i.test(
+    sql,
+  )
+}
+
+/**
+ * A lone `BEGIN` / `START TRANSACTION` with NO explicit read-write/read-only
+ * mode — inherits `default_transaction_read_only`. Used to decide whether a
+ * transaction opened while the session default is read-only is itself
+ * read-only (so `SET default_transaction_read_only=on; BEGIN; SELECT …` also
+ * streams). An explicit `READ WRITE` opts back out.
+ */
+function opensDefaultModeTransaction(sql: string): {
+  opens: boolean
+  explicitReadWrite: boolean
+} {
+  const m = /^\s*(begin|start\s+transaction)\b([^;]*)/i.exec(sql)
+  if (m === null) return { opens: false, explicitReadWrite: false }
+  return { opens: true, explicitReadWrite: /\bread\s+write\b/i.test(m[2]) }
+}
+
 export class HostSession {
   readonly id = `s-${randomUUID()}`
 
@@ -311,6 +364,21 @@ export class HostSession {
   private rebaseTaint: string | null = null
   /** Statement text of the unit currently driving (taint scan input). */
   private currentUnitText: string | null = null
+
+  /**
+   * H1 declared-read-only streaming (§3.5). `sessionReadOnly` tracks the
+   * session `default_transaction_read_only` GUC (SET-driven, replayed on
+   * recycle like any SET). `txnReadOnly` is true while inside a transaction
+   * the client DECLARED read-only (BEGIN READ ONLY / START TRANSACTION READ
+   * ONLY / a plain BEGIN under the read-only default). A unit executing in a
+   * read-only context streams its output to the client with NO buffering and
+   * asserts an empty capture at txn end.
+   */
+  private sessionReadOnly = false
+  private txnReadOnly = false
+  /** True while the CURRENT unit is streaming under the read-only promise —
+   *  drive() asserts an empty capture at txn end (else ReadOnlyCaptureError). */
+  private streamingReadOnly = false
   /** Cumulative rebase counters (TEST HOOK / diagnostics). */
   readonly rebaseStats = { attempts: 0, landed: 0, failed: 0 }
 
@@ -495,12 +563,26 @@ export class HostSession {
    * (recycle + replay + re-run), so the proxy only ever sees the final
    * output. `FatalSessionResetError` propagates (§3.3): the proxy sends the
    * error and terminates the connection.
+   *
+   * H1 (§3.5): when the unit runs in a DECLARED read-only context (BEGIN
+   * READ ONLY / default_transaction_read_only), and a `stream` sink is
+   * provided, the unit's output is written to the client INCREMENTALLY with
+   * no buffering; the returned `output` is empty and the disposition is
+   * `streamed-readonly`. Otherwise the output is buffered through the §3.5
+   * ladder (memory → spool file → 40001) so a large response in a
+   * non-read-only transaction cannot OOM the host.
    */
-  execUnit(unit: ProtocolUnit): Promise<UnitResult> {
-    return this.run(() => this.execUnitInner(unit))
+  execUnit(
+    unit: ProtocolUnit,
+    stream?: (bytes: Uint8Array) => void,
+  ): Promise<UnitResult> {
+    return this.run(() => this.execUnitInner(unit, stream))
   }
 
-  private async execUnitInner(unit: ProtocolUnit): Promise<UnitResult> {
+  private async execUnitInner(
+    unit: ProtocolUnit,
+    stream?: (bytes: Uint8Array) => void,
+  ): Promise<UnitResult> {
     // Taint-scan input (§4.5): simple-protocol SQL when known; extended
     // protocol falls back to a raw byte decode (Parse messages carry the
     // SQL text — the scan only needs substrings).
@@ -519,21 +601,98 @@ export class HostSession {
       }
     }
 
+    // H1 read-only context for THIS unit (§3.5): compute BEFORE executing,
+    // from the unit text and the standing txn/session read-only state. When
+    // read-only AND a stream sink is available, output is streamed with no
+    // buffering; a nonempty capture at txn end is then a loud protocol bug.
+    const streaming = stream !== undefined && this.unitIsReadOnly(unit)
+    this.streamingReadOnly = streaming
+
     let attempt = 0
+    let tooLarge = false
     const r = await this.drive<{ output: Uint8Array; scan: BackendScan }>(
       async (cell) => {
-        const chunks: Uint8Array[] = []
+        // Re-executions get a fresh buffer (the discarded attempt's spool
+        // file was disposed with it). Streaming units never buffer.
+        const buffer = streaming
+          ? null
+          : new ResponseBuffer({
+              memoryMax: this.runtime.opts.bufferMemoryMax,
+              spoolMax: this.runtime.opts.bufferSpoolMax,
+            })
+        // The non-streaming path assembles the WHOLE response first (through
+        // the ladder) and strips 'A' frames once, over the complete byte run
+        // — so message boundaries are never split. The streaming path
+        // forwards chunks raw (a declared read-only txn emits no 'A' frames).
+        let overflow: ResponseTooLargeError | null = null
         let threw: unknown
         try {
           await cell.db.runExclusive(() =>
             cell.db.execProtocolRawStream(unit.bytes, {
               onRawData: (data) => {
-                chunks.push(data.slice())
+                if (streaming) {
+                  // A DECLARED read-only transaction can never NOTIFY (NOTIFY
+                  // writes WAL and is a write), so there are no 'A' frames to
+                  // strip — forward raw. This also sidesteps the chunk-
+                  // boundary hazard: raw-stream chunks are not guaranteed to
+                  // align to message boundaries, so a per-chunk 'A' walk
+                  // could mis-parse; we simply never need it here.
+                  if (data.length > 0) stream(data.slice())
+                  return
+                }
+                try {
+                  buffer!.push(data.slice())
+                } catch (err) {
+                  if (err instanceof ResponseTooLargeError) {
+                    // Record and stop feeding; we cannot abort the native
+                    // exec mid-stream, so drain the rest into the void (the
+                    // buffer's push is now a no-op guard) — the whole unit
+                    // is discarded as 40001 below.
+                    overflow ??= err
+                    return
+                  }
+                  throw err
+                }
               },
             }),
           )
         } catch (err) {
           threw = err
+        }
+        if (overflow !== null) {
+          buffer?.dispose()
+          tooLarge = true
+          // A too-large response is treated as an aborted unit: nothing is
+          // published, floors are probed, and the proxy synthesizes 40001.
+          // Roll back any open transaction the oversized statement began.
+          if (cell.db.isInTransaction()) {
+            await cell.db.exec('rollback').catch(() => undefined)
+          }
+          const empty = new Uint8Array(0)
+          return {
+            payload: { output: empty, scan: scanBackendOutput(empty) },
+            threw: undefined,
+            aborted: true,
+            leaseExhausted: false,
+          }
+        }
+        // Streaming units produced no buffer: their output already went to
+        // the client. The scan is over an empty buffer (RFQ was streamed
+        // too); drive() classifies via the cell's txn state and capture.
+        if (streaming) {
+          const empty = new Uint8Array(0)
+          this._unitObserver?.({
+            phase: 'attempt',
+            unitKind: unit.kind,
+            attempt: attempt++,
+            outputBytes: 0,
+          })
+          return {
+            payload: { output: empty, scan: scanBackendOutput(empty) },
+            threw,
+            aborted: threw !== undefined,
+            leaseExhausted: isSequenceLeaseExhausted(threw),
+          }
         }
         // Uniform delivery (M3, §10.2 step 4): raw 'A' NotificationResponse
         // bytes are STRIPPED from unit output — all client-facing delivery
@@ -542,8 +701,10 @@ export class HostSession {
         // same walk IS the harvest: PGlite's raw-stream exec bypasses its
         // parser, so the 'A' bytes here are the only place the local
         // commit's notifications exist.
+        const assembled = buffer!.finalize()
+        buffer!.dispose()
         const { stripped: output, notifications } =
-          extractNotificationResponses(concatBytes(chunks))
+          extractNotificationResponses(assembled)
         this.notifBuffer.push(...notifications)
         const scan = scanBackendOutput(output)
         this._unitObserver?.({
@@ -570,10 +731,56 @@ export class HostSession {
       },
     )
 
+    // H1 spool-cap overflow (§3.5 rung 3): the unit was discarded; surface a
+    // clean 40001 + HINT. Nothing reached the client (the response died in
+    // the buffer). Update the read-only txn tracking first (below) is moot —
+    // the txn was rolled back.
+    if (tooLarge) {
+      this.streamingReadOnly = false
+      this.updateReadOnlyState(unit)
+      return {
+        output: new Uint8Array(0),
+        rfqStatus: 'I',
+        disposition: 'held-too-large',
+      }
+    }
+
+    this.streamingReadOnly = false
+
+    // H1: a streamed unit already sent every byte (incl. its RFQ). Whatever
+    // the drive() verdict — read-only, aborted, or mid-txn — the proxy has
+    // nothing left to flush. A read-only txn can never land/conflict/
+    // pinned-write (the capture is empty by the read-only promise, asserted
+    // in drive()), so those verdicts are unreachable here.
+    if (streaming) {
+      this.trackReplayState(unit)
+      this.updateReadOnlyState(unit)
+      if (
+        (r.kind === 'mid-txn' || r.kind === 'aborted') &&
+        r.threw !== undefined
+      )
+        throw r.threw
+      const streamed: UnitResult = {
+        output: new Uint8Array(0),
+        rfqStatus:
+          r.kind === 'mid-txn' ? 'T' : r.kind === 'aborted' ? 'E' : 'I',
+        disposition: 'streamed-readonly',
+      }
+      this._unitObserver?.({
+        phase: 'result',
+        unitKind: unit.kind,
+        attempt,
+        outputBytes: 0,
+        disposition: streamed.disposition,
+      })
+      return streamed
+    }
+
     let result: UnitResult
     switch (r.kind) {
       case 'mid-txn':
         if (r.threw !== undefined) throw r.threw
+        this.updateReadOnlyState(unit)
         result = {
           output: r.payload.output,
           rfqStatus: r.payload.scan.rfqStatus ?? 'T',
@@ -582,6 +789,7 @@ export class HostSession {
         break
       case 'aborted':
         if (r.threw !== undefined) throw r.threw
+        this.updateReadOnlyState(unit)
         result = {
           output: r.payload.output,
           rfqStatus: r.payload.scan.rfqStatus ?? 'I',
@@ -590,6 +798,7 @@ export class HostSession {
         break
       case 'read-only':
         this.trackReplayState(unit)
+        this.updateReadOnlyState(unit)
         result = {
           output: r.payload.output,
           rfqStatus: r.payload.scan.rfqStatus ?? 'I',
@@ -598,6 +807,7 @@ export class HostSession {
         break
       case 'landed':
         this.trackReplayState(unit)
+        this.updateReadOnlyState(unit)
         result = {
           output: r.payload.output,
           rfqStatus: r.payload.scan.rfqStatus ?? 'I',
@@ -682,6 +892,58 @@ export class HostSession {
       this._listenSet.delete(listen.channel)
       this.runtime.releaseListen(listen.channel)
     }
+  }
+
+  /**
+   * H1 (§3.5): is THIS unit executing in a declared-read-only context? True
+   * when the session is currently INSIDE a declared-read-only transaction
+   * (`txnReadOnly`), OR when this very unit OPENS one — a simple `BEGIN READ
+   * ONLY` / `START TRANSACTION READ ONLY`, or a plain `BEGIN` inheriting a
+   * `default_transaction_read_only = on` session default. Extended-protocol
+   * units carry no reliable simple-SQL text, so they never open a read-only
+   * txn on their own (a documented approximation, same class as the other
+   * text classifiers) — but they DO ride an already-open read-only txn.
+   */
+  private unitIsReadOnly(unit: ProtocolUnit): boolean {
+    if (this.txnReadOnly) return true
+    if (unit.kind !== 'simple' || unit.sqlForReplay === undefined) return false
+    const sql = unit.sqlForReplay
+    if (opensReadOnlyTransaction(sql)) return true
+    if (this.sessionReadOnly) {
+      const open = opensDefaultModeTransaction(sql)
+      if (open.opens && !open.explicitReadWrite) return true
+    }
+    return false
+  }
+
+  /**
+   * H1 (§3.5): fold the just-finished unit into the read-only tracking
+   * state. `default_transaction_read_only` SETs move the session default;
+   * BEGIN/START open a txn whose read-only-ness is fixed at open; the txn
+   * ending (RFQ 'I' — the drive() outcome is read-only/aborted/landed with
+   * the cell idle) clears `txnReadOnly`. Only meaningful for simple units.
+   */
+  private updateReadOnlyState(unit: ProtocolUnit): void {
+    const inTxn = this.cell !== null && this.cell.db.isInTransaction()
+    if (unit.kind === 'simple' && unit.sqlForReplay !== undefined) {
+      const sql = unit.sqlForReplay
+      if (setsDefaultReadOnly(sql)) this.sessionReadOnly = true
+      else if (setsDefaultReadWrite(sql)) this.sessionReadOnly = false
+      // A transaction OPENING: fix its read-only-ness now (only if we are
+      // actually mid-txn afterwards — a single-statement `BEGIN; …; COMMIT`
+      // simple unit opens and closes in one shot and stays idle).
+      if (inTxn && !this.txnReadOnly) {
+        if (opensReadOnlyTransaction(sql)) this.txnReadOnly = true
+        else {
+          const open = opensDefaultModeTransaction(sql)
+          if (open.opens && !open.explicitReadWrite && this.sessionReadOnly) {
+            this.txnReadOnly = true
+          }
+        }
+      }
+    }
+    // The transaction has ended (cell idle): clear the txn read-only flag.
+    if (!inTxn) this.txnReadOnly = false
   }
 
   /**
@@ -863,6 +1125,18 @@ export class HostSession {
           }
           slice = null
         }
+      }
+
+      // H1 (§3.5): a unit that STREAMED under the read-only promise must
+      // never leave a real (non-maintenance) user-write slice — its output
+      // already reached the client and cannot be reversed. A nonempty slice
+      // here means a write slipped past both our classifier and Postgres's
+      // own read-only enforcement: fail LOUD (XX000), never silently drop.
+      if (this.streamingReadOnly && slice !== null) {
+        const err = new ReadOnlyCaptureError(slice.bytes.length)
+        await this.runtime.probeFloors(cell).catch(() => undefined)
+        await this.destroyCell()
+        throw err
       }
 
       if (slice === null) {

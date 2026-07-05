@@ -43,6 +43,16 @@
         "types": "./dist/worker-cell/index.d.cts",
         "default": "./dist/worker-cell/index.cjs"
       }
+    },
+    "./testing": {
+      "import": {
+        "types": "./dist/testing.d.ts",
+        "default": "./dist/testing.js"
+      },
+      "require": {
+        "types": "./dist/testing.d.cts",
+        "default": "./dist/testing.cjs"
+      }
     }
   },
   "scripts": {
